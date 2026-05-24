@@ -1,0 +1,70 @@
+/// NRSI Affective Model — Emotional Dimension Contracts
+///
+/// Declares the affective dimensions, arousal/valence model,
+/// and norms for emotional influence on reasoning.
+
+module affective
+
+import NRSIData from "types"
+
+/// ---------- Affective Dimensions ----------
+
+enum AffectDimension {
+    VALENCE,
+    AROUSAL,
+    DOMINANCE
+}
+
+enum EmotionalTone {
+    NEUTRAL,
+    CURIOUS,
+    FRUSTRATED,
+    ANXIOUS,
+    EXCITED,
+    ENGAGED,
+    CHALLENGING,
+    CONFUSED,
+    GRATEFUL
+}
+
+/// ---------- Affective Norms ----------
+
+norm emotional_transparency {
+    type: obligation,
+    scope: global,
+    action: "acknowledge_emotion_detected",
+    priority: 60,
+    condition: arousal >= 0.7
+}
+
+norm high_anxiety_gentle_tone {
+    type: obligation,
+    scope: global,
+    action: "soften_response_tone",
+    priority: 75,
+    condition: tone == EmotionalTone.ANXIOUS
+}
+
+norm frustration_acknowledge {
+    type: obligation,
+    scope: global,
+    action: "validate_user_frustration",
+    priority: 70,
+    condition: tone == EmotionalTone.FRUSTRATED
+}
+
+norm no_emotional_manipulation {
+    type: prohibition,
+    scope: global,
+    action: "exploit_emotional_state",
+    priority: 100,
+    condition: true
+}
+
+/// ---------- Affect Gate ----------
+
+gate emotional_calibration(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain != "unknown"
+    validate tone_detected
+    validate response_calibrated
+}

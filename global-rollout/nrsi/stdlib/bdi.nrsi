@@ -1,0 +1,69 @@
+/// NRSI BDI Model — Beliefs, Desires, Intentions
+///
+/// Declarative contracts for the BDI deliberation cycle.
+/// Runtime deliberation stays in Python; these are the invariants.
+
+module bdi
+
+import NRSIData, TrustLevel from "types"
+
+/// ---------- BDI Types ----------
+
+enum DesireType {
+    ANSWER_QUERY,
+    SEEK_KNOWLEDGE,
+    VALIDATE_CLAIM,
+    EXPLORE_CREATIVE,
+    MAINTAIN_SAFETY,
+    SELF_IMPROVE
+}
+
+enum IntentionState {
+    FORMED,
+    COMMITTED,
+    EXECUTING,
+    SUSPENDED,
+    COMPLETED,
+    ABANDONED
+}
+
+type Intention {
+    desire: DesireType,
+    state: IntentionState,
+    confidence: Float,
+    resource_budget: Int
+}
+
+/// ---------- BDI Invariant Norms ----------
+
+norm safety_overrides_desire {
+    type: prohibition,
+    scope: global,
+    action: "execute_unsafe_intention",
+    priority: 100,
+    condition: desire != DesireType.MAINTAIN_SAFETY
+}
+
+norm committed_intentions_persist {
+    type: obligation,
+    scope: global,
+    action: "complete_or_suspend",
+    priority: 85,
+    condition: state == IntentionState.COMMITTED
+}
+
+norm resource_bounded_execution {
+    type: obligation,
+    scope: global,
+    action: "respect_budget",
+    priority: 80,
+    condition: true
+}
+
+/// ---------- BDI Gate ----------
+
+gate intention_commit(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.50
+    validate no_conflict_with_existing
+    validate resource_available
+}

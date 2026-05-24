@@ -1,0 +1,543 @@
+/// Bidirectional Hierarchical Processing Pipeline.
+///
+/// Three-level processing: feedforward (up), feedback (down), lateral (same level).
+/// All data flow is tracked and auditable via FlowRecord.
+///
+/// Patent-covered: Bidirectional neuromorphic processing hierarchy,
+/// FlowRecord audit trail, convergent cycle processing.
+///
+/// Ported from nrsip/hierarchy.py.
+
+module hierarchy
+
+
+import time from "std/time"
+/// ── Flow Direction ──
+
+enum FlowDirection {
+    FEEDFORWARD = "feedforward",
+    FEEDBACK = "feedback",
+    LATERAL = "lateral"
+}
+
+/// ── Layer ──
+
+class Layer {
+    fn init(self, name: string, level: int, processor: Optional[any],
+            feedback_processor: Optional[any], lateral_processor: Optional[any],
+            description: Optional[string]) {
+        if level < 0 {
+            raise "Layer level must be non-negative, got " + to_string(level)
+        }
+        self.name = name
+        self.level = level
+        self.description = description
+        self._processor = processor
+        self._feedback_processor = feedback_processor
+        self._lateral_processor = lateral_processor
+        self._state = {}
+        self._feedforward_count = 0
+        self._feedback_count = 0
+        self._lateral_count = 0
+        self._total_time_ms = 0.0
+    }
+
+    fn process(self, data: any, context: Optional[any]) -> any {
+        return self._execute(self._processor, data, context, "feedforward")
+    }
+
+    fn process_feedback(self, data: any, context: Optional[any]) -> any {
+        if self._feedback_processor != nil {
+            return self._execute(self._feedback_processor, data, context, "feedback")
+        }
+        return data
+    }
+
+    fn process_lateral(self, data: any, context: Optional[any]) -> any {
+        if self._lateral_processor != nil {
+            return self._execute(self._lateral_processor, data, context, "lateral")
+        }
+        return data
+    }
+
+    fn _execute(self, processor: Optional[any], data: any, context: Optional[any],
+                direction: string) -> any {
+        let start = time.monotonic()
+        let result = data
+        if processor != nil {
+            if context != nil {
+                result = processor(data, context)
+            } else {
+                result = processor(data)
+            }
+        }
+        let elapsed = (time.monotonic() - start) * 1000.0
+        self._total_time_ms += elapsed
+        if direction == "feedforward" {
+            self._feedforward_count += 1
+        } else if direction == "feedback" {
+            self._feedback_count += 1
+        } else if direction == "lateral" {
+            self._lateral_count += 1
+        }
+        return result
+    }
+
+    fn set_state(self, key: string, value: any) {
+        self._state[key] = value
+    }
+
+    fn get_state(self, key: string, default_val: Optional[any]) -> Optional[any] {
+        return self._state.get(key, default_val)
+    }
+
+    fn clear_state(self) {
+        self._state = {}
+    }
+
+    fn state(self) -> any {
+        return self._state.copy()
+    }
+
+    fn set_processor(self, fn_proc: any) -> Layer {
+        self._processor = fn_proc
+        return self
+    }
+
+    fn set_feedback_processor(self, fn_proc: any) -> Layer {
+        self._feedback_processor = fn_proc
+        return self
+    }
+
+    fn set_lateral_processor(self, fn_proc: any) -> Layer {
+        self._lateral_processor = fn_proc
+        return self
+    }
+
+    fn stats(self) -> any {
+        let total = self._feedforward_count + self._feedback_count + self._lateral_count
+        let avg = 0.0
+        if total > 0 {
+            avg = self._total_time_ms / to_float(total)
+        }
+        return {
+            "name": self.name,
+            "level": self.level,
+            "feedforward": self._feedforward_count,
+            "feedback": self._feedback_count,
+            "lateral": self._lateral_count,
+            "total": total,
+            "avg_time_ms": avg
+        }
+    }
+}
+
+/// ── Flow Record ──
+
+type FlowRecord {
+    cycle: int,
+    direction: FlowDirection,
+    source_name: string,
+    source_level: int,
+    target_name: string,
+    target_level: int,
+    input_data: any,
+    output_data: any,
+    elapsed_ms: float,
+    success: bool,
+    error: Optional[string],
+    inhibited: bool,
+    inhibition_reason: Optional[string],
+    timestamp: float
+}
+
+fn make_flow_record(cycle: int, direction: FlowDirection,
+                    source_name: string, source_level: int,
+                    target_name: string, target_level: int,
+                    input_data: any, output_data: any,
+                    elapsed_ms: float, success: bool,
+                    error: Optional[string]) -> FlowRecord {
+    return FlowRecord {
+        cycle: cycle,
+        direction: direction,
+        source_name: source_name,
+        source_level: source_level,
+        target_name: target_name,
+        target_level: target_level,
+        input_data: input_data,
+        output_data: output_data,
+        elapsed_ms: elapsed_ms,
+        success: success,
+        error: error,
+        inhibited: false,
+        inhibition_reason: nil,
+        timestamp: time.time()
+    }
+}
+
+fn flow_record_to_string(r: FlowRecord) -> string {
+    if r.inhibited {
+        return "[INHIBITED] " + r.target_name + "(L" + to_string(r.target_level) + ") -- " + to_string(r.inhibition_reason)
+    }
+    let arrow = "^"
+    if r.direction == FlowDirection.FEEDBACK {
+        arrow = "v"
+    } else if r.direction == FlowDirection.LATERAL {
+        arrow = "<->"
+    }
+    let status = "OK"
+    if !r.success {
+        status = "FAIL"
+    }
+    return status + " [" + r.direction.value + "] " +
+           r.source_name + "(L" + to_string(r.source_level) + ") " + arrow + " " +
+           r.target_name + "(L" + to_string(r.target_level) + ") (" +
+           to_string(round(r.elapsed_ms, 1)) + "ms)"
+}
+
+/// ── Pipeline Result ──
+
+type PipelineResult {
+    success: bool,
+    final_output: any,
+    flow_records: List[FlowRecord],
+    total_cycles: int,
+    total_elapsed_ms: float,
+    converged: bool,
+    convergence_reason: Optional[string]
+}
+
+fn pipeline_feedforward_count(pr: PipelineResult) -> int {
+    let count = 0
+    for r in pr.flow_records {
+        if r.direction == FlowDirection.FEEDFORWARD {
+            if !r.inhibited {
+                count += 1
+            }
+        }
+    }
+    return count
+}
+
+fn pipeline_feedback_count(pr: PipelineResult) -> int {
+    let count = 0
+    for r in pr.flow_records {
+        if r.direction == FlowDirection.FEEDBACK {
+            if !r.inhibited {
+                count += 1
+            }
+        }
+    }
+    return count
+}
+
+fn pipeline_inhibited_count(pr: PipelineResult) -> int {
+    let count = 0
+    for r in pr.flow_records {
+        if r.inhibited {
+            count += 1
+        }
+    }
+    return count
+}
+
+fn pipeline_summary(pr: PipelineResult) -> string {
+    let status = "COMPLETED"
+    if pr.converged {
+        status = "CONVERGED"
+    } else if !pr.success {
+        status = "FAILED"
+    }
+    let lines = []
+    lines.append("Pipeline " + status + ": " + to_string(pr.total_cycles) + " cycle(s)")
+    lines.append("  Flows: " + to_string(pipeline_feedforward_count(pr)) + " ff, " +
+                 to_string(pipeline_feedback_count(pr)) + " fb, " +
+                 to_string(pipeline_inhibited_count(pr)) + " inhibited")
+    lines.append("  Time: " + to_string(round(pr.total_elapsed_ms, 1)) + "ms")
+    if pr.convergence_reason != nil {
+        lines.append("  Convergence: " + pr.convergence_reason)
+    }
+    for r in pr.flow_records {
+        lines.append("    " + flow_record_to_string(r))
+    }
+    return lines.join("\n")
+}
+
+/// ── Hierarchical Pipeline ──
+
+class HierarchicalPipeline {
+    fn init(self, layers: Optional[List[Layer]], name: string) {
+        self.name = name
+        self._layers = []
+        self._layers_by_name = {}
+        self._inhibited_layers = {}
+
+        if layers != nil {
+            let sorted_layers = layers.sort_by(fn(l: Layer) -> int { return l.level })
+            for lay in sorted_layers {
+                self.add_layer(lay)
+            }
+        }
+    }
+
+    fn add_layer(self, layer_obj: Layer) -> HierarchicalPipeline {
+        if self._layers_by_name.get(layer_obj.name, nil) != nil {
+            raise "Layer '" + layer_obj.name + "' already exists"
+        }
+        self._layers.append(layer_obj)
+        self._layers.sort_by(fn(l: Layer) -> int { return l.level })
+        self._layers_by_name[layer_obj.name] = layer_obj
+        return self
+    }
+
+    fn get_layer(self, name: string) -> Layer {
+        let l = self._layers_by_name.get(name, nil)
+        if l == nil {
+            raise "Layer '" + name + "' not found"
+        }
+        return l
+    }
+
+    fn process(self, data: any, context: Optional[any], mode: string,
+               max_cycles: int, convergence_fn: Optional[any]) -> PipelineResult {
+        if self._layers.len() == 0 {
+            raise "Pipeline has no layers"
+        }
+        if mode == "single" {
+            return self._single_pass(data, context)
+        } else if mode == "cycle" {
+            return self._full_cycle(data, context)
+        } else if mode == "converge" {
+            return self._convergent(data, context, max_cycles, convergence_fn)
+        }
+        raise "Unknown mode: '" + mode + "'"
+    }
+
+    fn _single_pass(self, data: any, context: Optional[any]) -> PipelineResult {
+        let start = time.monotonic()
+        let records = []
+        let current = data
+        for i in range(0, self._layers.len()) {
+            let lyr = self._layers[i]
+            let src_name = "input"
+            let src_level = -1
+            if i > 0 {
+                src_name = self._layers[i - 1].name
+                src_level = self._layers[i - 1].level
+            }
+            let record = self._exec(lyr, current, context, FlowDirection.FEEDFORWARD,
+                                     src_name, src_level, 0)
+            records.append(record)
+            if !record.success {
+                return PipelineResult {
+                    success: false, final_output: nil, flow_records: records,
+                    total_cycles: 0, total_elapsed_ms: (time.monotonic() - start) * 1000.0,
+                    converged: false, convergence_reason: nil
+                }
+            }
+            current = record.output_data
+        }
+        return PipelineResult {
+            success: true, final_output: current, flow_records: records,
+            total_cycles: 1, total_elapsed_ms: (time.monotonic() - start) * 1000.0,
+            converged: false, convergence_reason: nil
+        }
+    }
+
+    fn _full_cycle(self, data: any, context: Optional[any]) -> PipelineResult {
+        let start = time.monotonic()
+        let records = []
+        let current = data
+
+        for i in range(0, self._layers.len()) {
+            let lyr = self._layers[i]
+            let src_name = "input"
+            let src_level = -1
+            if i > 0 {
+                src_name = self._layers[i - 1].name
+                src_level = self._layers[i - 1].level
+            }
+            let record = self._exec(lyr, current, context, FlowDirection.FEEDFORWARD,
+                                     src_name, src_level, 0)
+            records.append(record)
+            if !record.success {
+                return PipelineResult {
+                    success: false, final_output: nil, flow_records: records,
+                    total_cycles: 0, total_elapsed_ms: (time.monotonic() - start) * 1000.0,
+                    converged: false, convergence_reason: nil
+                }
+            }
+            current = record.output_data
+        }
+
+        let last_idx = self._layers.len() - 1
+        for i in range(0, self._layers.len()) {
+            let rev_i = last_idx - i
+            let lyr = self._layers[rev_i]
+            let src_name = "top"
+            let src_level = -1
+            if rev_i < last_idx {
+                src_name = self._layers[rev_i + 1].name
+                src_level = self._layers[rev_i + 1].level
+            }
+            let record = self._exec(lyr, current, context, FlowDirection.FEEDBACK,
+                                     src_name, src_level, 0)
+            records.append(record)
+            if !record.success {
+                return PipelineResult {
+                    success: false, final_output: nil, flow_records: records,
+                    total_cycles: 1, total_elapsed_ms: (time.monotonic() - start) * 1000.0,
+                    converged: false, convergence_reason: nil
+                }
+            }
+            current = record.output_data
+        }
+
+        return PipelineResult {
+            success: true, final_output: current, flow_records: records,
+            total_cycles: 1, total_elapsed_ms: (time.monotonic() - start) * 1000.0,
+            converged: false, convergence_reason: nil
+        }
+    }
+
+    fn _convergent(self, data: any, context: Optional[any],
+                   max_cycles: int, convergence_fn: Optional[any]) -> PipelineResult {
+        let start = time.monotonic()
+        let all_records = []
+        let current = data
+        let previous = nil
+        let converged = false
+        let reason = nil
+        let cycle = 0
+
+        for cycle in range(0, max_cycles) {
+            let ff = current
+            for i in range(0, self._layers.len()) {
+                let lyr = self._layers[i]
+                let src_name = "input"
+                let src_level = -1
+                if i > 0 {
+                    src_name = self._layers[i - 1].name
+                    src_level = self._layers[i - 1].level
+                }
+                let rec = self._exec(lyr, ff, context, FlowDirection.FEEDFORWARD,
+                                      src_name, src_level, cycle)
+                all_records.append(rec)
+                if !rec.success {
+                    return PipelineResult {
+                        success: false, final_output: nil, flow_records: all_records,
+                        total_cycles: cycle + 1,
+                        total_elapsed_ms: (time.monotonic() - start) * 1000.0,
+                        converged: false, convergence_reason: nil
+                    }
+                }
+                ff = rec.output_data
+            }
+
+            let fb = ff
+            let last_idx = self._layers.len() - 1
+            for i in range(0, self._layers.len()) {
+                let rev_i = last_idx - i
+                let lyr = self._layers[rev_i]
+                let src_name = "top"
+                let src_level = -1
+                if rev_i < last_idx {
+                    src_name = self._layers[rev_i + 1].name
+                    src_level = self._layers[rev_i + 1].level
+                }
+                let rec = self._exec(lyr, fb, context, FlowDirection.FEEDBACK,
+                                      src_name, src_level, cycle)
+                all_records.append(rec)
+                if !rec.success {
+                    return PipelineResult {
+                        success: false, final_output: nil, flow_records: all_records,
+                        total_cycles: cycle + 1,
+                        total_elapsed_ms: (time.monotonic() - start) * 1000.0,
+                        converged: false, convergence_reason: nil
+                    }
+                }
+                fb = rec.output_data
+            }
+
+            current = fb
+
+            if previous != nil {
+                if convergence_fn != nil {
+                    if convergence_fn(previous, current) {
+                        converged = true
+                        reason = "Converged at cycle " + to_string(cycle + 1)
+                        break
+                    }
+                } else {
+                    if _equal(previous, current) {
+                        converged = true
+                        reason = "Output stabilized at cycle " + to_string(cycle + 1)
+                        break
+                    }
+                }
+            }
+            previous = current
+        }
+
+        if !converged {
+            reason = "Max cycles (" + to_string(max_cycles) + ") reached"
+        }
+
+        return PipelineResult {
+            success: true, final_output: current, flow_records: all_records,
+            total_cycles: cycle + 1,
+            total_elapsed_ms: (time.monotonic() - start) * 1000.0,
+            converged: converged, convergence_reason: reason
+        }
+    }
+
+    fn _exec(self, lyr: Layer, data: any, context: Optional[any],
+             direction: FlowDirection, src_name: string,
+             src_level: int, cycle: int) -> FlowRecord {
+        let start = time.monotonic()
+        try {
+            let output = data
+            if direction == FlowDirection.FEEDFORWARD {
+                output = lyr.process(data, context)
+            } else if direction == FlowDirection.FEEDBACK {
+                output = lyr.process_feedback(data, context)
+            } else {
+                output = lyr.process_lateral(data, context)
+            }
+
+            return make_flow_record(cycle, direction,
+                src_name, src_level,
+                lyr.name, lyr.level,
+                data, output,
+                (time.monotonic() - start) * 1000.0, true, nil)
+        } catch(e) {
+            return make_flow_record(cycle, direction,
+                src_name, src_level,
+                lyr.name, lyr.level,
+                data, nil,
+                (time.monotonic() - start) * 1000.0, false, to_string(e))
+        }
+    }
+
+    fn layers(self) -> List[any] {
+        return self._layers.copy()
+    }
+
+    fn depth(self) -> int {
+        return self._layers.len()
+    }
+}
+
+fn _equal(a: any, b: any) -> bool {
+    try {
+        return a == b
+    } catch(e) {
+        return to_string(a) == to_string(b)
+    }
+}
+
+export FlowDirection, Layer
+export FlowRecord, make_flow_record, flow_record_to_string
+export PipelineResult, pipeline_feedforward_count, pipeline_feedback_count
+export pipeline_inhibited_count, pipeline_summary
+export HierarchicalPipeline

@@ -1,0 +1,160 @@
+/// Session and replay store abstractions for distributed NRSIP deployments.
+///
+/// Full implementation of `nrsip/session_store.py`.
+/// Provides pluggable backends: Redis (production) and in-memory (testing).
+
+module session_store
+
+
+import time from "std/time"
+/// ---------- Abstract SessionStore ----------
+
+class SessionStore {
+    fn register_nonce(self, nonce: bytes, ttl_seconds: float) -> bool {
+        raise NotImplementedError("abstract method")
+    }
+
+    fn store_session(self, session_id: string, data: Dict[string, string], ttl_seconds: int) {
+        raise NotImplementedError("abstract method")
+    }
+
+    fn get_session(self, session_id: string) -> Optional[Dict[string, string]] {
+        raise NotImplementedError("abstract method")
+    }
+
+    fn delete_session(self, session_id: string) {
+        raise NotImplementedError("abstract method")
+    }
+
+    fn update_session_field(self, session_id: string, field: string, value: string) {
+        raise NotImplementedError("abstract method")
+    }
+}
+
+/// ---------- InMemorySessionStore ----------
+
+class InMemorySessionStore(SessionStore) {
+    fn new(self) {
+        self._nonces = {}
+        self._sessions = {}
+        self._ttls = {}
+    }
+
+    fn _purge(self, now: float) {
+        let expired_nonces = []
+        for k in keys(self._nonces) {
+            if now - self._nonces[k] > 300 {
+                append(expired_nonces, k)
+            }
+        }
+        for k in expired_nonces {
+            delete(self._nonces, k)
+        }
+
+        let expired_sessions = []
+        for k in keys(self._ttls) {
+            if now > self._ttls[k] {
+                append(expired_sessions, k)
+            }
+        }
+        for k in expired_sessions {
+            delete(self._sessions, k)
+            delete(self._ttls, k)
+        }
+    }
+
+    fn register_nonce(self, nonce: bytes, ttl_seconds: float) -> bool {
+        let now = time.time()
+        self._purge(now)
+        let key = bytes_to_hex(nonce)
+        if key in self._nonces {
+            return false
+        }
+        self._nonces[key] = now
+        return true
+    }
+
+    fn register(self, nonce: bytes, now: float, ttl_seconds: float) -> bool {
+        let key = bytes_to_hex(nonce)
+        if key in self._nonces {
+            return false
+        }
+        self._nonces[key] = now
+        return true
+    }
+
+    fn store_session(self, session_id: string, data: Dict[string, string], ttl_seconds: int) {
+        self._sessions[session_id] = dict_copy(data)
+        self._ttls[session_id] = time.time() + ttl_seconds
+    }
+
+    fn get_session(self, session_id: string) -> Optional[Dict[string, string]] {
+        let now = time.time()
+        let exp = get_or_default(self._ttls, session_id, None)
+        if exp != None and now > exp {
+            delete(self._sessions, session_id)
+            delete(self._ttls, session_id)
+            return None
+        }
+        return get_or_default(self._sessions, session_id, None)
+    }
+
+    fn delete_session(self, session_id: string) {
+        delete(self._sessions, session_id)
+        delete(self._ttls, session_id)
+    }
+
+    fn update_session_field(self, session_id: string, field: string, value: string) {
+        let session = get_or_default(self._sessions, session_id, None)
+        if session != None {
+            session[field] = value
+        }
+    }
+}
+
+/// ---------- RedisSessionStore ----------
+
+class RedisSessionStore(SessionStore) {
+    fn new(self, redis_client: Any, namespace: string) {
+        self._redis = redis_client
+        self._ns = namespace
+    }
+
+    fn register_nonce(self, nonce: bytes, ttl_seconds: float) -> bool {
+        let key = self._ns + ":nonce:" + bytes_to_hex(nonce)
+        let ttl = max(1, int(ttl_seconds))
+        let result = self._redis.set(key, "1", nx: true, ex: ttl)
+        return bool(result)
+    }
+
+    fn register(self, nonce: bytes, now: float, ttl_seconds: float) -> bool {
+        return self.register_nonce(nonce, ttl_seconds)
+    }
+
+    fn store_session(self, session_id: string, data: Dict[string, string], ttl_seconds: int) {
+        let key = self._ns + ":session:" + session_id
+        self._redis.hset(key, mapping: data)
+        self._redis.expire(key, ttl_seconds)
+    }
+
+    fn get_session(self, session_id: string) -> Optional[Dict[string, string]] {
+        let key = self._ns + ":session:" + session_id
+        let data = self._redis.hgetall(key)
+        if data {
+            return data
+        }
+        return None
+    }
+
+    fn delete_session(self, session_id: string) {
+        let key = self._ns + ":session:" + session_id
+        self._redis.delete(key)
+    }
+
+    fn update_session_field(self, session_id: string, field: string, value: string) {
+        let key = self._ns + ":session:" + session_id
+        self._redis.hset(key, field, value)
+    }
+}
+
+export SessionStore, InMemorySessionStore, RedisSessionStore

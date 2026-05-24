@@ -1,0 +1,1090 @@
+/// NRS Semantic Similarity & Understanding Engine.
+///
+/// TF-IDF, BM25, synonym expansion, concept networks, Porter stemming.
+/// Pure algorithmic — no external ML dependencies.
+
+module semantic_engine
+
+import math from "std/math"
+import re from "std/regex"
+
+/// ── Stop words — 230+ common English function words ────────────────────
+
+let STOP_WORDS: Set[string] = Set.of(
+    "a", "about", "above", "across", "after", "afterwards", "again",
+    "against", "all", "almost", "alone", "along", "already", "also",
+    "although", "always", "am", "among", "amongst", "an", "and",
+    "another", "any", "anybody", "anyhow", "anyone", "anything",
+    "anyway", "anywhere", "are", "aren", "arent", "around", "as", "at",
+    "away", "back", "be", "became", "because", "become", "becomes",
+    "becoming", "been", "before", "beforehand", "began", "begin",
+    "behind", "being", "below", "beneath", "beside", "besides",
+    "between", "beyond", "both", "but", "by", "came", "can", "cannot",
+    "cant", "could", "couldn", "couldnt", "d", "dare", "did", "didn",
+    "didnt", "do", "does", "doesn", "doesnt", "doing", "done", "don",
+    "dont", "down", "during", "each", "either", "else", "enough",
+    "even", "ever", "every", "everybody", "everyone", "everything",
+    "everywhere", "few", "first", "for", "from", "further", "get",
+    "gets", "getting", "give", "given", "go", "goes", "going", "gone",
+    "got", "gotten", "had", "hadn", "hadnt", "has", "hasn", "hasnt",
+    "have", "haven", "havent", "having", "he", "hed", "hell", "her",
+    "here", "heres", "hers", "herself", "hes", "him", "himself", "his",
+    "how", "however", "hows", "i", "id", "if", "ill", "im", "in",
+    "into", "is", "isn", "isnt", "it", "its", "itself", "ive", "just",
+    "know", "last", "least", "less", "let", "lets", "like", "likely",
+    "ll", "long", "m", "made", "make", "many", "may", "me", "might",
+    "mine", "more", "moreover", "most", "much", "must", "mustn",
+    "mustnt", "my", "myself", "need", "neither", "never",
+    "nevertheless", "new", "next", "no", "nobody", "none", "nor",
+    "not", "nothing", "now", "nowhere", "of", "off", "often", "oh",
+    "on", "once", "one", "only", "onto", "or", "other", "others",
+    "otherwise", "ought", "our", "ours", "ourselves", "out", "over",
+    "own", "per", "perhaps", "please", "quite", "rather", "re",
+    "really", "right", "s", "said", "same", "say", "says", "shall",
+    "shan", "shant", "she", "shed", "shell", "shes", "should",
+    "shouldn", "shouldnt", "since", "so", "some", "somebody",
+    "somehow", "someone", "something", "sometime", "sometimes",
+    "somewhere", "still", "such", "sure", "t", "take", "than", "that",
+    "thats", "the", "their", "theirs", "them", "themselves", "then",
+    "there", "thereafter", "theres", "these", "they", "theyd",
+    "theyll", "theyre", "theyve", "thing", "think", "this", "those",
+    "though", "through", "throughout", "till", "to", "together", "too",
+    "toward", "towards", "try", "under", "until", "up", "upon", "us",
+    "use", "used", "using", "usually", "ve", "very", "want", "was",
+    "wasn", "wasnt", "way", "we", "wed", "well", "were", "werent",
+    "weve", "what", "whatever", "whats", "when", "whenever", "whens",
+    "where", "whereas", "wherever", "wheres", "whether", "which",
+    "whichever", "while", "who", "whoever", "whole", "whom", "whos",
+    "whose", "why", "whys", "will", "with", "within", "without",
+    "won", "wont", "would", "wouldn", "wouldnt", "yet", "you", "youd",
+    "youll", "your", "youre", "yours", "yourself", "yourselves", "youve"
+)
+
+/// ── Porter Stemmer ─────────────────────────────────────────────────────
+
+let STEP2_PAIRS: List[List[string]] = [
+    ["ational", "ate"], ["tional", "tion"], ["enci", "ence"],
+    ["anci", "ance"], ["izer", "ize"], ["abli", "able"],
+    ["alli", "al"], ["entli", "ent"], ["eli", "e"],
+    ["ousli", "ous"], ["ization", "ize"], ["ation", "ate"],
+    ["ator", "ate"], ["alism", "al"], ["iveness", "ive"],
+    ["fulness", "ful"], ["ousness", "ous"], ["aliti", "al"],
+    ["iviti", "ive"], ["biliti", "ble"], ["logi", "log"]
+]
+
+let STEP3_PAIRS: List[List[string]] = [
+    ["icate", "ic"], ["ative", ""], ["alize", "al"],
+    ["iciti", "ic"], ["ical", "ic"], ["ful", ""], ["ness", ""]
+]
+
+let STEP4_SUFFIXES: List[string] = [
+    "al", "ance", "ence", "er", "ic", "able", "ible", "ant",
+    "ement", "ment", "ent", "ou", "ism", "ate", "iti", "ous",
+    "ive", "ize"
+]
+
+class PorterStemmer {
+    fn new() -> PorterStemmer {
+        return PorterStemmer {}
+    }
+
+    fn _is_consonant(self, word: string, i: int) -> bool {
+        let ch = word[i]
+        if ch in "aeiou" {
+            return false
+        }
+        if ch == "y" {
+            return i == 0 || !self._is_consonant(word, i - 1)
+        }
+        return true
+    }
+
+    fn _measure(self, stem: string) -> int {
+        if stem == "" { return 0 }
+        let cv: List[string] = []
+        let i = 0
+        while i < stem.len() {
+            let tag = "V"
+            if self._is_consonant(stem, i) { tag = "C" }
+            if cv.len() == 0 || cv[cv.len() - 1] != tag {
+                cv.append(tag)
+            }
+            i += 1
+        }
+        let cv_str = cv.join("")
+        let count = 0
+        let j = 0
+        while j < cv_str.len() - 1 {
+            if cv_str[j] == "V" && cv_str[j + 1] == "C" {
+                count += 1
+            }
+            j += 1
+        }
+        return count
+    }
+
+    fn _has_vowel(self, stem: string) -> bool {
+        let i = 0
+        while i < stem.len() {
+            if !self._is_consonant(stem, i) {
+                return true
+            }
+            i += 1
+        }
+        return false
+    }
+
+    fn _ends_double_consonant(self, word: string) -> bool {
+        return word.len() >= 2 && word[-1] == word[-2] && self._is_consonant(word, word.len() - 1)
+    }
+
+    fn _ends_cvc(self, word: string) -> bool {
+        if word.len() < 3 { return false }
+        return self._is_consonant(word, word.len() - 1) &&
+               !self._is_consonant(word, word.len() - 2) &&
+               self._is_consonant(word, word.len() - 3) &&
+               word[-1] not in "wxy"
+    }
+
+    fn _step1a(self, w: string) -> string {
+        if w.endswith("sses") { return w[0:-2] }
+        if w.endswith("ies") { return w[0:-2] }
+        if w.endswith("ss") { return w }
+        if w.endswith("s") { return w[0:-1] }
+        return w
+    }
+
+    fn _step1b(self, w: string) -> string {
+        if w.endswith("eed") {
+            let stem = w[0:-3]
+            if self._measure(stem) > 0 { return stem + "ee" }
+            return w
+        }
+
+        let removed = false
+        if w.endswith("ed") {
+            let stem = w[0:-2]
+            if self._has_vowel(stem) {
+                w = stem
+                removed = true
+            }
+        } else if w.endswith("ing") {
+            let stem = w[0:-3]
+            if self._has_vowel(stem) {
+                w = stem
+                removed = true
+            }
+        }
+
+        if removed {
+            if w.endswith("at") || w.endswith("bl") || w.endswith("iz") {
+                return w + "e"
+            }
+            if self._ends_double_consonant(w) && w[-1] not in "lsz" {
+                return w[0:-1]
+            }
+            if self._measure(w) == 1 && self._ends_cvc(w) {
+                return w + "e"
+            }
+        }
+        return w
+    }
+
+    fn _step1c(self, w: string) -> string {
+        if w.endswith("y") && self._has_vowel(w[0:-1]) {
+            return w[0:-1] + "i"
+        }
+        return w
+    }
+
+    fn _step2(self, w: string) -> string {
+        for pair in STEP2_PAIRS {
+            let suffix = pair[0]
+            let repl = pair[1]
+            if w.endswith(suffix) {
+                let stem = w[0:-suffix.len()]
+                if self._measure(stem) > 0 { return stem + repl }
+                return w
+            }
+        }
+        return w
+    }
+
+    fn _step3(self, w: string) -> string {
+        for pair in STEP3_PAIRS {
+            let suffix = pair[0]
+            let repl = pair[1]
+            if w.endswith(suffix) {
+                let stem = w[0:-suffix.len()]
+                if self._measure(stem) > 0 { return stem + repl }
+                return w
+            }
+        }
+        return w
+    }
+
+    fn _step4(self, w: string) -> string {
+        for suffix in STEP4_SUFFIXES {
+            if w.endswith(suffix) {
+                let stem = w[0:-suffix.len()]
+                if self._measure(stem) > 1 { return stem }
+                return w
+            }
+        }
+        if w.endswith("ion") {
+            let stem = w[0:-3]
+            if stem != "" && stem[-1] in "st" && self._measure(stem) > 1 {
+                return stem
+            }
+        }
+        return w
+    }
+
+    fn _step5a(self, w: string) -> string {
+        if w.endswith("e") {
+            let stem = w[0:-1]
+            let m = self._measure(stem)
+            if m > 1 { return stem }
+            if m == 1 && !self._ends_cvc(stem) { return stem }
+        }
+        return w
+    }
+
+    fn _step5b(self, w: string) -> string {
+        if self._measure(w) > 1 && self._ends_double_consonant(w) && w[-1] == "l" {
+            return w[0:-1]
+        }
+        return w
+    }
+
+    fn stem(self, word: string) -> string {
+        let w = word.lower()
+        if w.len() <= 2 { return w }
+        w = self._step1a(w)
+        w = self._step1b(w)
+        w = self._step1c(w)
+        w = self._step2(w)
+        w = self._step3(w)
+        w = self._step4(w)
+        w = self._step5a(w)
+        w = self._step5b(w)
+        return w
+    }
+}
+
+/// ── Text Processor ─────────────────────────────────────────────────────
+
+let TOKEN_RE = re.compile("[a-z]+")
+
+class TextProcessor {
+    fn new() -> TextProcessor {
+        let tp = TextProcessor {}
+        tp._stemmer = PorterStemmer.new()
+        return tp
+    }
+
+    fn stem(self, word: string) -> string {
+        return self._stemmer.stem(word)
+    }
+
+    fn tokenize(self, text: string) -> List[any] {
+        return TOKEN_RE.findall(text.lower())
+    }
+
+    fn remove_stopwords(self, tokens: List[string]) -> List[any] {
+        let result: List[string] = []
+        for t in tokens {
+            if t not in STOP_WORDS && t.len() > 1 {
+                result.append(t)
+            }
+        }
+        return result
+    }
+
+    fn extract_ngrams(self, tokens: List[string], n: int) -> List[any] {
+        if tokens.len() < n { return [] }
+        let result: List[string] = []
+        let i = 0
+        while i <= tokens.len() - n {
+            result.append(tokens[i:i + n].join("_"))
+            i += 1
+        }
+        return result
+    }
+
+    fn normalize(self, text: string) -> List[any] {
+        let tokens = self.tokenize(text)
+        tokens = self.remove_stopwords(tokens)
+        let stemmed: List[string] = []
+        for t in tokens {
+            stemmed.append(self._stemmer.stem(t))
+        }
+        return stemmed
+    }
+}
+
+/// ── TF-IDF Engine ──────────────────────────────────────────────────────
+
+class TFIDFEngine {
+    fn new() -> TFIDFEngine {
+        let e = TFIDFEngine {}
+        e._documents = {}
+        e._idf_cache = {}
+        e._processor = TextProcessor.new()
+        e._dirty = true
+        return e
+    }
+
+    fn add_document(self, doc_id: string, text: string) -> void {
+        self._documents[doc_id] = self._processor.normalize(text)
+        self._dirty = true
+    }
+
+    fn remove_document(self, doc_id: string) -> void {
+        if doc_id in self._documents {
+            self._documents.remove(doc_id)
+        }
+        self._dirty = true
+    }
+
+    fn _compute_idf(self) -> void {
+        if !self._dirty { return }
+        let n = self._documents.len()
+        if n == 0 {
+            self._idf_cache = {}
+            self._dirty = false
+            return
+        }
+        let df: Dict[string, int] = {}
+        for doc_id, tokens in self._documents.items() {
+            let unique_terms = Set.from(tokens)
+            for term in unique_terms {
+                df[term] = df.get(term, 0) + 1
+            }
+        }
+        self._idf_cache = {}
+        for t, d in df.items() {
+            self._idf_cache[t] = math.log(n / d)
+        }
+        self._dirty = false
+    }
+
+    fn tf_idf(self, doc_id: string) -> Dict[string, float] {
+        self._compute_idf()
+        let tokens = self._documents.get(doc_id, None)
+        if tokens == None || tokens.len() == 0 { return {} }
+        let tf = counter(tokens)
+        let length = tokens.len()
+        let result: Dict[string, float] = {}
+        for t, c in tf.items() {
+            result[t] = (c / length) * self._idf_cache.get(t, 0.0)
+        }
+        return result
+    }
+
+    fn query_similarity(self, query: string, top_k: int) -> List[any] {
+        self._compute_idf()
+        let q_tokens = self._processor.normalize(query)
+        if q_tokens.len() == 0 || self._documents.len() == 0 { return [] }
+
+        let tf_q = counter(q_tokens)
+        let q_len = q_tokens.len()
+        let q_vec: Dict[string, float] = {}
+        for t, c in tf_q.items() {
+            q_vec[t] = (c / q_len) * self._idf_cache.get(t, 0.0)
+        }
+
+        let results: List[List[any]] = []
+        for doc_id in self._documents.keys() {
+            let score = _cosine(q_vec, self.tf_idf(doc_id))
+            if score > 0.0 {
+                results.append([doc_id, score])
+            }
+        }
+        results.sort_by(fn(x) { return -x[1] })
+        return results[0:top_k]
+    }
+
+    fn document_similarity(self, doc_a: string, doc_b: string) -> float {
+        let va = self.tf_idf(doc_a)
+        let vb = self.tf_idf(doc_b)
+        if va.len() == 0 || vb.len() == 0 { return 0.0 }
+        return _cosine(va, vb)
+    }
+}
+
+fn _cosine(vec_a: Dict[string, float], vec_b: Dict[string, float]) -> float {
+    if vec_a.len() == 0 || vec_b.len() == 0 { return 0.0 }
+    let a = vec_a
+    let b = vec_b
+    if a.len() > b.len() {
+        a = vec_b
+        b = vec_a
+    }
+    let dot = 0.0
+    for k, v in a.items() {
+        if k in b {
+            dot += v * b[k]
+        }
+    }
+    if dot == 0.0 { return 0.0 }
+    let mag_a = 0.0
+    for v in a.values() { mag_a += v * v }
+    mag_a = math.sqrt(mag_a)
+    let mag_b = 0.0
+    for v in b.values() { mag_b += v * v }
+    mag_b = math.sqrt(mag_b)
+    let denom = mag_a * mag_b
+    if denom <= 0.0 { return 0.0 }
+    return dot / denom
+}
+
+/// ── BM25 Engine ────────────────────────────────────────────────────────
+
+class BM25Engine {
+    fn new(k1: float, b: float) -> BM25Engine {
+        let e = BM25Engine {}
+        e._k1 = k1
+        e._b = b
+        e._documents = {}
+        e._doc_lengths = {}
+        e._avg_doc_length = 0.0
+        e._df = {}
+        e._processor = TextProcessor.new()
+        return e
+    }
+
+    fn add_document(self, doc_id: string, text: string) -> void {
+        let tokens = self._processor.normalize(text)
+        if doc_id in self._documents {
+            self._remove_doc_stats(doc_id)
+        }
+        self._documents[doc_id] = tokens
+        self._doc_lengths[doc_id] = tokens.len()
+        let unique = Set.from(tokens)
+        for term in unique {
+            self._df[term] = self._df.get(term, 0) + 1
+        }
+        let total = 0
+        for v in self._doc_lengths.values() { total += v }
+        if self._documents.len() > 0 {
+            self._avg_doc_length = total / self._documents.len()
+        } else {
+            self._avg_doc_length = 0.0
+        }
+    }
+
+    fn remove_document(self, doc_id: string) -> void {
+        if doc_id not in self._documents { return }
+        self._remove_doc_stats(doc_id)
+        self._documents.remove(doc_id)
+        self._doc_lengths.remove(doc_id)
+        let total = 0
+        for v in self._doc_lengths.values() { total += v }
+        if self._documents.len() > 0 {
+            self._avg_doc_length = total / self._documents.len()
+        } else {
+            self._avg_doc_length = 0.0
+        }
+    }
+
+    fn _remove_doc_stats(self, doc_id: string) -> void {
+        let unique = Set.from(self._documents[doc_id])
+        for term in unique {
+            self._df[term] = self._df.get(term, 0) - 1
+            if self._df[term] <= 0 {
+                self._df.remove(term)
+            }
+        }
+    }
+
+    fn score(self, query: string) -> List[any] {
+        let query_terms = self._processor.normalize(query)
+        if query_terms.len() == 0 || self._documents.len() == 0 { return [] }
+        let results: List[List[any]] = []
+        for doc_id in self._documents.keys() {
+            let s = self._bm25_score(query_terms, doc_id)
+            if s > 0.0 {
+                results.append([doc_id, s])
+            }
+        }
+        results.sort_by(fn(x) { return -x[1] })
+        return results
+    }
+
+    fn _bm25_score(self, query_terms: List[string], doc_id: string) -> float {
+        let doc = self._documents[doc_id]
+        let doc_len = self._doc_lengths[doc_id]
+        let tf = counter(doc)
+        let n_docs = self._documents.len()
+        let avgdl = self._avg_doc_length
+        if avgdl <= 0.0 { avgdl = 1.0 }
+
+        let total = 0.0
+        for q in query_terms {
+            let f = tf.get(q, 0)
+            if f == 0 { continue }
+            let df_val = self._df.get(q, 0)
+            let idf = math.log(1.0 + (n_docs - df_val + 0.5) / (df_val + 0.5))
+            let num = f * (self._k1 + 1.0)
+            let den = f + self._k1 * (1.0 - self._b + self._b * doc_len / avgdl)
+            total += idf * num / den
+        }
+        return total
+    }
+}
+
+/// ── Concept Network ────────────────────────────────────────────────────
+
+let SYNONYM_DATA: List[string] = [
+    "hypothesis theory conjecture proposition thesis postulate",
+    "experiment test trial study investigation inquiry",
+    "observe watch monitor examine inspect scrutinise",
+    "analyse analyze examine study investigate scrutinize",
+    "discover find uncover reveal detect identify",
+    "prove demonstrate verify confirm validate substantiate",
+    "atom particle molecule element nucleus",
+    "energy power force vigour vigor",
+    "evolve develop advance progress mature grow",
+    "measure quantify gauge assess evaluate calibrate",
+    "computer machine processor device workstation server",
+    "program software application app code script",
+    "internet web network cyberspace net online",
+    "data information records facts dataset",
+    "algorithm procedure method process routine technique",
+    "database repository datastore archive warehouse",
+    "bug defect error fault glitch flaw malfunction",
+    "encrypt encode cipher scramble obfuscate protect",
+    "download fetch retrieve pull obtain acquire",
+    "upload send transmit push publish deploy",
+    "law legislation statute regulation rule ordinance act",
+    "judge justice magistrate arbitrator adjudicator referee",
+    "lawyer attorney counsel advocate solicitor barrister",
+    "crime offense violation infraction felony misdemeanor",
+    "guilty culpable liable responsible blameworthy",
+    "innocent blameless guiltless acquitted exonerated cleared",
+    "evidence proof testimony exhibit documentation witness",
+    "trial hearing proceeding litigation case prosecution",
+    "sentence penalty punishment sanction verdict judgement",
+    "contract agreement pact covenant treaty accord",
+    "doctor physician practitioner medic clinician surgeon",
+    "patient invalid sufferer client subject",
+    "disease illness sickness ailment condition malady disorder",
+    "medicine drug medication remedy treatment pharmaceutical",
+    "surgery operation procedure intervention incision",
+    "hospital clinic infirmary facility centre center",
+    "symptom sign indication manifestation marker signal",
+    "diagnosis assessment evaluation prognosis analysis",
+    "cure heal treat remedy restore recover",
+    "pain ache soreness discomfort agony suffering torment",
+    "money cash currency funds capital wealth finance",
+    "buy purchase acquire procure obtain order",
+    "sell trade market vend retail distribute",
+    "price cost value worth expense charge fee",
+    "profit gain earnings revenue income return yield",
+    "loss deficit shortfall setback decline downturn",
+    "bank institution lender treasury reserve",
+    "tax levy duty tariff excise toll",
+    "debt liability obligation loan mortgage arrears",
+    "invest fund sponsor bankroll underwrite finance",
+    "happy glad pleased content joyful cheerful delighted elated",
+    "sad unhappy sorrowful melancholy gloomy dejected mournful",
+    "angry furious enraged irate livid wrathful incensed hostile",
+    "afraid scared frightened terrified fearful anxious nervous",
+    "brave courageous bold valiant fearless daring heroic gallant",
+    "calm peaceful serene tranquil placid composed relaxed",
+    "excited thrilled enthusiastic eager elated exhilarated keen",
+    "tired exhausted fatigued weary drained spent depleted",
+    "confused puzzled bewildered perplexed baffled mystified",
+    "proud dignified honoured honored gratified satisfied",
+    "run execute operate perform accomplish carry",
+    "create make build construct generate produce craft",
+    "delete remove erase eliminate destroy discard purge",
+    "change modify alter adjust transform revise amend",
+    "find search locate discover detect uncover pinpoint",
+    "send transmit dispatch deliver forward relay ship",
+    "receive get obtain acquire accept collect gather",
+    "start begin initiate launch commence activate trigger",
+    "stop end halt cease terminate discontinue finish",
+    "move shift transfer relocate transport migrate displace",
+    "big large huge enormous massive immense vast giant colossal",
+    "small tiny little minute miniature diminutive petite compact",
+    "fast quick rapid swift speedy hasty brisk prompt",
+    "slow sluggish gradual leisurely unhurried plodding languid",
+    "good excellent great fine superb outstanding splendid magnificent",
+    "bad poor terrible awful dreadful horrible atrocious abysmal",
+    "beautiful pretty lovely gorgeous stunning attractive exquisite",
+    "ugly hideous unsightly grotesque repulsive unattractive homely",
+    "strong powerful mighty robust sturdy tough forceful potent",
+    "weak feeble frail fragile delicate flimsy vulnerable faint",
+    "war conflict battle combat warfare hostility skirmish",
+    "soldier warrior fighter combatant trooper veteran",
+    "weapon arm armament munition ordnance arsenal",
+    "attack assault offensive strike raid onslaught blitz",
+    "defend protect guard shield fortify secure garrison",
+    "retreat withdraw disengage flee evacuate retire regroup",
+    "victory win triumph conquest success prevail",
+    "defeat loss rout failure surrender capitulation",
+    "army military forces troops legion regiment brigade",
+    "peace ceasefire truce armistice accord detente reconciliation",
+    "government administration regime authority state governance",
+    "leader chief head ruler commander president premier",
+    "election vote ballot poll referendum plebiscite",
+    "party faction coalition bloc movement caucus",
+    "policy platform agenda programme initiative strategy",
+    "democracy republic commonwealth federation union",
+    "freedom liberty independence autonomy emancipation sovereignty",
+    "power authority control dominion influence command supremacy",
+    "citizen national resident subject inhabitant denizen",
+    "revolution uprising revolt rebellion insurrection coup mutiny",
+    "country nation state land territory realm dominion",
+    "city town municipality metropolis settlement borough",
+    "mountain peak summit hill ridge highland plateau",
+    "river stream creek brook waterway tributary channel",
+    "ocean sea waters maritime nautical marine",
+    "forest woods woodland jungle grove thicket copse",
+    "desert wasteland barren arid dryland steppe",
+    "island isle atoll archipelago islet cay",
+    "valley gorge canyon ravine glen basin hollow",
+    "lake pond reservoir lagoon pool loch",
+    "say tell speak state declare announce utter voice proclaim",
+    "write compose author draft pen scribe inscribe",
+    "ask question inquire query request interrogate probe",
+    "answer reply respond retort counter rejoin",
+    "explain clarify elucidate elaborate expound illustrate",
+    "understand comprehend grasp fathom perceive appreciate",
+    "agree concur consent approve accept endorse ratify",
+    "disagree object protest oppose dissent dispute contest",
+    "argue debate discuss contend dispute deliberate",
+    "teach instruct educate train coach tutor mentor",
+    "animal creature beast organism fauna wildlife",
+    "plant flora vegetation greenery botanical herb shrub",
+    "weather climate atmosphere conditions forecast",
+    "earth ground soil dirt terrain surface land",
+    "fire flame blaze inferno combustion conflagration",
+    "water liquid fluid aqua moisture hydrate",
+    "light illumination brightness radiance luminosity glow shine",
+    "dark darkness shadow shade gloom obscurity murk",
+    "wind breeze gale gust draft tempest cyclone",
+    "rain precipitation downpour shower drizzle deluge torrent",
+    "cat feline kitty tabby tomcat",
+    "dog canine hound puppy mutt",
+    "home house residence dwelling abode domicile",
+    "food meal nourishment sustenance cuisine fare",
+    "child kid youngster juvenile minor youth toddler",
+    "man male gentleman fellow guy bloke",
+    "woman female lady dame gal",
+    "friend companion ally comrade mate buddy pal",
+    "enemy foe adversary opponent rival antagonist nemesis",
+    "smart intelligent clever bright brilliant sharp witty",
+    "stupid foolish dumb idiotic silly senseless",
+    "old ancient aged elderly vintage mature antique",
+    "young youthful juvenile fresh immature adolescent",
+    "rich wealthy affluent prosperous opulent moneyed",
+    "poor impoverished destitute needy penniless indigent",
+    "walk stroll amble saunter stride hike trek",
+    "run sprint jog dash race gallop rush hurry",
+    "important significant crucial vital essential critical key",
+    "dangerous hazardous risky perilous unsafe treacherous",
+    "safe secure protected sheltered guarded",
+    "clean neat tidy spotless pristine immaculate",
+    "dirty filthy grimy soiled unclean muddy",
+    "empty vacant hollow bare void blank",
+    "full complete filled packed loaded brimming",
+    "correct right accurate precise exact proper",
+    "wrong incorrect mistaken erroneous inaccurate faulty",
+    "easy simple straightforward effortless uncomplicated",
+    "hard difficult challenging tough arduous strenuous",
+    "help assist aid support facilitate bolster",
+    "problem issue trouble difficulty obstacle challenge hurdle",
+    "answer solution response resolution reply"
+]
+
+let HYPERNYM_DATA: Dict[string, string] = {
+    "dog": "animal", "cat": "animal", "bird": "animal",
+    "fish": "animal", "horse": "animal", "whale": "animal",
+    "apple": "fruit", "banana": "fruit", "orange": "fruit",
+    "grape": "fruit", "peach": "fruit", "mango": "fruit",
+    "car": "vehicle", "bus": "vehicle", "truck": "vehicle",
+    "bicycle": "vehicle", "motorcycle": "vehicle", "train": "vehicle",
+    "python": "language", "java": "language", "rust": "language",
+    "oak": "tree", "pine": "tree", "maple": "tree",
+    "gold": "metal", "silver": "metal", "iron": "metal",
+    "doctor": "profession", "lawyer": "profession", "teacher": "profession",
+    "soccer": "sport", "tennis": "sport", "basketball": "sport",
+    "rifle": "weapon", "sword": "weapon", "cannon": "weapon",
+    "dollar": "currency", "euro": "currency", "yen": "currency",
+    "earth": "planet", "mars": "planet", "venus": "planet",
+    "hydrogen": "element", "oxygen": "element", "carbon": "element"
+}
+
+let RELATED_DATA: Dict[string, List[string]] = {
+    "car": ["road", "drive", "engine", "wheel", "fuel", "highway"],
+    "computer": ["keyboard", "monitor", "software", "internet", "code"],
+    "hospital": ["doctor", "nurse", "patient", "medicine", "surgery"],
+    "school": ["teacher", "student", "classroom", "education", "learn"],
+    "ocean": ["wave", "fish", "coral", "tide", "shore", "depth"],
+    "forest": ["tree", "wildlife", "leaf", "soil", "canopy", "trail"],
+    "city": ["building", "road", "traffic", "population", "urban"],
+    "war": ["soldier", "weapon", "strategy", "casualty", "territory"],
+    "election": ["candidate", "voter", "campaign", "debate", "ballot"],
+    "economy": ["market", "trade", "growth", "inflation", "employment"],
+    "music": ["rhythm", "melody", "harmony", "instrument", "composer"],
+    "space": ["star", "galaxy", "orbit", "astronaut", "rocket"]
+}
+
+class ConceptNetwork {
+    fn new() -> ConceptNetwork {
+        let cn = ConceptNetwork {}
+        cn._synonyms = {}
+        cn._hypernyms = {}
+        cn._related = {}
+        cn._load_core_concepts()
+        return cn
+    }
+
+    fn _load_core_concepts(self) -> void {
+        let stemmer = PorterStemmer.new()
+
+        for group_str in SYNONYM_DATA {
+            let words = Set.from(group_str.split(" "))
+            let stems: Set[string] = Set.new()
+            for w in words {
+                stems.add(stemmer.stem(w))
+            }
+            let all_forms = words.union(stems)
+            for form in all_forms {
+                if form not in self._synonyms {
+                    self._synonyms[form] = Set.new()
+                }
+                for other in all_forms {
+                    if other != form {
+                        self._synonyms[form].add(other)
+                    }
+                }
+            }
+        }
+
+        for child, parent in HYPERNYM_DATA.items() {
+            if child not in self._hypernyms { self._hypernyms[child] = Set.new() }
+            self._hypernyms[child].add(parent)
+            let c_stem = stemmer.stem(child)
+            if c_stem != child {
+                if c_stem not in self._hypernyms { self._hypernyms[c_stem] = Set.new() }
+                self._hypernyms[c_stem].add(parent)
+            }
+        }
+
+        for word, related_list in RELATED_DATA.items() {
+            if word not in self._related { self._related[word] = Set.new() }
+            for r in related_list {
+                self._related[word].add(r)
+            }
+            let w_stem = stemmer.stem(word)
+            if w_stem != word {
+                if w_stem not in self._related { self._related[w_stem] = Set.new() }
+                for r in related_list {
+                    self._related[w_stem].add(r)
+                }
+            }
+        }
+    }
+
+    fn synonyms(self, word: string) -> any {
+        let result = self._synonyms.get(word, None)
+        if result != None { return Set.copy(result) }
+        let suffixes = ["li", "i", "er", "est", "ment", "ness"]
+        for sfx in suffixes {
+            if word.endswith(sfx) && word.len() > sfx.len() + 2 {
+                let truncated = word[0:-sfx.len()]
+                result = self._synonyms.get(truncated, None)
+                if result != None { return Set.copy(result) }
+            }
+        }
+        return Set.new()
+    }
+
+    fn expand_query(self, tokens: List[string]) -> List[any] {
+        let seen: Set[string] = Set.new()
+        let expanded: List[string] = []
+        for token in tokens {
+            if token not in seen {
+                seen.add(token)
+                expanded.append(token)
+            }
+            let syns = self._synonyms.get(token, Set.new())
+            let sorted_syns = syns.sorted()
+            for syn in sorted_syns {
+                if syn not in seen {
+                    seen.add(syn)
+                    expanded.append(syn)
+                }
+            }
+        }
+        return expanded
+    }
+
+    fn similarity(self, word_a: string, word_b: string) -> float {
+        if word_a == word_b { return 1.0 }
+        let syns_a = self.synonyms(word_a)
+        if word_b in syns_a { return 0.9 }
+        let syns_b = self.synonyms(word_b)
+        if syns_a.intersection(syns_b).len() > 0 { return 0.7 }
+        let hyp_a = self._hypernyms.get(word_a, Set.new())
+        let hyp_b = self._hypernyms.get(word_b, Set.new())
+        if word_b in hyp_a || word_a in hyp_b { return 0.6 }
+        if hyp_a.intersection(hyp_b).len() > 0 { return 0.4 }
+        let rel_a = self._related.get(word_a, Set.new())
+        if word_b in rel_a { return 0.3 }
+        let rel_b = self._related.get(word_b, Set.new())
+        if word_a in rel_b { return 0.3 }
+        return 0.0
+    }
+
+    fn add_synonym(self, word_a: string, word_b: string) -> void {
+        if word_a not in self._synonyms { self._synonyms[word_a] = Set.new() }
+        self._synonyms[word_a].add(word_b)
+        if word_b not in self._synonyms { self._synonyms[word_b] = Set.new() }
+        self._synonyms[word_b].add(word_a)
+    }
+
+    fn add_hypernym(self, word: string, hypernym: string) -> void {
+        if word not in self._hypernyms { self._hypernyms[word] = Set.new() }
+        self._hypernyms[word].add(hypernym)
+    }
+}
+
+/// ── Semantic Engine — unified API ──────────────────────────────────────
+
+class SemanticEngine {
+    fn new() -> SemanticEngine {
+        let se = SemanticEngine {}
+        se._tfidf = TFIDFEngine.new()
+        se._bm25 = BM25Engine.new(1.5, 0.75)
+        se._concepts = ConceptNetwork.new()
+        se._processor = TextProcessor.new()
+        return se
+    }
+
+    fn similarity(self, text_a: string, text_b: string) -> float {
+        let tokens_a = self._processor.normalize(text_a)
+        let tokens_b = self._processor.normalize(text_b)
+
+        if tokens_a.len() == 0 && tokens_b.len() == 0 { return 1.0 }
+        if tokens_a.len() == 0 || tokens_b.len() == 0 { return 0.0 }
+
+        let set_a = Set.from(tokens_a)
+        let set_b = Set.from(tokens_b)
+
+        let union_set = set_a.union(set_b)
+        let intersect = set_a.intersection(set_b)
+        let jaccard = 0.0
+        if union_set.len() > 0 { jaccard = intersect.len() / union_set.len() }
+
+        let exp_a = Set.from(self._concepts.expand_query(tokens_a))
+        let exp_b = Set.from(self._concepts.expand_query(tokens_b))
+        let exp_union = exp_a.union(exp_b)
+        let syn_jaccard = 0.0
+        if exp_union.len() > 0 {
+            syn_jaccard = exp_a.intersection(exp_b).len() / exp_union.len()
+        }
+
+        let len_a = tokens_a.len()
+        let len_b = tokens_b.len()
+        let tf_a: Dict[string, float] = {}
+        let count_a = counter(tokens_a)
+        for t, c in count_a.items() { tf_a[t] = c / len_a }
+        let tf_b: Dict[string, float] = {}
+        let count_b = counter(tokens_b)
+        for t, c in count_b.items() { tf_b[t] = c / len_b }
+        let tf_cos = _cosine(tf_a, tf_b)
+
+        let soft_scores: List[float] = []
+        for ta in set_a {
+            let best = 0.0
+            for tb in set_b {
+                let s = self._concepts.similarity(ta, tb)
+                if s > best { best = s }
+            }
+            soft_scores.append(best)
+        }
+        for tb in set_b {
+            let best = 0.0
+            for ta in set_a {
+                let s = self._concepts.similarity(tb, ta)
+                if s > best { best = s }
+            }
+            soft_scores.append(best)
+        }
+        let soft_sim = 0.0
+        if soft_scores.len() > 0 {
+            let total = 0.0
+            for ss in soft_scores { total += ss }
+            soft_sim = total / soft_scores.len()
+        }
+
+        let bg_a = Set.from(self._processor.extract_ngrams(tokens_a, 2))
+        let bg_b = Set.from(self._processor.extract_ngrams(tokens_b, 2))
+        let bg_union = bg_a.union(bg_b)
+        let bigram_sim = 0.0
+        if bg_union.len() > 0 {
+            bigram_sim = bg_a.intersection(bg_b).len() / bg_union.len()
+        }
+
+        let score = 0.20 * jaccard + 0.20 * syn_jaccard + 0.15 * tf_cos + 0.35 * soft_sim + 0.10 * bigram_sim
+        if score < 0.0 { score = 0.0 }
+        if score > 1.0 { score = 1.0 }
+        return score
+    }
+
+    fn best_match(self, query: string, candidates: List[string], top_k: int) -> List[any] {
+        let scored: List[List[any]] = []
+        let idx = 0
+        for candidate in candidates {
+            let s = self.similarity(query, candidate)
+            scored.append([candidate, s, idx])
+            idx += 1
+        }
+        scored.sort_by(fn(x) { return -x[1] })
+        return scored[0:top_k]
+    }
+
+    fn is_relevant(self, text: string, query: string, threshold: float) -> bool {
+        return self.similarity(text, query) >= threshold
+    }
+
+    fn extract_key_concepts(self, text: string) -> List[any] {
+        let tokens = self._processor.normalize(text)
+        if tokens.len() == 0 { return [] }
+        let tf = counter(tokens)
+        let total = tokens.len()
+        let unique = tf.len()
+
+        let scores: Dict[string, float] = {}
+        for term, count in tf.items() {
+            let freq = count / total
+            let rarity = math.log(1.0 + unique / count)
+            let specificity = term.len() / 6.0
+            if specificity > 1.5 { specificity = 1.5 }
+            scores[term] = freq * rarity * specificity
+        }
+
+        let max_s = 1.0
+        for v in scores.values() {
+            if v > max_s { max_s = v }
+        }
+        let result: List[List[any]] = []
+        for t, s in scores.items() {
+            result.append([t, s / max_s])
+        }
+        result.sort_by(fn(x) { return -x[1] })
+        return result
+    }
+
+    fn cluster_by_topic(self, texts: List[string], n_clusters: int) -> Dict[int, List[int]] {
+        let n = texts.len()
+        if n == 0 { return {} }
+        if n_clusters > n { n_clusters = n }
+        if n_clusters <= 1 {
+            let indices: List[int] = []
+            let i = 0
+            while i < n { indices.append(i); i += 1 }
+            return {0: indices}
+        }
+
+        let sim: Dict[string, float] = {}
+        let i = 0
+        while i < n {
+            let j = i + 1
+            while j < n {
+                let s = self.similarity(texts[i], texts[j])
+                sim[string(i) + ":" + string(j)] = s
+                sim[string(j) + ":" + string(i)] = s
+                j += 1
+            }
+            i += 1
+        }
+
+        fn _sim(a: int, b: int) -> float {
+            if a == b { return 1.0 }
+            return sim.get(string(a) + ":" + string(b), 0.0)
+        }
+
+        let medoids: List[int] = [0]
+        let medoid_set: Set[int] = Set.of(0)
+        let mc = 1
+        while mc < n_clusters {
+            let best_idx = -1
+            let lowest_nearest = 999999.0
+            let ci = 0
+            while ci < n {
+                if ci in medoid_set { ci += 1; continue }
+                let nearest = -1.0
+                for m in medoids {
+                    let sv = _sim(ci, m)
+                    if sv > nearest { nearest = sv }
+                }
+                if nearest < lowest_nearest {
+                    lowest_nearest = nearest
+                    best_idx = ci
+                }
+                ci += 1
+            }
+            if best_idx < 0 { break }
+            medoids.append(best_idx)
+            medoid_set.add(best_idx)
+            mc += 1
+        }
+
+        let clusters: Dict[int, List[int]] = {}
+        let ci = 0
+        while ci < n {
+            let best_c = 0
+            let best_s = -1.0
+            let mi = 0
+            while mi < medoids.len() {
+                let sv = _sim(ci, medoids[mi])
+                if sv > best_s {
+                    best_s = sv
+                    best_c = mi
+                }
+                mi += 1
+            }
+            if best_c not in clusters { clusters[best_c] = [] }
+            clusters[best_c].append(ci)
+            ci += 1
+        }
+        return clusters
+    }
+
+    fn expand_query(self, query: string) -> string {
+        let tokens = self._processor.normalize(query)
+        let expanded = self._concepts.expand_query(tokens)
+        return expanded.join(" ")
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        let syn_pairs = 0
+        for v in self._concepts._synonyms.values() { syn_pairs += v.len() }
+        let hyp_count = 0
+        for v in self._concepts._hypernyms.values() { hyp_count += v.len() }
+        let rel_count = 0
+        for v in self._concepts._related.values() { rel_count += v.len() }
+        return {
+            "tfidf_documents": self._tfidf._documents.len(),
+            "bm25_documents": self._bm25._documents.len(),
+            "concept_synonym_keys": self._concepts._synonyms.len(),
+            "concept_synonym_pairs": syn_pairs,
+            "concept_hypernyms": hyp_count,
+            "concept_related": rel_count,
+            "stop_words": STOP_WORDS.len()
+        }
+    }
+
+    fn tfidf(self) -> TFIDFEngine { return self._tfidf }
+    fn bm25(self) -> BM25Engine { return self._bm25 }
+    fn concepts(self) -> ConceptNetwork { return self._concepts }
+    fn processor(self) -> TextProcessor { return self._processor }
+}
+
+export TextProcessor, TFIDFEngine, BM25Engine, ConceptNetwork, SemanticEngine

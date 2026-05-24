@@ -1,0 +1,547 @@
+/// NRSI — Autonomous Curiosity Loop.
+///
+/// Identifies knowledge gaps, generates learning goals, and actively
+/// seeks to fill them via web retrieval and fact extraction.
+/// All transformer-free.
+
+module reasoning_curiosity
+
+
+import time from "std/time"
+from "reasoning_graph" import CausalGraph, FactExtractor, GraphNode, RelationType
+
+/// ---------- Enums ----------
+
+enum GapType {
+    ISOLATED_NODE = "isolated_node",
+    WEAK_EDGE = "weak_edge",
+    SPARSE_DOMAIN = "sparse_domain",
+    MISSING_RELATION = "missing_relation",
+    LOW_CONFIDENCE_CHAIN = "low_confidence_chain",
+    SELF_MODEL_WEAKNESS = "self_model_weakness"
+}
+
+enum GoalPriority {
+    CRITICAL = "critical",
+    HIGH = "high",
+    MEDIUM = "medium",
+    LOW = "low"
+}
+
+/// ---------- Types ----------
+
+type KnowledgeGap {
+    gap_type: GapType,
+    description: string,
+    domain: string,
+    concepts: List[string],
+    severity: float,
+    created_at: float
+}
+
+fn gap_id(g: KnowledgeGap) -> string {
+    let sorted_concepts: List[string] = []
+    for i in range(min(3, len(g.concepts))) {
+        sorted_concepts.append(g.concepts[i])
+    }
+    return g.gap_type.value + ":" + ":".join(sorted_concepts)
+}
+
+type LearningGoal {
+    question: string,
+    target_concepts: List[string],
+    domain: string,
+    priority: GoalPriority,
+    source_gap: KnowledgeGap,
+    confidence_target: float,
+    attempts: int,
+    resolved: bool,
+    created_at: float
+}
+
+fn goal_id(g: LearningGoal) -> string {
+    let q = g.question
+    if len(q) > 40 {
+        q = q[:40]
+    }
+    return "goal:" + g.domain + ":" + q
+}
+
+type CuriosityReport {
+    gaps_found: int,
+    goals_generated: int,
+    goals_resolved: int,
+    facts_acquired: int,
+    triples_added: int,
+    domains_scanned: List[string],
+    top_gaps: List[KnowledgeGap],
+    top_goals: List[LearningGoal],
+    duration_ms: int
+}
+
+/// ---------- Gap Analyzer ----------
+
+class GapAnalyzer {
+    fn __init__(self, graph: CausalGraph, weak_edge_threshold: float,
+                sparse_ratio_threshold: float) {
+        self._graph = graph
+        if weak_edge_threshold == None {
+            weak_edge_threshold = 0.3
+        }
+        if sparse_ratio_threshold == None {
+            sparse_ratio_threshold = 0.5
+        }
+        self._weak_threshold = weak_edge_threshold
+        self._sparse_ratio = sparse_ratio_threshold
+    }
+
+    fn analyze(self, domain_filter: Optional[string]) -> List[any] {
+        let gaps: List[KnowledgeGap] = []
+        let g1 = self._find_isolated_nodes(domain_filter)
+        for g in g1 {
+            gaps.append(g)
+        }
+        let g2 = self._find_weak_edges(domain_filter)
+        for g in g2 {
+            gaps.append(g)
+        }
+        let g3 = self._find_sparse_domains(domain_filter)
+        for g in g3 {
+            gaps.append(g)
+        }
+        let g4 = self._find_missing_relations(domain_filter)
+        for g in g4 {
+            gaps.append(g)
+        }
+
+        let sorted_gaps: List[KnowledgeGap] = []
+        let remaining = list(gaps)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i].severity > remaining[best_idx].severity {
+                    best_idx = i
+                }
+            }
+            sorted_gaps.append(remaining.pop(best_idx))
+        }
+        return sorted_gaps
+    }
+
+    fn _find_isolated_nodes(self, domain: Optional[string]) -> List[any] {
+        let gaps: List[KnowledgeGap] = []
+        for node in self._graph.isolated_nodes() {
+            if domain != None and node.domain != domain {
+                continue
+            }
+            gaps.append(KnowledgeGap {
+                gap_type: GapType.ISOLATED_NODE,
+                description: "'" + node.concept + "' has no relations to other concepts. What causes it? What does it affect?",
+                domain: node.domain,
+                concepts: [node.concept],
+                severity: 0.7,
+                created_at: time.time()
+            })
+        }
+        return gaps
+    }
+
+    fn _find_weak_edges(self, domain: Optional[string]) -> List[any] {
+        let gaps: List[KnowledgeGap] = []
+        for edge in self._graph.all_edges() {
+            if domain != None and edge.domain != domain {
+                continue
+            }
+            if edge.confidence < self._weak_threshold {
+                gaps.append(KnowledgeGap {
+                    gap_type: GapType.WEAK_EDGE,
+                    description: "Low-confidence link: '" + edge.source + "' " + edge.relation.value + " '" + edge.target + "' (confidence=" + str(round(edge.confidence, 2)) + "). Needs stronger evidence.",
+                    domain: edge.domain,
+                    concepts: [edge.source, edge.target],
+                    severity: 0.5 + (self._weak_threshold - edge.confidence),
+                    created_at: time.time()
+                })
+            }
+        }
+        return gaps
+    }
+
+    fn _find_sparse_domains(self, domain: Optional[string]) -> List[any] {
+        let domain_stats: Dict[string, Dict[string, int]] = {}
+        for node in self._graph.all_nodes() {
+            if node.domain != "" {
+                if node.domain not in domain_stats {
+                    domain_stats[node.domain] = {"nodes": 0, "edges": 0}
+                }
+                domain_stats[node.domain]["nodes"] += 1
+            }
+        }
+        for edge in self._graph.all_edges() {
+            if edge.domain != "" {
+                if edge.domain not in domain_stats {
+                    domain_stats[edge.domain] = {"nodes": 0, "edges": 0}
+                }
+                domain_stats[edge.domain]["edges"] += 1
+            }
+        }
+
+        let gaps: List[KnowledgeGap] = []
+        for d in domain_stats {
+            if domain != None and d != domain {
+                continue
+            }
+            let stats = domain_stats[d]
+            if stats["nodes"] == 0 {
+                continue
+            }
+            let ratio = stats["edges"] / stats["nodes"]
+            if ratio < self._sparse_ratio {
+                let sev = 0.6 + max(0.0, self._sparse_ratio - ratio) * 0.5
+                gaps.append(KnowledgeGap {
+                    gap_type: GapType.SPARSE_DOMAIN,
+                    description: "Domain '" + d + "' has " + str(stats["nodes"]) + " concepts but only " + str(stats["edges"]) + " relations (ratio=" + str(round(ratio, 1)) + "). Needs more causal connections.",
+                    domain: d,
+                    concepts: [],
+                    severity: sev,
+                    created_at: time.time()
+                })
+            }
+        }
+        return gaps
+    }
+
+    fn _find_missing_relations(self, domain: Optional[string]) -> List[any] {
+        let gaps: List[KnowledgeGap] = []
+        let checked: Set[string] = set()
+
+        for edge_ab in self._graph.all_edges() {
+            if domain != None and edge_ab.domain != domain {
+                continue
+            }
+            if edge_ab.relation != RelationType.CAUSES and edge_ab.relation != RelationType.ENABLES {
+                continue
+            }
+
+            for edge_bc in self._graph.outgoing(edge_ab.target, edge_ab.relation) {
+                let key = edge_ab.source + "→" + edge_bc.target
+                if key in checked {
+                    continue
+                }
+                checked.add(key)
+
+                let direct = self._graph.get_edge(edge_ab.source, edge_ab.relation, edge_bc.target)
+                if direct == None {
+                    gaps.append(KnowledgeGap {
+                        gap_type: GapType.MISSING_RELATION,
+                        description: "'" + edge_ab.source + "' " + edge_ab.relation.value + " '" + edge_ab.target + "', and '" + edge_ab.target + "' " + edge_bc.relation.value + " '" + edge_bc.target + "'. Does '" + edge_ab.source + "' directly " + edge_ab.relation.value + " '" + edge_bc.target + "'?",
+                        domain: edge_ab.domain,
+                        concepts: [edge_ab.source, edge_ab.target, edge_bc.target],
+                        severity: 0.4,
+                        created_at: time.time()
+                    })
+                }
+            }
+        }
+
+        return gaps
+    }
+}
+
+/// ---------- Learning Goal Generator ----------
+
+let _QUESTION_TEMPLATES: Dict[string, List[string]] = {
+    "isolated_node": ["What causes {concept}?", "What does {concept} lead to?", "What are the effects of {concept}?"],
+    "weak_edge": ["Is it true that {concept_a} {relation} {concept_b}?", "What evidence supports that {concept_a} {relation} {concept_b}?"],
+    "sparse_domain": ["What are the key causal relationships in {domain}?", "What causes what in {domain}?"],
+    "missing_relation": ["Does {concept_a} directly {relation} {concept_c}?", "What is the relationship between {concept_a} and {concept_c}?"],
+    "self_model_weakness": ["What are the fundamental principles of {domain}?", "What are common misconceptions about {domain}?"]
+}
+
+class LearningGoalGenerator {
+    fn generate(self, gaps: List[KnowledgeGap], max_goals: int) -> List[any] {
+        if max_goals == None {
+            max_goals = 20
+        }
+        let goals: List[LearningGoal] = []
+        let seen_questions: Set[string] = set()
+
+        for gap in gaps {
+            let templates: List[string] = []
+            if gap.gap_type.value in _QUESTION_TEMPLATES {
+                templates = _QUESTION_TEMPLATES[gap.gap_type.value]
+            }
+            if len(templates) == 0 {
+                continue
+            }
+
+            let template = templates[0]
+            let question = self._fill_template(template, gap)
+            if question in seen_questions {
+                continue
+            }
+            seen_questions.add(question)
+
+            let priority = self._severity_to_priority(gap.severity)
+            goals.append(LearningGoal {
+                question: question,
+                target_concepts: gap.concepts,
+                domain: gap.domain,
+                priority: priority,
+                source_gap: gap,
+                confidence_target: 0.7,
+                attempts: 0,
+                resolved: false,
+                created_at: time.time()
+            })
+
+            if len(goals) >= max_goals {
+                break
+            }
+        }
+
+        let priority_order: Dict[string, int] = {
+            "critical": 0, "high": 1, "medium": 2, "low": 3
+        }
+
+        let sorted_goals: List[LearningGoal] = []
+        let remaining = list(goals)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            let best_pri = priority_order.get(remaining[0].priority.value, 3)
+            let best_sev = remaining[0].source_gap.severity
+            for i in range(1, len(remaining)) {
+                let pri = priority_order.get(remaining[i].priority.value, 3)
+                let sev = remaining[i].source_gap.severity
+                if pri < best_pri or (pri == best_pri and sev > best_sev) {
+                    best_pri = pri
+                    best_sev = sev
+                    best_idx = i
+                }
+            }
+            sorted_goals.append(remaining.pop(best_idx))
+        }
+        return sorted_goals
+    }
+
+    fn _fill_template(self, template: string, gap: KnowledgeGap) -> string {
+        let concepts = gap.concepts
+        if len(concepts) == 0 {
+            concepts = ["unknown"]
+        }
+        let result = template
+        let concept = concepts[0]
+        let concept_a = concepts[0]
+        let concept_b = "?"
+        if len(concepts) > 1 {
+            concept_b = concepts[1]
+        }
+        let concept_c = "?"
+        if len(concepts) > 2 {
+            concept_c = concepts[2]
+        }
+        let domain_val = gap.domain
+        if domain_val == "" {
+            domain_val = "this area"
+        }
+        result = result.replace("{concept}", concept)
+        result = result.replace("{concept_a}", concept_a)
+        result = result.replace("{concept_b}", concept_b)
+        result = result.replace("{concept_c}", concept_c)
+        result = result.replace("{domain}", domain_val)
+        result = result.replace("{relation}", "relates to")
+        return result
+    }
+
+    fn _severity_to_priority(self, severity: float) -> GoalPriority {
+        if severity >= 0.8 {
+            return GoalPriority.CRITICAL
+        } else if severity >= 0.6 {
+            return GoalPriority.HIGH
+        } else if severity >= 0.4 {
+            return GoalPriority.MEDIUM
+        }
+        return GoalPriority.LOW
+    }
+}
+
+/// ---------- Curiosity Scheduler ----------
+
+class CuriosityScheduler {
+    fn __init__(self, graph: CausalGraph, retrieval_fn: Optional[Callable],
+                max_goals_per_cycle: int, max_attempts_per_goal: int) {
+        self._graph = graph
+        self._retrieval_fn = retrieval_fn
+        if max_goals_per_cycle == None {
+            max_goals_per_cycle = 10
+        }
+        if max_attempts_per_goal == None {
+            max_attempts_per_goal = 3
+        }
+        self._max_goals = max_goals_per_cycle
+        self._max_attempts = max_attempts_per_goal
+        self._analyzer = GapAnalyzer(graph, None, None)
+        self._generator = LearningGoalGenerator()
+        self._extractor = FactExtractor()
+        self._goal_queue: List[LearningGoal] = []
+        self._resolved_goals: List[LearningGoal] = []
+        self._cycle_count = 0
+    }
+
+    fn pending_goals(self) -> List[any] {
+        let result: List[LearningGoal] = []
+        for g in self._goal_queue {
+            if not g.resolved {
+                result.append(g)
+            }
+        }
+        return result
+    }
+
+    fn resolved_count(self) -> int {
+        return len(self._resolved_goals)
+    }
+
+    fn run_cycle(self, domain_filter: Optional[string],
+                 deep_self_model_weaknesses: Optional[List[Dict[string, Any]]]) -> CuriosityReport {
+        let start = time.time()
+        self._cycle_count += 1
+
+        let gaps = self._analyzer.analyze(domain_filter)
+
+        if deep_self_model_weaknesses != None {
+            for w in deep_self_model_weaknesses {
+                gaps.append(KnowledgeGap {
+                    gap_type: GapType.SELF_MODEL_WEAKNESS,
+                    description: w.get("description", "Weak domain"),
+                    domain: w.get("domain", ""),
+                    concepts: w.get("concepts", []),
+                    severity: w.get("severity", 0.6),
+                    created_at: time.time()
+                })
+            }
+        }
+
+        let goals = self._generator.generate(gaps, self._max_goals)
+
+        let existing_ids: Set[string] = set()
+        for g in self._goal_queue {
+            existing_ids.add(goal_id(g))
+        }
+        for new_goal in goals {
+            if goal_id(new_goal) not in existing_ids {
+                self._goal_queue.append(new_goal)
+                existing_ids.add(goal_id(new_goal))
+            }
+        }
+
+        let facts_acquired = 0
+        let triples_added = 0
+
+        if self._retrieval_fn != None {
+            let pending = self.pending_goals()
+            for i in range(min(self._max_goals, len(pending))) {
+                let curr_goal = pending[i]
+                if curr_goal.attempts >= self._max_attempts {
+                    continue
+                }
+                curr_goal.attempts += 1
+
+                let results: List[Dict[string, Any]] = []
+                try {
+                    results = self._retrieval_fn(curr_goal.question)
+                } catch exc {
+                    continue
+                }
+
+                for result in results {
+                    let text = result.get("text", "")
+                    let conf = result.get("confidence", 0.5)
+                    if text == "" {
+                        continue
+                    }
+                    facts_acquired += 1
+
+                    let triples = self._extractor.extract_from_text(
+                        text, conf, "curiosity-" + str(self._cycle_count),
+                        curr_goal.domain)
+                    for t in triples {
+                        self._graph.add_edge(
+                            t.subject, t.obj, t.relation, t.confidence,
+                            t.domain, t.evidence, t.fact_id)
+                        triples_added += 1
+                    }
+                }
+
+                if triples_added > 0 {
+                    curr_goal.resolved = true
+                    self._resolved_goals.append(curr_goal)
+                }
+            }
+        }
+
+        let duration_ms = int((time.time() - start) * 1000)
+        let domains: Set[string] = set()
+        for g in gaps {
+            if g.domain != "" {
+                domains.add(g.domain)
+            }
+        }
+        let domain_list: List[string] = []
+        for d in domains {
+            domain_list.append(d)
+        }
+
+        let top_gaps: List[KnowledgeGap] = []
+        for i in range(min(5, len(gaps))) {
+            top_gaps.append(gaps[i])
+        }
+        let top_goals: List[LearningGoal] = []
+        for i in range(min(5, len(goals))) {
+            top_goals.append(goals[i])
+        }
+
+        let resolved_this = 0
+        for g in goals {
+            if g.resolved {
+                resolved_this += 1
+            }
+        }
+
+        return CuriosityReport {
+            gaps_found: len(gaps),
+            goals_generated: len(goals),
+            goals_resolved: resolved_this,
+            facts_acquired: facts_acquired,
+            triples_added: triples_added,
+            domains_scanned: domain_list,
+            top_gaps: top_gaps,
+            top_goals: top_goals,
+            duration_ms: duration_ms
+        }
+    }
+
+    fn get_top_questions(self, n: int) -> List[any] {
+        let pending = self.pending_goals()
+        let result: List[string] = []
+        for i in range(min(n, len(pending))) {
+            result.append(pending[i].question)
+        }
+        return result
+    }
+}
+
+/// ---------- Gate ----------
+
+gate curiosity_gate(data: raw[CuriosityReport]) -> validated[CuriosityReport] {
+    require confidence >= 0.3
+    validate gap_analysis
+    validate goal_quality
+}
+
+/// ---------- Exports ----------
+
+export GapType, GoalPriority
+export KnowledgeGap, LearningGoal, CuriosityReport
+export gap_id, goal_id
+export GapAnalyzer, LearningGoalGenerator, CuriosityScheduler
+export curiosity_gate

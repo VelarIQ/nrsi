@@ -1,0 +1,56 @@
+{
+  "domain": "telecom",
+  "version": "2026.1",
+  "source": "ITU-T Q.700 / 3GPP TS 29.002 / TS 29.272 / RFC 3261",
+  "source_tier": "t2_verified",
+  "facts": [
+    {
+      "id": "ts-ss7-stack",
+      "text": "SS7 (Signaling System 7) protocol stack: MTP1 (physical), MTP2 (data link), MTP3 (network), SCCP (Signaling Connection Control Part for routing), TCAP (Transaction Capabilities Application Part), and application layers MAP (Mobile Application Part), ISUP (ISDN User Part), CAMEL (Customised Applications for Mobile network Enhanced Logic). SS7 is circuit-switched signaling used in 2G/3G core.",
+      "confidence": 0.96,
+      "tags": ["ss7", "signaling", "protocol-stack", "logical"]
+    },
+    {
+      "id": "ts-diameter-protocol",
+      "text": "Diameter protocol replaced SS7 MAP in 4G/5G for authentication and policy. Key interfaces: S6a (MME to HSS for authentication/location), Gx (PCRF to PGW for policy/charging rules), Gy (OCS for online charging), Rx (AF to PCRF for QoS), Cx (IMS registration). Diameter uses TCP/SCTP transport with AVP (Attribute-Value Pair) encoding.",
+      "confidence": 0.96,
+      "tags": ["diameter", "signaling", "4g", "5g", "logical"]
+    },
+    {
+      "id": "ts-sip-protocol",
+      "text": "SIP (Session Initiation Protocol, RFC 3261) handles voice/video session setup in IMS/VoLTE. Methods: INVITE (session setup), ACK (confirm), BYE (terminate), REGISTER (location binding), SUBSCRIBE/NOTIFY (event notification). SIP uses proxy/registrar/redirect servers. P-CSCF, I-CSCF, S-CSCF form the IMS SIP core.",
+      "confidence": 0.95,
+      "tags": ["sip", "ims", "volte", "signaling", "logical"]
+    },
+    {
+      "id": "ts-smsc-failure-patterns",
+      "text": "SMSC failure patterns: queue overflow (SMSC storage full, messages rejected with RP-ERROR cause 22), HLR/HSS timeout (subscriber lookup fails, delivery report pending), MAP error codes (absent subscriber=6, teleservice not provisioned=11, system failure=34), Diameter result codes (DIAMETER_ERROR_USER_UNKNOWN=5001, DIAMETER_UNABLE_TO_DELIVER=3002).",
+      "confidence": 0.94,
+      "tags": ["smsc", "failure", "error-codes", "diagnostic", "causal"]
+    },
+    {
+      "id": "ts-signaling-storm",
+      "text": "Signaling storms occur when massive numbers of devices simultaneously attempt attach/detach/TAU procedures, overwhelming MME capacity. Causes: large-scale power outage recovery, major event crowds, IoT device mass-reconnect, misconfigured TAU timer. Mitigation: NAS backoff timer, overload control (NAS cause #22), congestion-based rejection.",
+      "confidence": 0.93,
+      "tags": ["signaling-storm", "overload", "mme", "causal", "mitigation"]
+    },
+    {
+      "id": "ts-nas-procedures",
+      "text": "Key NAS (Non-Access Stratum) procedures: Attach (device registers to network), Detach (device deregisters), TAU (Tracking Area Update when moving between tracking areas), Service Request (device requests data/signaling connection), Authentication (AKA protocol with RAND/AUTN/RES), Security Mode Command (activates encryption/integrity).",
+      "confidence": 0.96,
+      "tags": ["nas", "procedures", "mobility", "logical"]
+    },
+    {
+      "id": "ts-gtp-tunneling",
+      "text": "GTP (GPRS Tunneling Protocol) creates tunnels for user data transport. GTP-C (control plane) manages tunnel creation/modification/deletion with TEID (Tunnel Endpoint Identifier). GTP-U (user plane) encapsulates user IP packets in GTP/UDP/IP headers. S1-U tunnel: eNodeB to SGW. S5/S8 tunnel: SGW to PGW. Tunnel failures cause data path interruption.",
+      "confidence": 0.95,
+      "tags": ["gtp", "tunneling", "data-plane", "logical", "causal"]
+    },
+    {
+      "id": "ts-hlr-hss-functions",
+      "text": "HLR (2G/3G) and HSS (4G/5G) store subscriber profiles: IMSI, MSISDN, authentication vectors (Ki/OPc), service subscriptions, roaming permissions, current serving node (VLR/MME address). HLR uses MAP protocol; HSS uses Diameter S6a. Database corruption or unavailability causes authentication failures and service denial for all affected subscribers.",
+      "confidence": 0.95,
+      "tags": ["hlr", "hss", "subscriber", "database", "causal"]
+    }
+  ]
+}

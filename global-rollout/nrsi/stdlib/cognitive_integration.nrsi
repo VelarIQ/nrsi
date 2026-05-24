@@ -1,0 +1,1347 @@
+/// NRSI Cognitive Integration Layer — Unifies the Two Brain Systems.
+///
+/// Bridges:
+///   Original Brain (NRSProcessingPipeline): VLT, PVS-4, Tuition, Lobes,
+///     NervousSystem, BinaryNeurons, GenerativeEngine, DomainCreases, Plasticity
+///   Cognitive Brain (ReasoningBridge): CausalGraph, 20+ reasoning modules,
+///     WebIntelligence, EpistemicAwareness, AdversarialSelfTest, Provenance
+///
+/// Complete conversion of `nrsip/cognitive_integration.py`.
+
+module cognitive_integration
+
+import time from "std/time"
+import re from "std/re"
+import logging from "std/logging"
+
+from reasoning_bridge import ReasoningBridge, CognitiveResponse, ReasoningResult
+from reasoning_graph import CausalGraph, RelationType, GraphEdge
+from reasoning_governance import KnowledgeIngestionGate, GateVerdict
+from reasoning_bayesian import GraphConfidenceManager, Evidence, EvidenceType, BayesianUpdater
+from reasoning_semantic import SemanticQueryParser, SpreadingActivation
+from reasoning_epistemic import EpistemicEngine, EpistemicState
+from reasoning_provenance import ProvenanceTracker
+from reasoning_coherence import CoherenceController
+from reasoning_adversarial import AdversarialSelfTester
+from reasoning_language import GroundedGenerator
+from reasoning_synthesis import ReasoningSynthesizer
+from reasoning_learning import ConversationalLearner
+from reasoning_maintenance import GraphMaintenance
+from reasoning_social import SocialCognition
+from reasoning_temporal import TemporalReasoner, QuantitativeReasoner
+from reasoning_inference import InferenceEngine
+from reasoning_advanced import AbductiveReasoner, CounterfactualReasoner, DeductionEngine, ConstraintPropagator
+from reasoning_planning import GoalPlanner
+from reasoning_commonsense import CommonSenseBootstrapper, DefaultReasoner
+from reasoning_composition import ConceptComposer
+from reasoning_analogy import TransferEngine
+
+/// ── Data Types ──────────────────────────────────────────────────────────
+
+type CognitiveAugmentation {
+    concepts: List[string],
+    reasoning_text: string,
+    confidence: float,
+    quality_grade: string,
+    epistemic_certainty: float,
+    knowledge_gaps: List[string],
+    suggested_lobes: List[string],
+    cognitive_response: Optional[CognitiveResponse],
+    processing_time_ms: float
+}
+
+fn new_cognitive_augmentation() -> CognitiveAugmentation {
+    return CognitiveAugmentation {
+        concepts: [],
+        reasoning_text: "",
+        confidence: 0.0,
+        quality_grade: "",
+        epistemic_certainty: 0.0,
+        knowledge_gaps: [],
+        suggested_lobes: [],
+        cognitive_response: None,
+        processing_time_ms: 0.0
+    }
+}
+
+/// ── VLT <-> Knowledge Graph Adapter ────────────────────────────────────
+
+class VLTGraphAdapter {
+    fn new(graph: CausalGraph, gate: KnowledgeIngestionGate, confidence_mgr: GraphConfidenceManager) -> VLTGraphAdapter {
+        let a = VLTGraphAdapter {}
+        a._graph = graph
+        a._gate = gate
+        a._confidence = confidence_mgr
+        a._synced_keys = {}
+        a.LAYER_CONFIDENCE_MAP = {
+            "L1_EPHEMERAL": 0.3,
+            "L2_SESSION": 0.5,
+            "L3_PERSISTENT": 0.7,
+            "L4_ARCHIVAL": 0.9
+        }
+        return a
+    }
+
+    fn sync_vlt_to_graph(self, vlt: any) -> Dict[string, int] {
+        let stats = {"scanned": 0, "imported": 0, "rejected": 0, "skipped": 0}
+
+        let layer_names = ["L4_ARCHIVAL", "L3_PERSISTENT", "L2_SESSION"]
+        for layer_name in layer_names {
+            let layer_enum = None
+            if hasattr(vlt, "_layers") {
+                for k in vlt._layers {
+                    if k.value == layer_name {
+                        layer_enum = k
+                        break
+                    }
+                }
+            }
+            if layer_enum == None {
+                continue
+            }
+
+            let layer_items = vlt._layers.get(layer_enum, {})
+            let base_conf = self.LAYER_CONFIDENCE_MAP.get(layer_name, 0.5)
+
+            for key in layer_items {
+                let item = layer_items[key]
+                stats["scanned"] += 1
+                if key in self._synced_keys {
+                    stats["skipped"] += 1
+                    continue
+                }
+
+                let triples = self._vlt_item_to_triples(item, base_conf)
+                for triple in triples {
+                    let subj = triple[0]
+                    let rel = triple[1]
+                    let obj = triple[2]
+                    let conf = triple[3]
+                    let decision = self._gate.evaluate(
+                        source: subj, target: obj, relation: rel,
+                        confidence: conf, source_type: "knowledge_pack",
+                        domain: getattr(item, "domain", "general"),
+                        evidence: "VLT:" + layer_name + ":" + key
+                    )
+                    if decision.verdict == GateVerdict.ACCEPT {
+                        self._graph.add_edge(
+                            subj, obj, rel, conf,
+                            domain: getattr(item, "domain", "general"),
+                            evidence: "vlt:" + layer_name,
+                            fact_id: "vlt-" + key[0:16]
+                        )
+                        stats["imported"] += 1
+                    } else {
+                        stats["rejected"] += 1
+                    }
+                }
+                self._synced_keys[key] = true
+            }
+        }
+
+        return stats
+    }
+
+    fn sync_graph_to_vlt(self, vlt: any, max_edges: int) -> int {
+        let exported = 0
+        let edge_keys = []
+        for eid in self._graph._edges {
+            edge_keys.append(eid)
+        }
+        let idx = 0
+        for eid in edge_keys {
+            if idx >= max_edges { break }
+            let edge = self._graph._edges[eid]
+            if edge.confidence < 0.6 {
+                idx += 1
+                continue
+            }
+            let key = "graph:" + eid
+            let existing = vlt.recall(key)
+            if existing != None {
+                idx += 1
+                continue
+            }
+
+            vlt.store(
+                key: key,
+                value: edge.source + " " + edge.relation.value + " " + edge.target,
+                layer: "L3_PERSISTENT",
+                confidence: edge.confidence,
+                domain: edge.domain,
+                source: "reasoning_graph",
+                tags: ["graph_sync", edge.relation.value]
+            )
+            exported += 1
+            idx += 1
+        }
+
+        return exported
+    }
+
+    fn on_vlt_promote(self, key: string, item: any, from_layer: string, to_layer: string) -> void {
+        let to_conf = self.LAYER_CONFIDENCE_MAP.get(to_layer, 0.5)
+        let triples = self._vlt_item_to_triples(item, to_conf)
+        for triple in triples {
+            let subj = triple[0]
+            let rel = triple[1]
+            let obj = triple[2]
+            let conf = triple[3]
+            let edge_id = subj.lower() + "|" + rel.value + "|" + obj.lower()
+            let ev = Evidence {
+                evidence_id: "vlt-promote-" + key[0:12],
+                evidence_type: EvidenceType.DIRECT_OBSERVATION,
+                supports: true,
+                strength: to_conf * 0.3,
+                source: "vlt_promote:" + from_layer + "->" + to_layer
+            }
+            self._confidence.add_evidence_for_edge(edge_id, ev, sync_back: true)
+        }
+    }
+
+    fn on_vlt_evict(self, key: string, item: any, layer: string) -> void {
+        let triples = self._vlt_item_to_triples(item, 0.0)
+        for triple in triples {
+            let subj = triple[0]
+            let rel = triple[1]
+            let obj = triple[2]
+            let edge_id = subj.lower() + "|" + rel.value + "|" + obj.lower()
+            let ev = Evidence {
+                evidence_id: "vlt-evict-" + key[0:12],
+                evidence_type: EvidenceType.CONVERSATIONAL,
+                supports: false,
+                strength: 0.2,
+                source: "vlt_evict:" + layer
+            }
+            self._confidence.add_evidence_for_edge(edge_id, ev, sync_back: true)
+        }
+    }
+
+    fn _vlt_item_to_triples(self, item: any, base_conf: float) -> List[any] {
+        let triples = []
+        let val = str(item)
+        if hasattr(item, "value") {
+            val = str(item.value)
+        }
+
+        let rel_patterns = [
+            ["(.+?)\\s+(?:causes?|leads?\\s+to)\\s+(.+)", RelationType.CAUSES],
+            ["(.+?)\\s+(?:is\\s+a|is\\s+an|is\\s+type\\s+of)\\s+(.+)", RelationType.IS_A],
+            ["(.+?)\\s+(?:has|contains|includes)\\s+(.+)", RelationType.HAS_PROPERTY],
+            ["(.+?)\\s+(?:part\\s+of|belongs?\\s+to|component\\s+of)\\s+(.+)", RelationType.PART_OF],
+            ["(.+?)\\s+(?:produces?|generates?|creates?)\\s+(.+)", RelationType.PRODUCES],
+            ["(.+?)\\s+(?:prevents?|blocks?|inhibits?)\\s+(.+)", RelationType.PREVENTS],
+            ["(.+?)\\s+(?:enables?|allows?|facilitates?)\\s+(.+)", RelationType.ENABLES],
+            ["(.+?)\\s+(?:requires?|needs?|depends?\\s+on)\\s+(.+)", RelationType.REQUIRES]
+        ]
+
+        for pair in rel_patterns {
+            let pattern = pair[0]
+            let rel_type = pair[1]
+            let m = re.match(pattern, val, re.IGNORECASE)
+            if m != None {
+                let subj = m.group(1).strip()[0:80]
+                let obj = m.group(2).strip()[0:80]
+                if len(subj) >= 3 and len(subj) <= 80 and len(obj) >= 3 and len(obj) <= 80 {
+                    let item_conf = 0.5
+                    if hasattr(item, "confidence") {
+                        item_conf = item.confidence
+                    }
+                    let conf = base_conf * item_conf
+                    if conf < 0.15 { conf = 0.15 }
+                    triples.append([subj, rel_type, obj, conf])
+                }
+                break
+            }
+        }
+
+        return triples
+    }
+}
+
+/// ── PVS-4 <-> Semantic Index Adapter ───────────────────────────────────
+
+class PVSSemanticAdapter {
+    fn new(bridge: ReasoningBridge) -> PVSSemanticAdapter {
+        let a = PVSSemanticAdapter {}
+        a._bridge = bridge
+        return a
+    }
+
+    fn lookup(self, query: string, pvs: any) -> Dict[string, any] {
+        let result = {
+            "pvs_hit": false, "semantic_concepts": [],
+            "activated_subgraph": [], "confidence": 0.0
+        }
+
+        let pvs_match = pvs.lookup(query)
+        if pvs_match != None {
+            result["pvs_hit"] = true
+            result["confidence"] = pvs_match.confidence
+            result["pvs_tier"] = pvs_match.tier
+        }
+
+        if self._bridge._semantic != None {
+            let understanding = self._bridge._semantic.parse(query)
+            let concepts = []
+            for pair in understanding.key_concepts {
+                concepts.append(pair[0])
+            }
+            result["semantic_concepts"] = concepts
+            result["intent_concepts"] = understanding.intent_concepts
+        }
+
+        return result
+    }
+
+    fn enrich_pvs_with_graph(self, pvs: any, graph: CausalGraph, max_entries: int) -> int {
+        let count = 0
+        for eid in graph._edges {
+            let edge = graph._edges[eid]
+            if edge.confidence < 0.7 {
+                continue
+            }
+            let text = edge.source + " " + edge.relation.value + " " + edge.target
+            let existing = pvs.lookup(text)
+            if existing != None {
+                continue
+            }
+            pvs.store(
+                text: text, tier: "T2",
+                confidence: edge.confidence,
+                data: {"edge_id": eid, "domain": edge.domain, "source": "graph_sync"}
+            )
+            count += 1
+            if count >= max_entries {
+                break
+            }
+        }
+        return count
+    }
+}
+
+/// ── Tuition <-> Reasoning Adapter ──────────────────────────────────────
+
+class TuitionReasoningAdapter {
+    fn new(bridge: ReasoningBridge) -> TuitionReasoningAdapter {
+        let a = TuitionReasoningAdapter {}
+        a._bridge = bridge
+        return a
+    }
+
+    fn correction_to_graph(self, query: string, student_tier: string, teacher_tier: string, tuition_system: any) -> Dict[string, any] {
+        let result = {"learned": 0, "evidence_added": 0}
+
+        let learn_result = self._bridge.learn_from_turn(
+            "The correct approach for '" + query + "' is " + teacher_tier + " (not " + student_tier + ")",
+            speaker: "tuition_system",
+            session_id: "tuition"
+        )
+        result["learned"] = len(learn_result.get("learned", []))
+
+        let edge_id = query.lower()[0:40] + "|requires|" + teacher_tier.lower()
+        if self._bridge._confidence != None {
+            let ev = Evidence {
+                evidence_id: "tuition-" + str(hash(query) % 65536),
+                evidence_type: EvidenceType.DIRECT_OBSERVATION,
+                supports: true,
+                strength: 0.85,
+                source: "tuition_system",
+                description: "Tuition correction: " + student_tier + " -> " + teacher_tier
+            }
+            self._bridge._confidence.add_evidence_for_edge(edge_id, ev, sync_back: true)
+            result["evidence_added"] = 1
+        }
+
+        return result
+    }
+
+    fn graph_corrections_to_tuition(self, tuition_system: any) -> int {
+        let count = 0
+        let graph = self._bridge.graph()
+        for eid in graph._edges {
+            let edge = graph._edges[eid]
+            if edge.relation != RelationType.REQUIRES {
+                continue
+            }
+            if edge.confidence < 0.7 {
+                continue
+            }
+            let target_lower = edge.target.lower()
+            if "tier" not in target_lower and "t" not in target_lower[0:2] {
+                continue
+            }
+
+            let existing = tuition_system.route(edge.source, "")
+            if existing != None and existing != "" {
+                continue
+            }
+
+            tuition_system.correct(
+                query: edge.source, student_tier: "unknown",
+                teacher_tier: edge.target,
+                correction_type: "graph_derived",
+                ground_truth_verified: edge.confidence >= 0.85
+            )
+            count += 1
+        }
+        return count
+    }
+}
+
+/// ── Binary Neurons <-> Bayesian Confidence ─────────────────────────────
+
+class NeuronConfidenceAdapter {
+    fn new(confidence_mgr: GraphConfidenceManager, epistemic: EpistemicEngine) -> NeuronConfidenceAdapter {
+        let a = NeuronConfidenceAdapter {}
+        a._confidence = confidence_mgr
+        a._epistemic = epistemic
+        return a
+    }
+
+    fn activation_to_evidence(self, activation_result: any, query: string) -> Dict[string, any] {
+        let result = {"evidence_count": 0, "familiarity": 0.0}
+
+        let active = activation_result.active_count
+
+        if active > 0 {
+            let familiarity = active / 50.0
+            if familiarity > 1.0 { familiarity = 1.0 }
+            result["familiarity"] = familiarity
+
+            for domain in activation_result.domain_signals {
+                let count = activation_result.domain_signals[domain]
+                if count >= 3 {
+                    let sig = activation_result.activation_signature
+                    let ev = Evidence {
+                        evidence_id: "neuron-" + sig[0:12],
+                        evidence_type: EvidenceType.DIRECT_OBSERVATION,
+                        supports: true,
+                        strength: count * 0.1,
+                        source: "binary_neurons",
+                        description: "Neuron activation: " + str(count) + " neurons fired for domain '" + domain + "'"
+                    }
+                    if ev.strength > 0.6 { ev.strength = 0.6 }
+                    let concepts = query.lower().split()
+                    let ci = 0
+                    for c in concepts {
+                        if ci >= 3 { break }
+                        if len(c) >= 3 {
+                            let outgoing = self._confidence._graph._outgoing.get(c, [])
+                            for eid in outgoing {
+                                self._confidence.add_evidence_for_edge(eid, ev, sync_back: true)
+                                result["evidence_count"] += 1
+                            }
+                        }
+                        ci += 1
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+}
+
+/// ── Domain Creases <-> Knowledge Graph ─────────────────────────────────
+
+class CreaseGraphAdapter {
+    fn new(graph: CausalGraph, gate: KnowledgeIngestionGate) -> CreaseGraphAdapter {
+        let a = CreaseGraphAdapter {}
+        a._graph = graph
+        a._gate = gate
+        a.TIER_CONFIDENCE = {
+            "T0_MATHEMATICAL": 0.99,
+            "T1_EMPIRICAL": 0.85,
+            "T2_CONSENSUS": 0.7,
+            "T3_HEURISTIC": 0.5
+        }
+        return a
+    }
+
+    fn sync_creases_to_graph(self, crease_registry: any) -> Dict[string, int] {
+        let stats = {"domains": 0, "facts_imported": 0, "axioms_imported": 0}
+
+        for domain_name in crease_registry.domains {
+            let crease = crease_registry.get(domain_name)
+            if crease == None {
+                continue
+            }
+            stats["domains"] += 1
+
+            for layer_idx in crease.layers {
+                let crease_layer = crease.layers[layer_idx]
+                let fact_keys = []
+                for k in crease_layer.facts {
+                    fact_keys.append(k)
+                }
+                for key in fact_keys {
+                    let value = crease_layer.get(key)
+                    if value == None {
+                        continue
+                    }
+                    let conf = 0.5 + (int(layer_idx) * 0.1)
+                    let val_str = str(value)
+                    if len(val_str) < 3 or len(val_str) > 200 {
+                        continue
+                    }
+
+                    let decision = self._gate.evaluate(
+                        source: key, target: val_str[0:80],
+                        relation: RelationType.HAS_PROPERTY,
+                        confidence: conf,
+                        source_type: "knowledge_pack",
+                        domain: domain_name,
+                        evidence: "crease:" + domain_name + ":layer" + str(layer_idx)
+                    )
+                    if decision.verdict == GateVerdict.ACCEPT {
+                        self._graph.add_edge(
+                            key, val_str[0:80], RelationType.HAS_PROPERTY,
+                            conf, domain: domain_name,
+                            evidence: "crease:" + domain_name
+                        )
+                        stats["facts_imported"] += 1
+                    }
+                }
+            }
+
+            if hasattr(crease, "_axioms") and crease._axioms != None {
+                let axiom_base = crease._axioms
+                for akey in axiom_base._axioms {
+                    let axiom = axiom_base._axioms[akey]
+                    let tier_name = str(axiom.tier)
+                    if hasattr(axiom.tier, "value") {
+                        tier_name = axiom.tier.value
+                    }
+                    let conf = self.TIER_CONFIDENCE.get(tier_name, 0.5)
+                    let val_str = str(axiom.value)[0:80]
+
+                    if len(akey) >= 3 and len(val_str) >= 3 {
+                        let axiom_domain = "axiom"
+                        if hasattr(axiom, "domain") and axiom.domain != None {
+                            axiom_domain = axiom.domain
+                        }
+                        self._graph.add_edge(
+                            akey, val_str, RelationType.IS_A,
+                            conf, domain: axiom_domain,
+                            evidence: "axiom:" + tier_name
+                        )
+                        stats["axioms_imported"] += 1
+                    }
+                }
+            }
+        }
+
+        return stats
+    }
+
+    fn sync_graph_to_creases(self, crease_registry: any) -> int {
+        let exported = 0
+        for eid in self._graph._edges {
+            let edge = self._graph._edges[eid]
+            if edge.domain == None or edge.domain == "" or edge.domain == "general" or edge.domain == "web" or edge.domain == "axiom" {
+                continue
+            }
+            if edge.confidence < 0.6 {
+                continue
+            }
+
+            let crease = crease_registry.get(edge.domain)
+            if crease == None {
+                continue
+            }
+            if crease.state.value == "LOCKED" or crease.state.value == "RETIRED" {
+                continue
+            }
+
+            let existing = crease.query(edge.source)
+            if existing != None {
+                continue
+            }
+
+            try {
+                crease.grow(
+                    key: edge.source,
+                    value: edge.relation.value + ": " + edge.target,
+                    source: "reasoning_graph",
+                    mesh_validated: edge.confidence >= 0.8
+                )
+                exported += 1
+            } catch(e) {
+                pass
+            }
+        }
+
+        return exported
+    }
+}
+
+/// ── Plasticity <-> Graph Maintenance ───────────────────────────────────
+
+class PlasticityMaintenanceAdapter {
+    fn new(graph: CausalGraph, confidence_mgr: GraphConfidenceManager, maintenance: GraphMaintenance, gate: KnowledgeIngestionGate) -> PlasticityMaintenanceAdapter {
+        let a = PlasticityMaintenanceAdapter {}
+        a._graph = graph
+        a._confidence = confidence_mgr
+        a._maintenance = maintenance
+        a._gate = gate
+        return a
+    }
+
+    fn hebbian_to_graph(self, plasticity_mgr: any) -> Dict[string, int] {
+        let stats = {"reinforced": 0, "decayed": 0}
+
+        for event in plasticity_mgr.events {
+            if event.plasticity_type.value == "hebbian" {
+                if event.new_value > event.old_value {
+                    stats["reinforced"] += 1
+                } else {
+                    stats["decayed"] += 1
+                }
+            }
+        }
+
+        let decay_events = plasticity_mgr.decay_all_weights()
+        if len(decay_events) > 0 {
+            self._maintenance.confidence_decay_pass(
+                age_threshold_days: 30, decay_rate: 0.02)
+            stats["decayed"] += len(decay_events)
+        }
+
+        return stats
+    }
+
+    fn threshold_to_gate(self, plasticity_mgr: any) -> void {
+        try {
+            let confidence_threshold = plasticity_mgr.get_threshold("confidence")
+            let new_floor = confidence_threshold.value
+            if new_floor < 0.1 { new_floor = 0.1 }
+            if new_floor > 0.4 { new_floor = 0.4 }
+            self._gate._confidence_floor = new_floor
+        } catch(e) {
+            pass
+        }
+    }
+}
+
+/// ── Nervous System <-> Cognitive Adapter ───────────────────────────────
+
+class NervousSystemCognitiveAdapter {
+    fn new(bridge: ReasoningBridge) -> NervousSystemCognitiveAdapter {
+        let a = NervousSystemCognitiveAdapter {}
+        a._bridge = bridge
+        return a
+    }
+
+    fn amygdala_to_social(self, emotional_context: any) -> void {
+        if self._bridge._social == None {
+            return
+        }
+
+        let valence_map = {
+            "fear": "negative", "anger": "negative", "disgust": "negative",
+            "sadness": "negative", "joy": "positive", "trust": "positive",
+            "anticipation": "positive", "surprise": "neutral"
+        }
+
+        let emotion = None
+        if hasattr(emotional_context, "dominant_emotion") {
+            emotion = emotional_context.dominant_emotion
+        } else if hasattr(emotional_context, "primary_emotion") {
+            emotion = emotional_context.primary_emotion
+        }
+
+        if emotion != None {
+            let valence = valence_map.get(emotion, "neutral")
+            let intensity = 0.5
+            if hasattr(emotional_context, "intensity") {
+                intensity = emotional_context.intensity
+            }
+
+            self._bridge._social.emotional_detector._last_external = {
+                "emotion": emotion, "valence": valence,
+                "intensity": intensity, "source": "amygdala"
+            }
+        }
+    }
+
+    fn thalamus_to_activation(self, attention_weights: any) -> List[any] {
+        let focused = []
+        if not hasattr(attention_weights, "weights") {
+            return focused
+        }
+        for lobe_name in attention_weights.weights {
+            let weight = attention_weights.weights[lobe_name]
+            if weight >= 0.3 {
+                focused.append(lobe_name)
+            }
+        }
+        return focused
+    }
+
+    fn prediction_error_to_adversarial(self, comparison: any) -> void {
+        if not hasattr(comparison, "error_magnitude") {
+            return
+        }
+        if comparison.error_magnitude > 0.3 {
+            logging.info("Prediction error " + str(comparison.error_magnitude) + " detected — flagging for adversarial review")
+        }
+    }
+
+    fn default_mode_to_curiosity(self, idle_result: Dict[string, any]) -> void {
+        let count = idle_result.get("consolidation_count", 0)
+        if count > 0 {
+            logging.info("Default mode triggered " + str(count) + " consolidations — queuing curiosity")
+        }
+    }
+}
+
+/// ── Generative Engine <-> Grounded Language ────────────────────────────
+
+class GenerativeGroundedAdapter {
+    fn new(bridge: ReasoningBridge) -> GenerativeGroundedAdapter {
+        let a = GenerativeGroundedAdapter {}
+        a._bridge = bridge
+        return a
+    }
+
+    fn grounded_chat(self, message: string, generative_engine: any, conversation_history: List[Dict[string, string]], domain: string) -> Dict[string, any] {
+        let cognitive = self._bridge.think(message, domain: domain)
+
+        let grounded_text = ""
+        if cognitive.text != None {
+            grounded_text = cognitive.text
+        }
+        let knowledge_facts = []
+        if cognitive.grounded != None and cognitive.grounded.sentences != None {
+            for s in cognitive.grounded.sentences {
+                if s.text != None and s.text != "" {
+                    knowledge_facts.append(s.text)
+                }
+            }
+        }
+
+        let lobe_facts = []
+        if cognitive.synthesis != None and hasattr(cognitive.synthesis, "flat_text") {
+            let synth = cognitive.synthesis.flat_text
+            if synth != None and synth != "" {
+                lobe_facts.append(synth)
+            }
+        }
+
+        let lobe_arg = None
+        if len(lobe_facts) > 0 { lobe_arg = lobe_facts }
+        let kf_arg = None
+        if len(knowledge_facts) > 0 { kf_arg = knowledge_facts }
+
+        let gen_response = generative_engine.chat(
+            message: message,
+            conversation_history: conversation_history,
+            lobe_facts: lobe_arg,
+            knowledge_facts: kf_arg
+        )
+
+        return {
+            "text": gen_response,
+            "grounded_text": grounded_text,
+            "cognitive_response": cognitive,
+            "quality_grade": cognitive.quality_grade,
+            "confidence": cognitive.confidence,
+            "epistemic": cognitive.epistemic
+        }
+    }
+}
+
+/// ── PoVI <-> Provenance Chain ──────────────────────────────────────────
+
+class PoVIProvenanceAdapter {
+    fn new(provenance: ProvenanceTracker, confidence_mgr: GraphConfidenceManager, gate: KnowledgeIngestionGate) -> PoVIProvenanceAdapter {
+        let a = PoVIProvenanceAdapter {}
+        a._provenance = provenance
+        a._confidence = confidence_mgr
+        a._gate = gate
+        return a
+    }
+
+    fn consensus_to_evidence(self, consensus_result: any, query: string) -> Dict[string, int] {
+        let stats = {"evidence_added": 0}
+
+        let verdict = getattr(consensus_result, "verdict", None)
+        if verdict == None {
+            return stats
+        }
+
+        let verdict_val = str(verdict)
+        if hasattr(verdict, "value") {
+            verdict_val = verdict.value
+        }
+        let supports = verdict_val == "CONFIRMED" or verdict_val == "ACCEPTED"
+        let strength = 0.3
+        if verdict_val == "CONFIRMED" {
+            strength = 0.8
+        } else if supports {
+            strength = 0.6
+        }
+
+        let concepts = query.lower().split()
+        let ci = 0
+        for c in concepts {
+            if ci >= 3 { break }
+            if len(c) < 3 {
+                ci += 1
+                continue
+            }
+            let outgoing = self._confidence._graph._outgoing.get(c, [])
+            for eid in outgoing {
+                let round_id = getattr(consensus_result, "round_id", "unknown")
+                let ev = Evidence {
+                    evidence_id: "povi-" + str(round_id)[0:12],
+                    evidence_type: EvidenceType.DIRECT_OBSERVATION,
+                    supports: supports,
+                    strength: strength,
+                    source: "povi_consensus",
+                    description: "PoVI verdict: " + verdict_val
+                }
+                self._confidence.add_evidence_for_edge(eid, ev, sync_back: true)
+                stats["evidence_added"] += 1
+            }
+            ci += 1
+        }
+
+        return stats
+    }
+
+    fn proof_to_provenance(self, proof: any, claims: List[List[string]]) -> void {
+        if len(claims) == 0 {
+            return
+        }
+        let trail = self._provenance.audit_response(claims)
+        if trail != None and hasattr(trail, "records") {
+            for record in trail.records {
+                let verdict_str = str(getattr(proof, "verdict", "unknown"))
+                let round_str = str(getattr(proof, "round_id", "?"))
+                record.alternatives.append(
+                    "PoVI verified: " + verdict_str + " (round=" + round_str + ")"
+                )
+            }
+        }
+    }
+
+    fn l4_consensus_to_graph(self, fact_hash: string, fact_text: string, consensus_result: any, l4_consensus: any) -> bool {
+        let is_archived = l4_consensus.is_archived(fact_hash)
+        if not is_archived {
+            return false
+        }
+
+        let triples = []
+        try {
+            from reasoning_nlp import EnhancedFactExtractor
+            let extractor = EnhancedFactExtractor {}
+            triples = extractor.extract_from_text(
+                fact_text, confidence: 0.85,
+                fact_id: "povi-l4-" + fact_hash[0:12], domain: "povi_verified"
+            )
+        } catch(e) {
+            return false
+        }
+
+        for triple in triples {
+            let decision = self._gate.evaluate(
+                source: triple.subject, target: triple.obj,
+                relation: triple.relation, confidence: triple.confidence,
+                source_type: "knowledge_pack", domain: "povi_verified",
+                evidence: "PoVI L4 verified: " + fact_hash[0:16]
+            )
+            if decision.verdict == GateVerdict.ACCEPT {
+                self._gate._graph.add_edge(
+                    triple.subject, triple.obj, triple.relation,
+                    triple.confidence, domain: "povi_verified",
+                    evidence: "povi_l4:" + fact_hash[0:16]
+                )
+                return true
+            }
+        }
+        return false
+    }
+}
+
+/// ── NIF Governance <-> Knowledge Graph ─────────────────────────────────
+
+class NIFGovernanceAdapter {
+    fn new(graph: CausalGraph, gate: KnowledgeIngestionGate) -> NIFGovernanceAdapter {
+        let a = NIFGovernanceAdapter {}
+        a._graph = graph
+        a._gate = gate
+        a.CERT_LEVEL_TRUST = {
+            "BASIC": 0.5,
+            "STANDARD": 0.7,
+            "ADVANCED": 0.85,
+            "PREMIUM": 0.95
+        }
+        return a
+    }
+
+    fn sync_specs_to_graph(self, nif_governance: any) -> int {
+        let count = 0
+        for spec_id in nif_governance._specs {
+            let spec = nif_governance._specs[spec_id]
+            let title = spec_id
+            if hasattr(spec, "title") {
+                title = spec.title
+            }
+            self._graph.add_edge(
+                spec_id, title, RelationType.IS_A, 0.95,
+                domain: "nif_protocol", evidence: "nif_governance"
+            )
+            if hasattr(spec, "description") and spec.description != None and spec.description != "" {
+                self._graph.add_edge(
+                    spec_id, spec.description[0:80], RelationType.HAS_PROPERTY,
+                    0.85, domain: "nif_protocol", evidence: "nif_governance"
+                )
+            }
+            count += 1
+        }
+        return count
+    }
+
+    fn certifications_to_credibility(self, nif_governance: any, credibility_tracker: any) -> int {
+        let count = 0
+        for pid in nif_governance._certifications {
+            let cert = nif_governance._certifications[pid]
+            let level_name = str(cert.level)
+            if hasattr(cert.level, "value") {
+                level_name = cert.level.value
+            }
+            let trust = self.CERT_LEVEL_TRUST.get(level_name, 0.5)
+
+            self._graph.add_edge(
+                pid, "certified:" + level_name, RelationType.HAS_PROPERTY,
+                trust, domain: "nif_provider", evidence: "nif_certification"
+            )
+
+            if credibility_tracker != None and hasattr(credibility_tracker, "_domain_history") {
+                credibility_tracker._domain_history[pid] = {
+                    "trust_score": trust, "total": 0, "accepted": 0, "rejected": 0
+                }
+            }
+            count += 1
+        }
+        return count
+    }
+}
+
+/// ── Main Integration Layer ─────────────────────────────────────────────
+
+class CognitiveIntegrationLayer {
+    fn __init__(self) {
+        self.bridge = ReasoningBridge()
+        self._initialized = false
+        self._store = None
+
+        self._vlt_adapter = None
+        self._pvs_adapter = None
+        self._tuition_adapter = None
+        self._neuron_adapter = None
+        self._crease_adapter = None
+        self._plasticity_adapter = None
+        self._nervous_adapter = None
+        self._generative_adapter = None
+        self._povi_adapter = None
+        self._nif_adapter = None
+    }
+
+    fn initialize(self, pipeline: any) -> Dict[string, any] {
+        let stats = {"phase": "cognitive_integration_init"}
+
+        try {
+            from persistent_store import KnowledgeStore
+            self._store = KnowledgeStore {}
+            if self._store._fallback {
+                stats["store_backend"] = "in-memory"
+            } else {
+                stats["store_backend"] = "redis"
+            }
+        } catch(e) {
+            logging.warning("Persistent store unavailable: " + str(e))
+        }
+
+        let init_stats = self.bridge.initialize(bootstrap_commonsense: true)
+        stats["bridge_init"] = init_stats
+
+        if self._store != None {
+            try {
+                let load_stats = self._store.load_all(
+                    graph: self.bridge.graph(),
+                    confidence_mgr: self.bridge._confidence
+                )
+                stats["persistent_load"] = load_stats
+            } catch(e) {
+                logging.warning("Could not load persistent state: " + str(e))
+            }
+        }
+
+        let graph = self.bridge.graph()
+        let gate = self.bridge.ingestion_gate()
+        let confidence = self.bridge._confidence
+
+        self._vlt_adapter = VLTGraphAdapter.new(graph, gate, confidence)
+        self._pvs_adapter = PVSSemanticAdapter.new(self.bridge)
+        self._tuition_adapter = TuitionReasoningAdapter.new(self.bridge)
+        self._neuron_adapter = NeuronConfidenceAdapter.new(confidence, self.bridge._epistemic)
+        self._crease_adapter = CreaseGraphAdapter.new(graph, gate)
+        self._plasticity_adapter = PlasticityMaintenanceAdapter.new(
+            graph, confidence, self.bridge._maintenance, gate)
+        self._nervous_adapter = NervousSystemCognitiveAdapter.new(self.bridge)
+        self._generative_adapter = GenerativeGroundedAdapter.new(self.bridge)
+        self._povi_adapter = PoVIProvenanceAdapter.new(
+            self.bridge._provenance, confidence, gate)
+        self._nif_adapter = NIFGovernanceAdapter.new(graph, gate)
+
+        if pipeline != None {
+            let vlt_stats = self._vlt_adapter.sync_vlt_to_graph(pipeline.vlt)
+            stats["vlt_to_graph"] = vlt_stats
+
+            let crease_stats = self._crease_adapter.sync_creases_to_graph(pipeline.crease_registry)
+            stats["creases_to_graph"] = crease_stats
+
+            let pvs_count = self._pvs_adapter.enrich_pvs_with_graph(pipeline.vlt.pvs, graph, 200)
+            stats["pvs_enriched"] = pvs_count
+        } else {
+            stats["pipeline_sync"] = "skipped (no pipeline)"
+        }
+
+        try {
+            from nif_governance import NIFGovernance
+            let nif = NIFGovernance {}
+            let nif_specs = self._nif_adapter.sync_specs_to_graph(nif)
+            let nif_certs = self._nif_adapter.certifications_to_credibility(nif, None)
+            stats["nif_specs"] = nif_specs
+            stats["nif_certifications"] = nif_certs
+        } catch(e) {
+            logging.debug("NIF governance sync skipped: " + str(e))
+        }
+
+        if pipeline != None {
+            self._wire_lobes_to_reasoning(pipeline)
+        }
+
+        self._initialized = true
+        stats["graph_nodes"] = graph.node_count()
+        stats["graph_edges"] = graph.edge_count()
+        logging.info("Cognitive integration initialized: " + str(graph.node_count()) + " nodes, " + str(graph.edge_count()) + " edges")
+        return stats
+    }
+
+    fn _wire_lobes_to_reasoning(self, pipeline: any) -> void {
+        try {
+            from nrs_core import LOBE_INSTANCES
+            for lobe_name in LOBE_INSTANCES {
+                let lobe = LOBE_INSTANCES[lobe_name]
+                if hasattr(lobe, "set_cognitive_bridge") {
+                    lobe.set_cognitive_bridge(self.bridge)
+                }
+            }
+            logging.info("Wired cognitive bridge to " + str(len(LOBE_INSTANCES)) + " lobe processors")
+        } catch(e) {
+            logging.warning("Could not wire lobes to cognitive bridge: " + str(e))
+        }
+    }
+
+    fn track_user_interaction(self, user_id: string, query: string, domain: string, session_id: string, concepts: Optional[List[string]], confidence: float) -> void {
+        if self._store == None or user_id == "" {
+            return
+        }
+        try {
+            self.save_conversation(user_id, session_id, "user", query, concepts, confidence)
+            let profile = self._store.load_user_profile(user_id)
+            if profile != None {
+                profile["interaction_count"] = profile.get("interaction_count", 0) + 1
+                let domains = profile.get("domains_of_interest", [])
+                if domain != "" {
+                    let found = false
+                    for d in domains {
+                        if d == domain { found = true; break }
+                    }
+                    if not found {
+                        domains.append(domain)
+                        let max_len = 20
+                        if len(domains) > max_len {
+                            domains = domains[len(domains) - max_len:]
+                        }
+                        profile["domains_of_interest"] = domains
+                    }
+                }
+                self._store.save_user_profile(user_id, profile)
+            } else {
+                let init_domains = []
+                if domain != "" {
+                    init_domains = [domain]
+                }
+                self._store.save_user_profile(user_id, {
+                    "display_name": user_id,
+                    "interaction_count": 1,
+                    "domains_of_interest": init_domains
+                })
+            }
+        } catch(e) {
+            pass
+        }
+    }
+
+    fn pre_process(self, query: string, domain: string, session_id: string, user_id: string) -> CognitiveAugmentation {
+        let t0 = time.time()
+        let aug = new_cognitive_augmentation()
+
+        let reasoning = self.bridge.process(query, session_id, user_id, domain)
+        aug.concepts = reasoning.concepts_found
+        if reasoning.augmented_text != None {
+            aug.reasoning_text = reasoning.augmented_text
+        }
+        aug.confidence = reasoning.confidence
+
+        if self.bridge._epistemic != None {
+            let concept_slice = aug.concepts[0:5]
+            let epistemic = self.bridge._epistemic.assess_query(concept_slice)
+            aug.epistemic_certainty = epistemic.overall_certainty
+            let gaps = []
+            for g in epistemic.dont_know {
+                gaps.append(g)
+            }
+            for g in epistemic.speculating_about {
+                gaps.append(g)
+            }
+            aug.knowledge_gaps = gaps
+        }
+
+        let lobe_map = {
+            "linguistic": ["what", "who", "define", "explain"],
+            "logical": ["why", "how", "because", "therefore", "prove"],
+            "mathematical": ["calculate", "compute", "math", "number", "equation"],
+            "spatial": ["where", "location", "map", "distance", "near"],
+            "temporal": ["when", "date", "time", "year", "history", "before", "after"],
+            "creative": ["create", "write", "compose", "imagine", "story", "poem"]
+        }
+        let ql = query.lower()
+        for lobe in lobe_map {
+            let signals = lobe_map[lobe]
+            for s in signals {
+                if s in ql {
+                    aug.suggested_lobes.append(lobe)
+                    break
+                }
+            }
+        }
+
+        if reasoning.reasoning_mode == "factual" {
+            let has_linguistic = false
+            for l in aug.suggested_lobes {
+                if l == "linguistic" { has_linguistic = true; break }
+            }
+            if not has_linguistic {
+                let new_lobes = ["linguistic"]
+                for l in aug.suggested_lobes { new_lobes.append(l) }
+                aug.suggested_lobes = new_lobes
+            }
+        } else if reasoning.reasoning_mode == "causal" {
+            let has_logical = false
+            for l in aug.suggested_lobes {
+                if l == "logical" { has_logical = true; break }
+            }
+            if not has_logical {
+                let new_lobes = ["logical"]
+                for l in aug.suggested_lobes { new_lobes.append(l) }
+                aug.suggested_lobes = new_lobes
+            }
+        }
+
+        if len(aug.suggested_lobes) == 0 {
+            aug.suggested_lobes = ["linguistic", "logical"]
+        }
+
+        aug.processing_time_ms = (time.time() - t0) * 1000
+
+        if user_id != "" {
+            self.track_user_interaction(
+                user_id, query, domain, session_id,
+                aug.concepts[0:5], aug.confidence)
+        }
+
+        return aug
+    }
+
+    fn augment_lobe_output(self, lobe_answer: string, query: string, domain: string) -> string {
+        return self.bridge.augment_lobe_result(lobe_answer, query, domain)
+    }
+
+    fn post_validate(self, answer: string, query: string, session_id: string) -> Dict[string, any] {
+        let result = {"valid": true, "issues": []}
+
+        if answer == None or len(answer) < 10 {
+            return result
+        }
+
+        let cognitive = self.bridge.think(query, session_id: session_id)
+        result["quality_grade"] = cognitive.quality_grade
+        result["confidence"] = cognitive.confidence
+
+        if cognitive.coherence_check != None {
+            if not cognitive.coherence_check.get("coherent", true) {
+                result["valid"] = false
+                result["issues"].append("coherence_violation")
+            }
+        }
+
+        if cognitive.self_test != None and cognitive.self_test.quality_rating != None {
+            let rating = cognitive.self_test.quality_rating
+            if rating.overall_score < 0.3 {
+                result["valid"] = false
+                result["issues"].append("low_quality_score:" + str(rating.overall_score))
+            }
+        }
+
+        result["cognitive_response"] = cognitive
+        return result
+    }
+
+    fn on_tuition_correction(self, query: string, student_tier: string, teacher_tier: string, tuition_system: any) -> Dict[string, any] {
+        if self._tuition_adapter != None {
+            return self._tuition_adapter.correction_to_graph(
+                query, student_tier, teacher_tier, tuition_system)
+        }
+        return {}
+    }
+
+    fn on_neuron_activation(self, activation_result: any, query: string) -> Dict[string, any] {
+        if self._neuron_adapter != None {
+            return self._neuron_adapter.activation_to_evidence(activation_result, query)
+        }
+        return {}
+    }
+
+    fn on_povi_consensus(self, consensus_result: any, query: string) -> Dict[string, int] {
+        if self._povi_adapter != None {
+            return self._povi_adapter.consensus_to_evidence(consensus_result, query)
+        }
+        return {}
+    }
+
+    fn on_plasticity_event(self, plasticity_mgr: any) -> Dict[string, int] {
+        if self._plasticity_adapter != None {
+            self._plasticity_adapter.threshold_to_gate(plasticity_mgr)
+            return self._plasticity_adapter.hebbian_to_graph(plasticity_mgr)
+        }
+        return {}
+    }
+
+    fn on_amygdala_evaluation(self, emotional_context: any) -> void {
+        if self._nervous_adapter != None {
+            self._nervous_adapter.amygdala_to_social(emotional_context)
+        }
+    }
+
+    fn grounded_chat(self, message: string, generative_engine: any, conversation_history: List[Dict[string, string]], domain: string) -> Dict[string, any] {
+        if self._generative_adapter != None {
+            return self._generative_adapter.grounded_chat(
+                message, generative_engine, conversation_history, domain)
+        }
+        return {"text": "", "grounded_text": ""}
+    }
+
+    fn periodic_sync(self, pipeline: any) -> Dict[string, any] {
+        let stats = {}
+
+        if self._vlt_adapter != None {
+            stats["vlt_to_graph"] = self._vlt_adapter.sync_vlt_to_graph(pipeline.vlt)
+            stats["graph_to_vlt"] = self._vlt_adapter.sync_graph_to_vlt(pipeline.vlt, 500)
+        }
+
+        if self._crease_adapter != None {
+            stats["graph_to_creases"] = self._crease_adapter.sync_graph_to_creases(
+                pipeline.crease_registry)
+        }
+
+        if self._pvs_adapter != None {
+            stats["pvs_enriched"] = self._pvs_adapter.enrich_pvs_with_graph(
+                pipeline.vlt.pvs, self.bridge.graph(), 200)
+        }
+
+        let persist_stats = self.persist()
+        if persist_stats != None {
+            stats["persisted"] = persist_stats
+        }
+
+        return stats
+    }
+
+    fn persist(self) -> Optional[Dict[string, any]] {
+        if self._store == None {
+            return None
+        }
+        try {
+            return self._store.save_all(
+                graph: self.bridge.graph(),
+                confidence_mgr: self.bridge._confidence
+            )
+        } catch(e) {
+            logging.warning("Persist failed: " + str(e))
+            return None
+        }
+    }
+
+    fn save_conversation(self, user_id: string, session_id: string, role: string, content: string, concepts: Optional[List[string]], confidence: float) -> Optional[int] {
+        if self._store == None {
+            return None
+        }
+        return self._store.save_conversation_turn(
+            user_id, session_id, role, content, concepts, confidence)
+    }
+
+    fn get_user_profile(self, user_id: string) -> Optional[Dict[string, any]] {
+        if self._store == None {
+            return None
+        }
+        return self._store.load_user_profile(user_id)
+    }
+
+    fn save_user_profile(self, user_id: string, profile: Dict[string, any]) -> void {
+        if self._store != None {
+            self._store.save_user_profile(user_id, profile)
+        }
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        let adapter_count = 0
+        let adapters = [
+            self._vlt_adapter, self._pvs_adapter, self._tuition_adapter,
+            self._neuron_adapter, self._crease_adapter,
+            self._plasticity_adapter, self._nervous_adapter,
+            self._generative_adapter, self._povi_adapter,
+            self._nif_adapter
+        ]
+        for a in adapters {
+            if a != None {
+                adapter_count += 1
+            }
+        }
+
+        let bridge_stats = {}
+        if self._initialized {
+            bridge_stats = self.bridge.stats()
+        }
+
+        return {
+            "initialized": self._initialized,
+            "bridge_stats": bridge_stats,
+            "adapters_active": adapter_count
+        }
+    }
+}
+
+/// ── Exports ─────────────────────────────────────────────────────────────
+
+export CognitiveAugmentation, new_cognitive_augmentation
+export VLTGraphAdapter, PVSSemanticAdapter, TuitionReasoningAdapter
+export NeuronConfidenceAdapter, CreaseGraphAdapter, PlasticityMaintenanceAdapter
+export NervousSystemCognitiveAdapter, GenerativeGroundedAdapter
+export PoVIProvenanceAdapter, NIFGovernanceAdapter
+export CognitiveIntegrationLayer

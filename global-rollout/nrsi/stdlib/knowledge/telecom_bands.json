@@ -1,0 +1,56 @@
+{
+  "domain": "telecom",
+  "version": "2026.1",
+  "source": "3GPP TS 36.101 / TS 38.101 / regional spectrum authorities",
+  "source_tier": "t2_verified",
+  "facts": [
+    {
+      "id": "tb-lte-bands",
+      "text": "Major LTE frequency bands: Band 1 (2100 MHz, global), Band 2 (1900 MHz, Americas), Band 3 (1800 MHz, global), Band 4 (AWS 1700/2100 MHz, Americas), Band 5 (850 MHz, Americas/Asia), Band 7 (2600 MHz, global), Band 8 (900 MHz, global), Band 12 (700 MHz, US), Band 13 (700 MHz, US Verizon), Band 20 (800 MHz, Europe), Band 28 (700 MHz, APAC), Band 38 (2600 MHz TDD), Band 40 (2300 MHz TDD), Band 41 (2500 MHz TDD).",
+      "confidence": 0.97,
+      "tags": ["lte", "bands", "frequency", "mathematical"]
+    },
+    {
+      "id": "tb-5g-nr-bands",
+      "text": "5G NR frequency bands split into FR1 (sub-6 GHz) and FR2 (mmWave). FR1: n1 (2100), n3 (1800), n5 (850), n7 (2600), n28 (700), n41 (2500), n77 (3300-4200), n78 (3300-3800), n79 (4400-5000). FR2: n257 (26.5-29.5 GHz), n258 (24.25-27.5 GHz), n260 (37-40 GHz), n261 (27.5-28.35 GHz). FR1 provides coverage; FR2 provides extreme capacity with limited range.",
+      "confidence": 0.97,
+      "tags": ["5g", "nr", "bands", "frequency", "mathematical"]
+    },
+    {
+      "id": "tb-gsm-bands",
+      "text": "GSM frequency bands: GSM 850 (824-849/869-894 MHz, Americas), GSM 900 (880-915/925-960 MHz, global), E-GSM 900 (extended), DCS 1800 (1710-1785/1805-1880 MHz, global), PCS 1900 (1850-1910/1930-1990 MHz, Americas). Channel spacing 200 kHz with TDMA 8 timeslots per carrier.",
+      "confidence": 0.96,
+      "tags": ["gsm", "bands", "frequency", "mathematical"]
+    },
+    {
+      "id": "tb-umts-bands",
+      "text": "UMTS/WCDMA frequency bands: Band I (2100 MHz, global primary), Band II (1900 MHz, Americas), Band IV (AWS), Band V (850 MHz), Band VIII (900 MHz). WCDMA uses 5 MHz carrier bandwidth with CDMA spreading. UARFCN (UTRA Absolute Radio Frequency Channel Number) identifies the carrier.",
+      "confidence": 0.96,
+      "tags": ["umts", "wcdma", "bands", "frequency", "mathematical"]
+    },
+    {
+      "id": "tb-propagation",
+      "text": "Radio propagation characteristics by frequency: sub-1 GHz bands (700-900 MHz) provide excellent coverage with 10-30 km cell radius in rural areas, good building penetration. 1-3 GHz bands provide balanced coverage/capacity with 1-5 km urban cells. 3-6 GHz (C-band) provides high capacity with 0.5-2 km cells, moderate penetration. mmWave (24-40 GHz) provides extreme capacity but only 100-300m range with poor penetration.",
+      "confidence": 0.94,
+      "tags": ["propagation", "coverage", "range", "mathematical", "causal"]
+    },
+    {
+      "id": "tb-earfcn-formula",
+      "text": "EARFCN (E-UTRA Absolute Radio Frequency Channel Number) to frequency conversion: F_DL = F_DL_low + 0.1 * (N_DL - N_offs_DL) MHz, where F_DL_low and N_offs_DL are band-specific offsets defined in 3GPP TS 36.101 Table 5.7.3-1. For example, Band 1: F_DL_low=2110 MHz, N_offs_DL=0, so EARFCN 300 = 2110 + 0.1*300 = 2140 MHz.",
+      "confidence": 0.97,
+      "tags": ["earfcn", "frequency", "formula", "mathematical"]
+    },
+    {
+      "id": "tb-interference-patterns",
+      "text": "Interference patterns by band: co-channel interference occurs when same frequency is reused too close (frequency reuse factor too aggressive). Adjacent channel interference from imperfect filtering between neighboring carriers. Cross-border interference in border regions where operators in different countries use same bands. PIM (Passive Intermodulation) from corroded connectors/hardware generates spurious signals in specific frequency combinations.",
+      "confidence": 0.93,
+      "tags": ["interference", "patterns", "causal", "diagnostic"]
+    },
+    {
+      "id": "tb-carrier-aggregation",
+      "text": "Carrier Aggregation (CA) combines multiple component carriers to increase bandwidth. LTE supports up to 5 CCs (100 MHz total). Types: intra-band contiguous (same band, adjacent), intra-band non-contiguous (same band, gap between), inter-band (different bands). Common combinations: B3+B7, B1+B3, B2+B4. 5G NR supports up to 16 CCs with EN-DC (E-UTRA NR Dual Connectivity) combining LTE and NR carriers.",
+      "confidence": 0.95,
+      "tags": ["carrier-aggregation", "bandwidth", "capacity", "mathematical"]
+    }
+  ]
+}

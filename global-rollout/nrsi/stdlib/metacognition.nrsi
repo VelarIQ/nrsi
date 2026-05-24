@@ -1,0 +1,75 @@
+/// NRSI Metacognition — Self-Monitoring and Calibration Contracts
+///
+/// Declares gap detection types, calibration thresholds,
+/// and norms for when the system should revise or abstain.
+
+module metacognition
+
+import NRSIData, TrustLevel from "types"
+
+/// ---------- Metacognitive Types ----------
+
+enum KnowledgeGapType {
+    MISSING_FACT,
+    UNCERTAIN_CLAIM,
+    DOMAIN_BOUNDARY,
+    TEMPORAL_STALE,
+    CONFLICTING_SOURCES
+}
+
+enum CalibrationAction {
+    PROCEED,
+    HEDGE,
+    REVISE,
+    ABSTAIN,
+    SEEK_MORE_DATA
+}
+
+type MetacognitiveAssessment {
+    gap_type: KnowledgeGapType,
+    calibration_score: Float,
+    recommended_action: CalibrationAction,
+    should_revise: Bool
+}
+
+/// ---------- Metacognitive Norms ----------
+
+norm flag_low_confidence {
+    type: obligation,
+    scope: global,
+    action: "hedge_response",
+    priority: 80,
+    condition: calibration_score < 0.50
+}
+
+norm abstain_on_no_data {
+    type: obligation,
+    scope: global,
+    action: "abstain_gracefully",
+    priority: 90,
+    condition: gap_type == KnowledgeGapType.MISSING_FACT and calibration_score < 0.20
+}
+
+norm revise_on_conflict {
+    type: obligation,
+    scope: global,
+    action: "trigger_revision",
+    priority: 85,
+    condition: gap_type == KnowledgeGapType.CONFLICTING_SOURCES
+}
+
+norm seek_web_on_boundary {
+    type: permission,
+    scope: global,
+    action: "web_retrieval",
+    priority: 70,
+    condition: gap_type == KnowledgeGapType.DOMAIN_BOUNDARY
+}
+
+/// ---------- Metacognitive Gate ----------
+
+gate metacognitive_check(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.0
+    validate calibration_assessed
+    validate action_determined
+}

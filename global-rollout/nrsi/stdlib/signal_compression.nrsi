@@ -1,0 +1,348 @@
+/// NRSIP Three-Layer Signal Compression.
+///
+/// Full implementation of `nrsip/signal_compression.py`.
+/// Patent-covered: Three-layer signal compression, neuromorphic locality principle.
+///
+/// Layer 0: Raw Activations (GPU-local) — NEVER leaves the instance.
+/// Layer 1: Activation Digest (~2 KB, instance-local) — 440x compression.
+/// Layer 2: Routing Packet (~128 bytes, NETWORK) — 6,937x compression.
+
+module signal_compression
+
+/// ---------- Constants ----------
+
+let PRODUCTION_TOTAL_NEURONS = 111000000
+let PRODUCTION_ACTIVE_K = 111000
+let TOTAL_NEURONS = 100000
+let ACTIVE_K = 100
+let L0_SIZE_BYTES = ACTIVE_K * 8
+let L1_SIZE_BYTES = 2048
+let L2_SIZE_BYTES = 128
+let COMPRESSION_L0_TO_L1 = PRODUCTION_ACTIVE_K * 8 / L1_SIZE_BYTES
+let COMPRESSION_L0_TO_L2 = PRODUCTION_ACTIVE_K * 8 / L2_SIZE_BYTES
+
+/// ---------- Enumerations ----------
+
+enum SignalLayer {
+    RAW = 0,
+    DIGEST = 1,
+    PACKET = 2
+}
+
+/// ---------- Layer 0: Raw Activations ----------
+
+type RawActivation {
+    active_neuron_ids: List[int],
+    similarities: Dict[int, float],
+    domain_signals: Dict[string, int],
+    total_neurons: int,
+    query_hash: string,
+    created_at_ms: int
+}
+
+fn raw_activation_active_count(ra: RawActivation) -> int {
+    return len(ra.active_neuron_ids)
+}
+
+fn raw_activation_sparsity(ra: RawActivation) -> float {
+    if ra.total_neurons > 0 {
+        return raw_activation_active_count(ra) / ra.total_neurons
+    }
+    return 0.0
+}
+
+fn raw_activation_estimated_bytes(ra: RawActivation) -> int {
+    return raw_activation_active_count(ra) * 8
+}
+
+fn raw_activation_signature(ra: RawActivation) -> string {
+    let sorted_ids = sorted(ra.active_neuron_ids)
+    let id_bytes_parts = []
+    for nid in sorted_ids {
+        append(id_bytes_parts, pack_uint32_be(nid))
+    }
+    return sha256_hex_bytes(join_bytes(id_bytes_parts))
+}
+
+fn raw_activation_compress_to_digest(ra: RawActivation) -> ActivationDigest {
+    let total = 0
+    for d in keys(ra.domain_signals) {
+        total += ra.domain_signals[d]
+    }
+    if total == 0 {
+        total = 1
+    }
+    let domain_dist = {}
+    for d in keys(ra.domain_signals) {
+        domain_dist[d] = ra.domain_signals[d] / total
+    }
+
+    let sorted_sims = sorted_by_value_desc(ra.similarities)
+    let top_signals = []
+    let count = 0
+    for nid in sorted_sims {
+        if count >= 10 {
+            break
+        }
+        append(top_signals, (nid, ra.similarities[nid]))
+        count += 1
+    }
+
+    let sim_sum = 0.0
+    for nid in keys(ra.similarities) {
+        sim_sum += ra.similarities[nid]
+    }
+    let mean_sim = sim_sum / max(len(ra.similarities), 1)
+
+    let max_sim = 0.0
+    for nid in keys(ra.similarities) {
+        if ra.similarities[nid] > max_sim {
+            max_sim = ra.similarities[nid]
+        }
+    }
+
+    return ActivationDigest {
+        signature: raw_activation_signature(ra),
+        query_hash: ra.query_hash,
+        active_count: raw_activation_active_count(ra),
+        total_neurons: ra.total_neurons,
+        sparsity: raw_activation_sparsity(ra),
+        domain_distribution: domain_dist,
+        top_signals: top_signals,
+        mean_similarity: mean_sim,
+        max_similarity: max_sim,
+        created_at_ms: ra.created_at_ms
+    }
+}
+
+/// ---------- Layer 1: Activation Digest ----------
+
+type ActivationDigest {
+    signature: string,
+    query_hash: string,
+    active_count: int,
+    total_neurons: int,
+    sparsity: float,
+    domain_distribution: Dict[string, float],
+    top_signals: List[Tuple[int, float]],
+    mean_similarity: float,
+    max_similarity: float,
+    created_at_ms: int
+}
+
+fn activation_digest_estimated_bytes(ad: ActivationDigest) -> int {
+    return L1_SIZE_BYTES
+}
+
+fn activation_digest_primary_domain(ad: ActivationDigest) -> Optional[string] {
+    if len(ad.domain_distribution) == 0 {
+        return None
+    }
+    let best_domain = None
+    let best_val = -1.0
+    for d in keys(ad.domain_distribution) {
+        if ad.domain_distribution[d] > best_val {
+            best_val = ad.domain_distribution[d]
+            best_domain = d
+        }
+    }
+    return best_domain
+}
+
+fn _domain_to_lobes_mask(domain_distribution: Dict[string, float]) -> int {
+    let mask = 0
+    for domain in keys(domain_distribution) {
+        if domain == "language" or domain == "text" or domain == "general" {
+            mask = mask | 0x01
+        }
+        if domain == "logic" or domain == "reasoning" or domain == "legal" {
+            mask = mask | 0x02
+        }
+        if domain == "math" or domain == "numerical" or domain == "financial" {
+            mask = mask | 0x04
+        }
+        if domain == "spatial" or domain == "geometric" or domain == "engineering" {
+            mask = mask | 0x08
+        }
+        if domain == "temporal" or domain == "sequence" or domain == "causal" {
+            mask = mask | 0x10
+        }
+        if domain == "creative" or domain == "art" or domain == "brainstorm" {
+            mask = mask | 0x20
+        }
+    }
+    if mask == 0 {
+        mask = 0x01
+    }
+    return mask
+}
+
+fn activation_digest_to_routing_packet(
+    ad: ActivationDigest, tier: string, processing_mode: string,
+    confidence: float, h_score: float, h_verdict: string,
+    instance_id: string
+) -> RoutingPacket {
+    let domain = activation_digest_primary_domain(ad)
+    if domain == None {
+        domain = "general"
+    }
+    return RoutingPacket {
+        version: 1,
+        query_hash: ad.query_hash,
+        activation_signature: slice_string(ad.signature, 0, 16),
+        tier: tier,
+        processing_mode: processing_mode,
+        domain: domain,
+        confidence: confidence,
+        h_score: h_score,
+        h_verdict: h_verdict,
+        lobes_mask: _domain_to_lobes_mask(ad.domain_distribution),
+        instance_id: instance_id,
+        timestamp_ms: ad.created_at_ms,
+        sequence: 0,
+        flags: 0
+    }
+}
+
+/// ---------- Layer 2: Routing Packet ----------
+
+type RoutingPacket {
+    version: int,
+    query_hash: string,
+    activation_signature: string,
+    tier: string,
+    processing_mode: string,
+    domain: string,
+    confidence: float,
+    h_score: float,
+    h_verdict: string,
+    lobes_mask: int,
+    instance_id: string,
+    timestamp_ms: int,
+    sequence: int,
+    flags: int
+}
+
+fn routing_packet_estimated_bytes(rp: RoutingPacket) -> int {
+    return L2_SIZE_BYTES
+}
+
+fn routing_packet_tier_rank(rp: RoutingPacket) -> int {
+    let ranks = {"T1": 1, "T2": 2, "T3": 3, "T4": 4}
+    return get_or_default(ranks, rp.tier, 0)
+}
+
+fn routing_packet_serialize(rp: RoutingPacket) -> bytes {
+    let mode_map = {"DETERMINISTIC": 0, "PROBABILISTIC": 1, "HYBRID": 2}
+    let verdict_map = {"validated": 0, "acceptable": 1, "suspicious": 2, "hallucination": 3, "pending": 4}
+
+    let qhash = None
+    if len(rp.query_hash) >= 64 {
+        qhash = hex_to_bytes(slice_string(rp.query_hash, 0, 64))
+    } else {
+        qhash = sha256_bytes(rp.query_hash)
+    }
+
+    let asig = None
+    if len(rp.activation_signature) >= 32 {
+        asig = hex_to_bytes(slice_string(rp.activation_signature, 0, 32))
+    } else {
+        asig = slice_bytes(sha256_bytes(rp.activation_signature), 0, 16)
+    }
+
+    let iid = pad_bytes(encode_utf8(slice_string(rp.instance_id, 0, 16)), 16)
+
+    return struct_pack(">B 32s 16s B B 2s H H B B 16s Q I I",
+        rp.version,
+        qhash,
+        asig,
+        routing_packet_tier_rank(rp),
+        get_or_default(mode_map, rp.processing_mode, 2),
+        pad_bytes(encode_utf8(slice_string(rp.domain, 0, 2)), 2),
+        int(rp.confidence * 65535),
+        int(rp.h_score * 65535),
+        get_or_default(verdict_map, rp.h_verdict, 4),
+        rp.lobes_mask,
+        iid,
+        rp.timestamp_ms,
+        rp.sequence,
+        rp.flags
+    )
+}
+
+fn routing_packet_deserialize(data: bytes) -> RoutingPacket {
+    let mode_names = {0: "DETERMINISTIC", 1: "PROBABILISTIC", 2: "HYBRID"}
+    let verdict_names = {0: "validated", 1: "acceptable", 2: "suspicious", 3: "hallucination", 4: "pending"}
+    let tier_names = {1: "T1", 2: "T2", 3: "T3", 4: "T4"}
+
+    let parts = struct_unpack(">B 32s 16s B B 2s H H B B 16s Q I I", slice_bytes(data, 0, 96))
+    return RoutingPacket {
+        version: parts[0],
+        query_hash: bytes_to_hex(parts[1]),
+        activation_signature: bytes_to_hex(parts[2]),
+        tier: get_or_default(tier_names, parts[3], "T1"),
+        processing_mode: get_or_default(mode_names, parts[4], "HYBRID"),
+        domain: trim_null(decode_utf8(parts[5])),
+        confidence: parts[6] / 65535,
+        h_score: parts[7] / 65535,
+        h_verdict: get_or_default(verdict_names, parts[8], "pending"),
+        lobes_mask: parts[9],
+        instance_id: trim_null(decode_utf8(parts[10])),
+        timestamp_ms: parts[11],
+        sequence: parts[12],
+        flags: parts[13]
+    }
+}
+
+/// ---------- Media Variant ----------
+
+type MediaRoutingPacket {
+    version: int,
+    query_hash: string,
+    activation_signature: string,
+    tier: string,
+    processing_mode: string,
+    domain: string,
+    confidence: float,
+    h_score: float,
+    h_verdict: string,
+    lobes_mask: int,
+    instance_id: string,
+    timestamp_ms: int,
+    sequence: int,
+    flags: int,
+    content_hash: string,
+    modality: string,
+    content_size_bytes: int
+}
+
+fn media_routing_packet_estimated_bytes(mrp: MediaRoutingPacket) -> int {
+    return 160
+}
+
+/// ---------- Compression Statistics ----------
+
+fn compression_stats(rps: int, instances: int) -> Dict[string, Any] {
+    let total_rps = rps * instances
+    return {
+        "rps_per_instance": rps,
+        "instances": instances,
+        "total_rps": total_rps,
+        "without_locality_mbps": round_to(total_rps * L0_SIZE_BYTES / 1000000, 1),
+        "with_l1_only_mbps": round_to(total_rps * L1_SIZE_BYTES / 1000000, 1),
+        "with_l2_only_mbps": round_to(total_rps * L2_SIZE_BYTES / 1000000, 1),
+        "compression_l0_to_l1": str(int(COMPRESSION_L0_TO_L1)) + "x",
+        "compression_l0_to_l2": str(int(COMPRESSION_L0_TO_L2)) + "x"
+    }
+}
+
+export SignalLayer
+export RawActivation, raw_activation_active_count, raw_activation_sparsity
+export raw_activation_estimated_bytes, raw_activation_signature
+export raw_activation_compress_to_digest
+export ActivationDigest, activation_digest_estimated_bytes
+export activation_digest_primary_domain, activation_digest_to_routing_packet
+export RoutingPacket, routing_packet_estimated_bytes, routing_packet_tier_rank
+export routing_packet_serialize, routing_packet_deserialize
+export MediaRoutingPacket, media_routing_packet_estimated_bytes
+export compression_stats

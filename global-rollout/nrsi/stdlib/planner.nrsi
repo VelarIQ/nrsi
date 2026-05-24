@@ -1,0 +1,1033 @@
+/// NRS Goal Decomposition Planner — Multi-Step Reasoning Through Planning.
+///
+/// Decomposes complex questions into sub-questions, plans multi-step
+/// reasoning chains, evaluates alternative approaches, tracks progress,
+/// and detects when sub-answers contradict or support each other.
+///
+/// Operates above the causal-graph GoalPlanner in reasoning_planning:
+/// that module navigates edges in a CausalGraph; this module decomposes
+/// natural-language queries into structured HTN plans.
+
+module planner
+
+import logging from "std/logging"
+import math from "std/math"
+import re from "std/regex"
+import time from "std/time"
+import uuid from "std/uuid"
+
+let logger = logging.getLogger("nrs.planner")
+
+/// ── Identifiers ────────────────────────────────────────────────────────
+
+fn _uid(prefix: string) -> string {
+    return prefix + uuid.uuid4_hex()[0:12]
+}
+
+fn _now() -> float {
+    return time.time()
+}
+
+/// ── Goal Types ─────────────────────────────────────────────────────────
+
+enum GoalType {
+    ANSWER,
+    PROVE,
+    COMPARE,
+    EXPLAIN,
+    LIST,
+    COMPUTE,
+    EVALUATE,
+    TEMPORAL
+}
+
+fn goal_type_value(gt: GoalType) -> string {
+    if gt == GoalType.ANSWER { return "answer" }
+    if gt == GoalType.PROVE { return "prove" }
+    if gt == GoalType.COMPARE { return "compare" }
+    if gt == GoalType.EXPLAIN { return "explain" }
+    if gt == GoalType.LIST { return "list" }
+    if gt == GoalType.COMPUTE { return "compute" }
+    if gt == GoalType.EVALUATE { return "evaluate" }
+    if gt == GoalType.TEMPORAL { return "temporal" }
+    return "answer"
+}
+
+enum GoalStatus {
+    PENDING,
+    ACTIVE,
+    COMPLETED,
+    FAILED,
+    BLOCKED
+}
+
+fn goal_status_value(gs: GoalStatus) -> string {
+    if gs == GoalStatus.PENDING { return "pending" }
+    if gs == GoalStatus.ACTIVE { return "active" }
+    if gs == GoalStatus.COMPLETED { return "completed" }
+    if gs == GoalStatus.FAILED { return "failed" }
+    if gs == GoalStatus.BLOCKED { return "blocked" }
+    return "pending"
+}
+
+enum StepAction {
+    RETRIEVE,
+    COMPUTE,
+    INFER,
+    COMPARE,
+    SYNTHESIZE,
+    VERIFY,
+    DECOMPOSE,
+    RANK,
+    ENUMERATE
+}
+
+fn step_action_value(sa: StepAction) -> string {
+    if sa == StepAction.RETRIEVE { return "retrieve" }
+    if sa == StepAction.COMPUTE { return "compute" }
+    if sa == StepAction.INFER { return "infer" }
+    if sa == StepAction.COMPARE { return "compare" }
+    if sa == StepAction.SYNTHESIZE { return "synthesize" }
+    if sa == StepAction.VERIFY { return "verify" }
+    if sa == StepAction.DECOMPOSE { return "decompose" }
+    if sa == StepAction.RANK { return "rank" }
+    if sa == StepAction.ENUMERATE { return "enumerate" }
+    return "retrieve"
+}
+
+fn step_action_from_name(name: string) -> StepAction {
+    let n = name.upper()
+    if n == "RETRIEVE" { return StepAction.RETRIEVE }
+    if n == "COMPUTE" { return StepAction.COMPUTE }
+    if n == "INFER" { return StepAction.INFER }
+    if n == "COMPARE" { return StepAction.COMPARE }
+    if n == "SYNTHESIZE" { return StepAction.SYNTHESIZE }
+    if n == "VERIFY" { return StepAction.VERIFY }
+    if n == "DECOMPOSE" { return StepAction.DECOMPOSE }
+    if n == "RANK" { return StepAction.RANK }
+    if n == "ENUMERATE" { return StepAction.ENUMERATE }
+    return StepAction.RETRIEVE
+}
+
+/// ── Data Objects ───────────────────────────────────────────────────────
+
+class Goal {
+    fn new(description: string, goal_type: GoalType) -> Goal {
+        let g = Goal {}
+        g.description = description
+        g.goal_type = goal_type
+        g.goal_id = _uid("goal-")
+        g.priority = 1.0
+        g.parent = None
+        g.constraints = {}
+        g.status = GoalStatus.PENDING
+        g.result = None
+        g.created_at = _now()
+        return g
+    }
+
+    fn to_dict(self) -> Dict[string, any] {
+        return {
+            "goal_id": self.goal_id,
+            "description": self.description,
+            "goal_type": goal_type_value(self.goal_type),
+            "priority": self.priority,
+            "parent": self.parent,
+            "constraints": self.constraints,
+            "status": goal_status_value(self.status),
+            "result": self.result,
+            "created_at": self.created_at
+        }
+    }
+}
+
+
+class PlanStep {
+    fn new(action: StepAction, description: string) -> PlanStep {
+        let s = PlanStep {}
+        s.action = action
+        s.description = description
+        s.step_id = _uid("step-")
+        s.inputs = []
+        s.status = GoalStatus.PENDING
+        s.result = None
+        s.confidence = 0.0
+        s.error = None
+        s.started_at = None
+        s.finished_at = None
+        return s
+    }
+
+    fn elapsed_ms(self) -> float {
+        if self.started_at == None { return 0.0 }
+        let end = self.finished_at
+        if end == None { end = _now() }
+        return (end - self.started_at) * 1000
+    }
+
+    fn to_dict(self) -> Dict[string, any] {
+        return {
+            "step_id": self.step_id,
+            "action": step_action_value(self.action),
+            "description": self.description,
+            "inputs": self.inputs,
+            "status": goal_status_value(self.status),
+            "result": self.result,
+            "confidence": self.confidence,
+            "error": self.error,
+            "elapsed_ms": self.elapsed_ms()
+        }
+    }
+}
+
+
+class HTNPlan {
+    fn new() -> HTNPlan {
+        let p = HTNPlan {}
+        p.plan_id = _uid("plan-")
+        p.goal = None
+        p.steps = []
+        p.estimated_confidence = 0.0
+        p.actual_confidence = 0.0
+        p.status = GoalStatus.PENDING
+        p.decomposition_type = ""
+        p.synthesis = None
+        p.created_at = _now()
+        p.finished_at = None
+        return p
+    }
+
+    fn completed_steps(self) -> int {
+        let count = 0
+        for s in self.steps {
+            if s.status == GoalStatus.COMPLETED { count += 1 }
+        }
+        return count
+    }
+
+    fn progress(self) -> float {
+        if self.steps.len() == 0 { return 0.0 }
+        return self.completed_steps() / self.steps.len()
+    }
+
+    fn elapsed_ms(self) -> float {
+        let end = self.finished_at
+        if end == None { end = _now() }
+        return (end - self.created_at) * 1000
+    }
+
+    fn to_dict(self) -> Dict[string, any] {
+        let step_dicts: List[Dict[string, any]] = []
+        for s in self.steps { step_dicts.append(s.to_dict()) }
+        let goal_dict = None
+        if self.goal != None { goal_dict = self.goal.to_dict() }
+        return {
+            "plan_id": self.plan_id,
+            "goal": goal_dict,
+            "steps": step_dicts,
+            "estimated_confidence": self.estimated_confidence,
+            "actual_confidence": self.actual_confidence,
+            "status": goal_status_value(self.status),
+            "decomposition_type": self.decomposition_type,
+            "synthesis": self.synthesis,
+            "progress": self.progress(),
+            "elapsed_ms": self.elapsed_ms()
+        }
+    }
+}
+
+
+/// ── Decomposition Templates ────────────────────────────────────────────
+
+let DECOMPOSITION_TEMPLATES: Dict[string, List[List[any]]] = {
+    "causal": [
+        [StepAction.RETRIEVE,   "Identify candidate causes of {goal}"],
+        [StepAction.VERIFY,     "Verify each candidate cause against available evidence"],
+        [StepAction.RANK,       "Rank causes by impact and evidential support"],
+        [StepAction.INFER,      "Identify interactions between causal factors"],
+        [StepAction.SYNTHESIZE,  "Synthesize causal explanation for {goal}"]
+    ],
+    "comparative": [
+        [StepAction.DECOMPOSE,  "Identify entities being compared in {goal}"],
+        [StepAction.RETRIEVE,   "Gather information about first entity"],
+        [StepAction.RETRIEVE,   "Gather information about second entity"],
+        [StepAction.ENUMERATE,  "Identify comparison dimensions"],
+        [StepAction.COMPARE,    "Compare entities on each dimension"],
+        [StepAction.SYNTHESIZE,  "Summarize comparison and key differences"]
+    ],
+    "explanatory": [
+        [StepAction.DECOMPOSE,  "Identify components/mechanisms of {goal}"],
+        [StepAction.RETRIEVE,   "Explain each component individually"],
+        [StepAction.INFER,      "Map interactions between components"],
+        [StepAction.VERIFY,     "Verify explanation consistency"],
+        [StepAction.SYNTHESIZE,  "Build coherent explanation of how {goal} works"]
+    ],
+    "temporal": [
+        [StepAction.RETRIEVE,   "Identify key events/periods related to {goal}"],
+        [StepAction.COMPUTE,    "Establish chronological ordering"],
+        [StepAction.INFER,      "Identify causal connections between events"],
+        [StepAction.RETRIEVE,   "Gather context for pivotal transitions"],
+        [StepAction.SYNTHESIZE,  "Narrate temporal progression of {goal}"]
+    ],
+    "analytical": [
+        [StepAction.RETRIEVE,   "Gather data and evidence for {goal}"],
+        [StepAction.DECOMPOSE,  "Break down into analyzable dimensions"],
+        [StepAction.COMPUTE,    "Identify patterns and trends"],
+        [StepAction.INFER,      "Evaluate significance of each pattern"],
+        [StepAction.VERIFY,     "Check for confounds and alternative explanations"],
+        [StepAction.SYNTHESIZE,  "Synthesize analytical conclusion for {goal}"]
+    ],
+    "evaluative": [
+        [StepAction.DECOMPOSE,  "Frame the decision/evaluation in {goal}"],
+        [StepAction.ENUMERATE,  "List arguments in favour"],
+        [StepAction.ENUMERATE,  "List arguments against"],
+        [StepAction.RETRIEVE,   "Assess risks and unknowns"],
+        [StepAction.COMPARE,    "Weigh trade-offs across criteria"],
+        [StepAction.SYNTHESIZE,  "Produce balanced evaluative judgement"]
+    ],
+    "enumerative": [
+        [StepAction.RETRIEVE,   "Identify scope and criteria for {goal}"],
+        [StepAction.ENUMERATE,  "Enumerate candidate items"],
+        [StepAction.VERIFY,     "Filter items against criteria"],
+        [StepAction.RANK,       "Rank or group qualifying items"],
+        [StepAction.SYNTHESIZE,  "Present organized list for {goal}"]
+    ],
+    "proof": [
+        [StepAction.DECOMPOSE,  "Identify claim to prove in {goal}"],
+        [StepAction.RETRIEVE,   "Gather premises and axioms"],
+        [StepAction.INFER,      "Construct chain of deductions"],
+        [StepAction.VERIFY,     "Check each inference step for validity"],
+        [StepAction.SYNTHESIZE,  "Present proof or identify gaps"]
+    ]
+}
+
+/// ── Goal-type detection heuristics ─────────────────────────────────────
+
+let GOAL_PATTERNS: List[List[string]] = [
+    ["\\b(why|what caused|what causes|reason for)\\b", "causal"],
+    ["\\b(compare|vs\\.?|versus|differ|difference between)\\b", "comparative"],
+    ["\\b(how does|how do|mechanism|explain how|how\\b.{0,20}\\bworks?)\\b", "explanatory"],
+    ["\\b(history|timeline|when did|chronolog|evolution of)\\b", "temporal"],
+    ["\\b(analy[sz]\\w*|assess\\w*|examin\\w*|investigat\\w*|stud(?:y|ies|ied))\\b", "analytical"],
+    ["\\b(should|pros and cons|worth|advisable|recommend)\\b", "evaluative"],
+    ["\\b(list|enumerate|name all|what are the|types of|examples of)\\b", "enumerative"],
+    ["\\b(prove|demonstrate that|show that|is it true)\\b", "proof"],
+    ["\\b(compute|calculate|how much|how many|what is the value)\\b", "analytical"]
+]
+
+let GOAL_TYPE_MAP: Dict[string, GoalType] = {
+    "causal": GoalType.ANSWER,
+    "comparative": GoalType.COMPARE,
+    "explanatory": GoalType.EXPLAIN,
+    "temporal": GoalType.TEMPORAL,
+    "analytical": GoalType.ANSWER,
+    "evaluative": GoalType.EVALUATE,
+    "enumerative": GoalType.LIST,
+    "proof": GoalType.PROVE
+}
+
+
+/// ── Goal Decomposer ────────────────────────────────────────────────────
+
+class GoalDecomposer {
+    fn new() -> GoalDecomposer {
+        let gd = GoalDecomposer {}
+        return gd
+    }
+
+    fn decompose(self, query: string, domain: string) -> HTNPlan {
+        let decomposition = self._detect_decomposition_type(query)
+        let goal_type = GOAL_TYPE_MAP.get(decomposition, GoalType.ANSWER)
+
+        let goal = Goal.new(query.strip(), goal_type)
+        goal.constraints = {"domain": domain}
+
+        let steps = self._generate_steps(goal, decomposition)
+        let estimated = self._estimate_confidence(decomposition, domain)
+
+        let plan = HTNPlan.new()
+        plan.goal = goal
+        plan.steps = steps
+        plan.estimated_confidence = estimated
+        plan.decomposition_type = decomposition
+
+        logger.debug("Decomposed '" + query[0:60] + "' -> " + decomposition + " (" + string(steps.len()) + " steps)")
+        return plan
+    }
+
+    fn _detect_decomposition_type(self, query: string) -> string {
+        let q = query.lower().strip()
+        let scores: Dict[string, float] = {}
+
+        for pattern_pair in GOAL_PATTERNS {
+            let pattern = pattern_pair[0]
+            let dtype = pattern_pair[1]
+            if re.search(pattern, q, re.IGNORECASE) != None {
+                if dtype not in scores { scores[dtype] = 0.0 }
+                scores[dtype] += 1.0
+            }
+        }
+
+        if scores.len() > 0 {
+            let best = ""
+            let best_score = -1.0
+            for dtype, score in scores.items() {
+                if score > best_score {
+                    best = dtype
+                    best_score = score
+                }
+            }
+            return best
+        }
+        return "analytical"
+    }
+
+    fn _generate_steps(self, goal: Goal, decomposition: string) -> List[any] {
+        let template = DECOMPOSITION_TEMPLATES.get(decomposition, DECOMPOSITION_TEMPLATES["analytical"])
+        let steps: List[PlanStep] = []
+
+        let i = 0
+        for entry in template {
+            let action = entry[0]
+            let desc_template = entry[1]
+            let desc = desc_template.replace("{goal}", goal.description)
+            let step = PlanStep.new(action, desc)
+            if i > 0 { step.inputs = [steps[i - 1].step_id] }
+            steps.append(step)
+            i += 1
+        }
+        return steps
+    }
+
+    fn _estimate_confidence(self, decomposition: string, domain: string) -> float {
+        let base_map: Dict[string, float] = {
+            "causal": 0.55,
+            "comparative": 0.70,
+            "explanatory": 0.60,
+            "temporal": 0.65,
+            "analytical": 0.50,
+            "evaluative": 0.45,
+            "enumerative": 0.75,
+            "proof": 0.40
+        }
+        let base = base_map.get(decomposition, 0.50)
+
+        let domain_boost_map: Dict[string, float] = {
+            "math": 0.10,
+            "science": 0.05,
+            "history": 0.05,
+            "general": 0.0
+        }
+        let boost = domain_boost_map.get(domain, 0.0)
+
+        let result = base + boost
+        if result > 0.95 { result = 0.95 }
+        return result
+    }
+}
+
+
+/// ── Plan Executor ──────────────────────────────────────────────────────
+
+class PlanExecutor {
+    fn new() -> PlanExecutor {
+        let pe = PlanExecutor {}
+        pe.MAX_RETRIES = 2
+        pe._step_handlers = {
+            "RETRIEVE": "retrieve_fn",
+            "COMPUTE": "compute_fn",
+            "INFER": "infer_fn",
+            "COMPARE": "infer_fn",
+            "SYNTHESIZE": "infer_fn",
+            "VERIFY": "infer_fn",
+            "DECOMPOSE": "infer_fn",
+            "RANK": "infer_fn",
+            "ENUMERATE": "retrieve_fn"
+        }
+        return pe
+    }
+
+    fn execute_step(self, step: PlanStep, context: Dict[string, any], capabilities: Dict[string, any]) -> PlanStep {
+        step.started_at = _now()
+        step.status = GoalStatus.ACTIVE
+
+        let action_key = step_action_value(step.action).upper()
+        let fn_key = self._step_handlers.get(action_key, "infer_fn")
+        let handler = capabilities.get(fn_key, None)
+
+        if handler == None {
+            step.status = GoalStatus.COMPLETED
+            step.result = "[no handler for " + step_action_value(step.action) + "] " + step.description
+            step.confidence = 0.3
+            step.finished_at = _now()
+            return step
+        }
+
+        let gathered_inputs: List[string] = []
+        for ref_id in step.inputs {
+            if ref_id in context {
+                gathered_inputs.append(string(context[ref_id]))
+            }
+        }
+
+        let prompt = step.description
+        if gathered_inputs.len() > 0 {
+            prompt += " | Context: " + gathered_inputs.join("; ")
+        }
+
+        let retries = 0
+        while retries <= self.MAX_RETRIES {
+            try {
+                let raw = handler(prompt)
+                step.result = raw
+                step.confidence = self._score_result(raw)
+                step.status = GoalStatus.COMPLETED
+                step.error = None
+                break
+            } catch(exc) {
+                retries += 1
+                step.error = string(exc)
+                logger.warning("Step " + step.step_id + " attempt " + string(retries) + " failed: " + step.error)
+                if retries > self.MAX_RETRIES {
+                    step.status = GoalStatus.FAILED
+                }
+            }
+        }
+
+        step.finished_at = _now()
+        return step
+    }
+
+    fn execute_plan(self, plan: HTNPlan, capabilities: Dict[string, any]) -> HTNPlan {
+        plan.status = GoalStatus.ACTIVE
+        let context: Dict[string, any] = {}
+
+        for step in plan.steps {
+            self.execute_step(step, context, capabilities)
+            if step.status == GoalStatus.COMPLETED && step.result != None {
+                context[step.step_id] = step.result
+            } else if step.status == GoalStatus.FAILED {
+                logger.warning("Step " + step.step_id + " failed; attempting replan")
+                let replacement = self.replan_on_failure(plan, step)
+                if replacement != None {
+                    self.execute_step(replacement, context, capabilities)
+                    if replacement.status == GoalStatus.COMPLETED {
+                        context[replacement.step_id] = replacement.result
+                        step.result = replacement.result
+                        step.confidence = replacement.confidence
+                        step.status = GoalStatus.COMPLETED
+                    }
+                }
+            }
+        }
+
+        let completed = 0
+        for s in plan.steps {
+            if s.status == GoalStatus.COMPLETED { completed += 1 }
+        }
+        if completed == plan.steps.len() {
+            plan.status = GoalStatus.COMPLETED
+        } else if completed > 0 {
+            plan.status = GoalStatus.ACTIVE
+        } else {
+            plan.status = GoalStatus.FAILED
+        }
+
+        let confidences: List[float] = []
+        for s in plan.steps {
+            if s.confidence > 0 { confidences.append(s.confidence) }
+        }
+        if confidences.len() > 0 {
+            plan.actual_confidence = _geometric_mean(confidences)
+        } else {
+            plan.actual_confidence = 0.0
+        }
+        plan.finished_at = _now()
+        return plan
+    }
+
+    fn replan_on_failure(self, plan: HTNPlan, failed_step: PlanStep) -> Optional[PlanStep] {
+        if failed_step.action == StepAction.COMPUTE {
+            let s = PlanStep.new(StepAction.RETRIEVE, "Look up result instead of computing: " + failed_step.description)
+            s.inputs = failed_step.inputs
+            return s
+        }
+        if failed_step.action == StepAction.INFER {
+            let s = PlanStep.new(StepAction.RETRIEVE, "Retrieve supporting evidence: " + failed_step.description)
+            s.inputs = failed_step.inputs
+            return s
+        }
+        if failed_step.action == StepAction.VERIFY {
+            let s = PlanStep.new(StepAction.RETRIEVE, "Find corroborating sources: " + failed_step.description)
+            s.inputs = failed_step.inputs
+            return s
+        }
+        return None
+    }
+
+    fn _score_result(self, raw: any) -> float {
+        if raw == None { return 0.0 }
+        let s = string(raw)
+        if s.strip().len() == 0 { return 0.1 }
+
+        let length_score = s.len() / 200.0
+        if length_score > 1.0 { length_score = 1.0 }
+        length_score = length_score * 0.4
+
+        let specificity = 0.0
+        let specificity_signals = [
+            "\\d{4}",
+            "\\b(because|therefore|however|specifically)\\b",
+            "\\b(according to|evidence|study|source)\\b",
+            "\\b(approximately|percent|ratio)\\b"
+        ]
+        for pattern in specificity_signals {
+            if re.search(pattern, s, re.IGNORECASE) != None {
+                specificity += 0.15
+            }
+        }
+        if specificity > 0.6 { specificity = 0.6 }
+
+        let result = length_score + specificity
+        if result > 1.0 { result = 1.0 }
+        return result
+    }
+}
+
+
+/// ── Plan Synthesizer ───────────────────────────────────────────────────
+
+class PlanSynthesizer {
+    fn new() -> PlanSynthesizer {
+        let ps = PlanSynthesizer {}
+        return ps
+    }
+
+    fn synthesize(self, plan: HTNPlan) -> string {
+        if plan.steps.len() == 0 { return "No steps were executed." }
+
+        let results: List[string] = []
+        for step in plan.steps {
+            if step.status == GoalStatus.COMPLETED && step.result != None {
+                results.append(string(step.result))
+            }
+        }
+        if results.len() == 0 { return "Plan execution produced no results." }
+
+        let decomp = plan.decomposition_type
+        let goal_desc = "the query"
+        if plan.goal != None { goal_desc = plan.goal.description }
+
+        if decomp == "causal" { return self._synthesize_causal(goal_desc, plan.steps) }
+        if decomp == "comparative" { return self._synthesize_comparative(goal_desc, plan.steps) }
+        if decomp == "evaluative" { return self._synthesize_evaluative(goal_desc, plan.steps) }
+        return self._synthesize_generic(goal_desc, plan.steps)
+    }
+
+    fn _synthesize_causal(self, goal: string, steps: List[PlanStep]) -> string {
+        let parts: List[string] = ["Regarding: " + goal + "\n"]
+
+        let factor_results: List[PlanStep] = []
+        for s in steps {
+            if s.action == StepAction.RETRIEVE || s.action == StepAction.VERIFY {
+                factor_results.append(s)
+            }
+        }
+        let ranking: List[PlanStep] = []
+        for s in steps { if s.action == StepAction.RANK { ranking.append(s) } }
+        let interactions: List[PlanStep] = []
+        for s in steps { if s.action == StepAction.INFER { interactions.append(s) } }
+        let synthesis: List[PlanStep] = []
+        for s in steps { if s.action == StepAction.SYNTHESIZE { synthesis.append(s) } }
+
+        if factor_results.len() > 0 {
+            parts.append("Identified factors:")
+            let i = 1
+            for s in factor_results {
+                let text = s.description
+                if s.result != None { text = string(s.result) }
+                parts.append("  " + string(i) + ". " + text)
+                i += 1
+            }
+        }
+
+        if ranking.len() > 0 {
+            let r_text = "see above"
+            if ranking[0].result != None { r_text = string(ranking[0].result) }
+            parts.append("\nRanking: " + r_text)
+        }
+
+        if interactions.len() > 0 {
+            let i_text = "complex multi-factor"
+            if interactions[0].result != None { i_text = string(interactions[0].result) }
+            parts.append("\nInteractions: " + i_text)
+        }
+
+        if synthesis.len() > 0 {
+            parts.append("\nConclusion: " + string(synthesis[0].result))
+        } else if factor_results.len() > 0 {
+            parts.append("\nConclusion: Multiple factors contribute to " + goal + ".")
+        }
+
+        return parts.join("\n")
+    }
+
+    fn _synthesize_comparative(self, goal: string, steps: List[PlanStep]) -> string {
+        let parts: List[string] = ["Comparison: " + goal + "\n"]
+
+        let retrieval: List[PlanStep] = []
+        for s in steps { if s.action == StepAction.RETRIEVE { retrieval.append(s) } }
+        let comparison: List[PlanStep] = []
+        for s in steps { if s.action == StepAction.COMPARE { comparison.append(s) } }
+        let synthesis: List[PlanStep] = []
+        for s in steps { if s.action == StepAction.SYNTHESIZE { synthesis.append(s) } }
+
+        let i = 0
+        for s in retrieval {
+            let text = s.description
+            if s.result != None { text = string(s.result) }
+            parts.append("Entity " + string(i + 1) + ": " + text)
+            i += 1
+        }
+
+        if comparison.len() > 0 {
+            let c_text = "see above"
+            if comparison[0].result != None { c_text = string(comparison[0].result) }
+            parts.append("\nDirect comparison: " + c_text)
+        }
+
+        if synthesis.len() > 0 {
+            parts.append("\nSummary: " + string(synthesis[0].result))
+        }
+
+        return parts.join("\n")
+    }
+
+    fn _synthesize_evaluative(self, goal: string, steps: List[PlanStep]) -> string {
+        let parts: List[string] = ["Evaluation: " + goal + "\n"]
+
+        let pros: List[PlanStep] = []
+        let cons: List[PlanStep] = []
+        let risks: List[PlanStep] = []
+        let synthesis: List[PlanStep] = []
+        for s in steps {
+            let desc_lower = s.description.lower()
+            if "favour" in desc_lower || "for" in desc_lower { pros.append(s) }
+            if "against" in desc_lower { cons.append(s) }
+            if "risk" in desc_lower { risks.append(s) }
+            if s.action == StepAction.SYNTHESIZE { synthesis.append(s) }
+        }
+
+        if pros.len() > 0 {
+            let text = "see analysis"
+            if pros[0].result != None { text = string(pros[0].result) }
+            parts.append("For: " + text)
+        }
+        if cons.len() > 0 {
+            let text = "see analysis"
+            if cons[0].result != None { text = string(cons[0].result) }
+            parts.append("Against: " + text)
+        }
+        if risks.len() > 0 {
+            let text = "see analysis"
+            if risks[0].result != None { text = string(risks[0].result) }
+            parts.append("Risks: " + text)
+        }
+        if synthesis.len() > 0 {
+            parts.append("\nJudgement: " + string(synthesis[0].result))
+        }
+
+        return parts.join("\n")
+    }
+
+    fn _synthesize_generic(self, goal: string, steps: List[PlanStep]) -> string {
+        let parts: List[string] = ["Analysis of: " + goal + "\n"]
+
+        let i = 1
+        for step in steps {
+            if step.status == GoalStatus.COMPLETED && step.result != None {
+                parts.append("Step " + string(i) + " (" + step_action_value(step.action) + "): " + string(step.result))
+            } else if step.status == GoalStatus.FAILED {
+                let err = ""
+                if step.error != None { err = step.error }
+                parts.append("Step " + string(i) + " (" + step_action_value(step.action) + "): [failed] " + err)
+            }
+            i += 1
+        }
+
+        let synthesis_steps: List[PlanStep] = []
+        for s in steps { if s.action == StepAction.SYNTHESIZE { synthesis_steps.append(s) } }
+        if synthesis_steps.len() > 0 && synthesis_steps[0].result != None {
+            parts.append("\nConclusion: " + string(synthesis_steps[0].result))
+        }
+
+        return parts.join("\n")
+    }
+}
+
+
+/// ── Contradiction / Support Detector ───────────────────────────────────
+
+class EvidenceCoherenceChecker {
+    fn new() -> EvidenceCoherenceChecker {
+        let ec = EvidenceCoherenceChecker {}
+        ec.CONTRADICTION_SIGNALS = [
+            ["\\bnot\\b", "\\bis\\b"],
+            ["\\bincreased?\\b", "\\bdecreased?\\b"],
+            ["\\bbetter\\b", "\\bworse\\b"],
+            ["\\bsuccess\\b", "\\bfailure\\b"],
+            ["\\btrue\\b", "\\bfalse\\b"],
+            ["\\bpositive\\b", "\\bnegative\\b"],
+            ["\\bmore\\b", "\\bless\\b"],
+            ["\\bhigher\\b", "\\blower\\b"]
+        ]
+        return ec
+    }
+
+    fn check_coherence(self, steps: List[PlanStep]) -> Dict[string, any] {
+        let completed: List[PlanStep] = []
+        for s in steps {
+            if s.status == GoalStatus.COMPLETED && s.result != None {
+                completed.append(s)
+            }
+        }
+        if completed.len() < 2 {
+            return {"coherent": true, "contradictions": [], "supports": []}
+        }
+
+        let contradictions: List[Dict[string, string]] = []
+        let supports: List[Dict[string, string]] = []
+
+        let i = 0
+        while i < completed.len() {
+            let j = i + 1
+            while j < completed.len() {
+                let a_text = string(completed[i].result).lower()
+                let b_text = string(completed[j].result).lower()
+                let rel = self._compare_pair(a_text, b_text)
+
+                if rel == "contradiction" {
+                    contradictions.append({
+                        "step_a": completed[i].step_id,
+                        "step_b": completed[j].step_id,
+                        "a_excerpt": string(completed[i].result)[0:120],
+                        "b_excerpt": string(completed[j].result)[0:120]
+                    })
+                } else if rel == "support" {
+                    supports.append({
+                        "step_a": completed[i].step_id,
+                        "step_b": completed[j].step_id
+                    })
+                }
+                j += 1
+            }
+            i += 1
+        }
+
+        return {
+            "coherent": contradictions.len() == 0,
+            "contradictions": contradictions,
+            "supports": supports,
+            "n_checked_pairs": completed.len() * (completed.len() - 1) / 2
+        }
+    }
+
+    fn _compare_pair(self, a: string, b: string) -> string {
+        let a_words = Set.from(a.split(" "))
+        let b_words = Set.from(b.split(" "))
+        let overlap = a_words.intersection(b_words)
+
+        let contradiction_score = 0
+        for pair in self.CONTRADICTION_SIGNALS {
+            let pos_pat = pair[0]
+            let neg_pat = pair[1]
+            let a_pos = re.search(pos_pat, a) != None
+            let a_neg = re.search(neg_pat, a) != None
+            let b_pos = re.search(pos_pat, b) != None
+            let b_neg = re.search(neg_pat, b) != None
+            if (a_pos && b_neg) || (a_neg && b_pos) {
+                contradiction_score += 1
+            }
+        }
+
+        if contradiction_score >= 2 && overlap.len() > 0 {
+            return "contradiction"
+        }
+
+        let max_len = a_words.len()
+        if b_words.len() > max_len { max_len = b_words.len() }
+        if overlap.len() > max_len * 0.3 {
+            return "support"
+        }
+
+        return "neutral"
+    }
+}
+
+
+/// ── Unified Planner ────────────────────────────────────────────────────
+
+class Planner {
+    fn new(max_history: int) -> Planner {
+        let p = Planner {}
+        p._decomposer = GoalDecomposer.new()
+        p._executor = PlanExecutor.new()
+        p._synthesizer = PlanSynthesizer.new()
+        p._coherence = EvidenceCoherenceChecker.new()
+        p._active_plans = {}
+        p._completed_plans = []
+        p._max_history = max_history
+        return p
+    }
+
+    fn plan(self, query: string, domain: string, context: Optional[Dict[string, any]]) -> HTNPlan {
+        let p = self._decomposer.decompose(query, domain)
+        if context != None {
+            let open_qs = context.get("open_questions", None)
+            if open_qs != None {
+                let count = 0
+                for oq in open_qs {
+                    if count >= 3 { break }
+                    let step = PlanStep.new(StepAction.RETRIEVE, "Address open question: " + oq)
+                    step.step_id = _uid("oq_")
+                    p.steps.append(step)
+                    count += 1
+                }
+            }
+            let primary_topic = context.get("primary_topic", None)
+            if primary_topic != None && primary_topic.lower() not in query.lower() {
+                let ctx_step = PlanStep.new(StepAction.RETRIEVE, "Connect to prior topic: " + primary_topic)
+                ctx_step.step_id = _uid("ctx_")
+                p.steps.insert(0, ctx_step)
+            }
+        }
+        self._active_plans[p.plan_id] = p
+        return p
+    }
+
+    fn execute(self, plan: HTNPlan, knowledge_fn: Optional[any], compute_fn: Optional[any], retrieve_fn: Optional[any], infer_fn: Optional[any]) -> HTNPlan {
+        let capabilities: Dict[string, any] = {}
+        if retrieve_fn != None { capabilities["retrieve_fn"] = retrieve_fn }
+        if knowledge_fn != None {
+            if "retrieve_fn" not in capabilities { capabilities["retrieve_fn"] = knowledge_fn }
+        }
+        if compute_fn != None { capabilities["compute_fn"] = compute_fn }
+        if infer_fn != None { capabilities["infer_fn"] = infer_fn }
+        if retrieve_fn != None && "infer_fn" not in capabilities {
+            capabilities["infer_fn"] = retrieve_fn
+        }
+
+        plan = self._executor.execute_plan(plan, capabilities)
+
+        let coherence = self._coherence.check_coherence(plan.steps)
+        if coherence["coherent"] == false {
+            logger.info("Plan " + plan.plan_id + " has " + string(coherence["contradictions"].len()) + " contradictions")
+        }
+
+        plan.synthesis = self._synthesizer.synthesize(plan)
+
+        if plan.plan_id in self._active_plans {
+            self._active_plans.remove(plan.plan_id)
+        }
+        self._completed_plans.append(plan)
+        if self._completed_plans.len() > self._max_history {
+            self._completed_plans = self._completed_plans[-self._max_history:]
+        }
+
+        return plan
+    }
+
+    fn explain_plan(self, plan: HTNPlan) -> string {
+        if plan.goal == None { return "Empty plan." }
+
+        let lines: List[string] = [
+            "Plan to " + goal_type_value(plan.goal.goal_type) + ": " + plan.goal.description,
+            "Strategy: " + plan.decomposition_type,
+            "Steps (" + string(plan.steps.len()) + "):"
+        ]
+
+        let i = 1
+        for step in plan.steps {
+            let deps = ""
+            if step.inputs.len() > 0 { deps = " (depends on prior step)" }
+            let status = goal_status_value(step.status)
+            lines.append("  " + string(i) + ". [" + status + "] " + step_action_value(step.action) + ": " + step.description + deps)
+            i += 1
+        }
+
+        lines.append("Estimated confidence: " + string(round(plan.estimated_confidence * 100, 0)) + "%")
+        if plan.actual_confidence > 0 {
+            lines.append("Actual confidence:    " + string(round(plan.actual_confidence * 100, 0)) + "%")
+        }
+        return lines.join("\n")
+    }
+
+    fn synthesize_results(self, plan: HTNPlan) -> string {
+        return self._synthesizer.synthesize(plan)
+    }
+
+    fn check_coherence(self, plan: HTNPlan) -> Dict[string, any] {
+        return self._coherence.check_coherence(plan.steps)
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        let completed = self._completed_plans
+        let succeeded: List[HTNPlan] = []
+        for p in completed {
+            if p.status == GoalStatus.COMPLETED { succeeded.append(p) }
+        }
+        let confidences: List[float] = []
+        for p in succeeded {
+            if p.actual_confidence > 0 { confidences.append(p.actual_confidence) }
+        }
+        let decomp_counts: Dict[string, int] = {}
+        for p in completed {
+            if p.decomposition_type not in decomp_counts { decomp_counts[p.decomposition_type] = 0 }
+            decomp_counts[p.decomposition_type] += 1
+        }
+
+        let mean_conf = 0.0
+        if confidences.len() > 0 {
+            let total = 0.0
+            for c in confidences { total += c }
+            mean_conf = total / confidences.len()
+        }
+
+        let total_steps = 0
+        for p in completed { total_steps += p.steps.len() }
+        let mean_steps = 0.0
+        if completed.len() > 0 { mean_steps = total_steps / completed.len() }
+
+        let success_rate = 0.0
+        if completed.len() > 0 { success_rate = succeeded.len() / completed.len() }
+
+        return {
+            "active_plans": self._active_plans.len(),
+            "completed_plans": completed.len(),
+            "success_rate": success_rate,
+            "mean_confidence": mean_conf,
+            "decomposition_distribution": decomp_counts,
+            "mean_steps_per_plan": mean_steps
+        }
+    }
+}
+
+
+/// ── Helpers ────────────────────────────────────────────────────────────
+
+fn _geometric_mean(values: List[float]) -> float {
+    if values.len() == 0 { return 0.0 }
+    let log_sum = 0.0
+    for v in values {
+        let clamped = v
+        if clamped < 1e-9 { clamped = 1e-9 }
+        log_sum += math.log(clamped)
+    }
+    return math.exp(log_sum / values.len())
+}
+
+
+export GoalType, GoalStatus, StepAction
+export Goal, PlanStep, HTNPlan
+export GoalDecomposer, PlanExecutor, PlanSynthesizer
+export EvidenceCoherenceChecker, Planner

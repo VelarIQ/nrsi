@@ -1,0 +1,75 @@
+/// NRSI Speech Acts — Pragmatic Classification Taxonomy
+///
+/// Classifies user utterances by illocutionary force.
+/// Links speech act types to processing obligations.
+
+module speech_acts
+
+import NRSIData, TrustLevel from "types"
+
+/// ---------- Speech Act Taxonomy ----------
+
+enum SpeechActType {
+    ASSERTIVE,
+    DIRECTIVE,
+    COMMISSIVE,
+    EXPRESSIVE,
+    DECLARATIVE,
+    INTERROGATIVE,
+    PHATIC
+}
+
+enum QueryIntent {
+    DEFINE,
+    EXPLAIN_MECHANISM,
+    EXPLAIN_CAUSE,
+    COMPARE,
+    LIST,
+    SUGGEST,
+    EVALUATE,
+    CODE,
+    CREATIVE,
+    CONVERSATIONAL
+}
+
+/// ---------- Speech Act Norms ----------
+
+norm assertive_requires_evidence {
+    type: obligation,
+    scope: speech_act("ASSERTIVE"),
+    action: "attach_evidence",
+    priority: 85,
+    condition: trust >= TrustLevel.VALIDATED
+}
+
+norm directive_requires_capability {
+    type: obligation,
+    scope: speech_act("DIRECTIVE"),
+    action: "check_capability",
+    priority: 90,
+    condition: true
+}
+
+norm interrogative_requires_answer {
+    type: obligation,
+    scope: speech_act("INTERROGATIVE"),
+    action: "provide_answer",
+    priority: 80,
+    condition: true
+}
+
+norm phatic_keep_brief {
+    type: obligation,
+    scope: speech_act("PHATIC"),
+    action: "brief_response",
+    priority: 70,
+    condition: true
+}
+
+/// ---------- Intent Classification Gate ----------
+
+gate intent_classify(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain != "unknown"
+    validate speech_act_assigned
+    validate intent_assigned
+}

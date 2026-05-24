@@ -1,0 +1,200 @@
+/// NRSIP IPv6 Neuron Addressing — 2620:be1a::/32 allocation.
+///
+/// Full implementation of `nrsip/ipv6_addressing.py`.
+/// Patent-covered: IPv6 neuron addressing, provider/region/crease/neuron encoding.
+///
+/// Address format:
+///   2620:be1a:PPPP:RRRR:CCCC:CCCC:NNNN:NNNN
+///   - 2620:be1a       = VelarIQ allocation (/32)
+///   - PPPP            = Provider ID (16 bits)
+///   - RRRR            = Region ID (16 bits)
+///   - CCCC:CCCC       = Crease/domain ID (32 bits)
+///   - NNNN:NNNN       = Neuron ID (32 bits)
+
+module ipv6_addressing
+
+import pow from "math"
+
+/// ---------- Constants ----------
+
+let PREFIX_NETWORK = "2620:be1a::/32"
+let VELA_PREFIX_HIGH = 639631386
+
+/// ---------- Enumerations ----------
+
+enum NRSIPRegion {
+    ME_GULF = 1,
+    NA_EAST = 2,
+    APAC = 3,
+    EU_WEST = 4,
+    NA_WEST = 5,
+    LATAM = 6,
+    AFRICA = 7
+}
+
+let REGION_NAMES = {
+    1: "me-gulf",
+    2: "na-east",
+    3: "apac",
+    4: "eu-west",
+    5: "na-west",
+    6: "latam",
+    7: "africa"
+}
+
+let REGION_BY_NAME = {
+    "me-gulf": 1,
+    "na-east": 2,
+    "apac": 3,
+    "eu-west": 4,
+    "na-west": 5,
+    "latam": 6,
+    "africa": 7
+}
+
+/// ---------- NeuronAddress ----------
+
+type NeuronAddress {
+    provider_id: int,
+    region_id: int,
+    crease_id: int,
+    neuron_id: int
+}
+
+fn neuron_address_ipv6(addr: NeuronAddress) -> string {
+    let high = VELA_PREFIX_HIGH * pow(2, 96) + addr.provider_id * pow(2, 80) + addr.region_id * pow(2, 64)
+    let low = addr.crease_id * pow(2, 32) + addr.neuron_id
+    return ipv6_to_string(high + low)
+}
+
+fn neuron_address_region_name(addr: NeuronAddress) -> string {
+    if addr.region_id in REGION_NAMES {
+        return REGION_NAMES[addr.region_id]
+    }
+    return "region-" + hex_format(addr.region_id, 6)
+}
+
+fn neuron_address_prefix_48(addr: NeuronAddress) -> string {
+    return "2620:be1a:" + hex_pad(addr.provider_id, 4) + ":" + hex_pad(addr.region_id, 4) + "::/48"
+}
+
+fn neuron_address_in_allocation(addr: NeuronAddress) -> bool {
+    let ipv6_int = VELA_PREFIX_HIGH * pow(2, 96) + addr.provider_id * pow(2, 80) + addr.region_id * pow(2, 64) + addr.crease_id * pow(2, 32) + addr.neuron_id
+    return (ipv6_int / pow(2, 96)) == VELA_PREFIX_HIGH
+}
+
+/// ---------- Encode / Decode ----------
+
+fn encode_neuron_address(
+    provider_id: int, region_id: int, crease_id: int, neuron_id: int
+) -> NeuronAddress {
+    if provider_id < 0 or provider_id > 65535 {
+        raise ValueError("provider_id must be 16-bit, got " + str(provider_id))
+    }
+    if region_id < 0 or region_id > 65535 {
+        raise ValueError("region_id must be 16-bit, got " + str(region_id))
+    }
+    if crease_id < 0 or crease_id > 4294967295 {
+        raise ValueError("crease_id must be 32-bit, got " + str(crease_id))
+    }
+    if neuron_id < 0 or neuron_id > 4294967295 {
+        raise ValueError("neuron_id must be 32-bit, got " + str(neuron_id))
+    }
+    return NeuronAddress {
+        provider_id: provider_id,
+        region_id: region_id,
+        crease_id: crease_id,
+        neuron_id: neuron_id
+    }
+}
+
+fn decode_neuron_address(addr_int: int) -> NeuronAddress {
+    let prefix = addr_int / pow(2, 96)
+    if prefix != VELA_PREFIX_HIGH {
+        raise ValueError("Address is not in the NRSIP allocation (expected 2620:be1a::/32)")
+    }
+    let provider_id = (addr_int / pow(2, 80)) % 65536
+    let region_id = (addr_int / pow(2, 64)) % 65536
+    let crease_id = (addr_int / pow(2, 32)) % 4294967296
+    let neuron_id = addr_int % 4294967296
+    return NeuronAddress {
+        provider_id: provider_id,
+        region_id: region_id,
+        crease_id: crease_id,
+        neuron_id: neuron_id
+    }
+}
+
+fn decode_from_string(addr_str: string) -> NeuronAddress {
+    let addr_int = ipv6_from_string(addr_str)
+    return decode_neuron_address(addr_int)
+}
+
+/// ---------- Entity-Level Addressing ----------
+
+type EntityAddress {
+    provider_id: int,
+    region_id: int,
+    entity_id: int
+}
+
+fn entity_address_ipv6(ea: EntityAddress) -> string {
+    let na = encode_neuron_address(ea.provider_id, ea.region_id, 0, ea.entity_id)
+    return neuron_address_ipv6(na)
+}
+
+fn allocate_entity_address(provider_id: int, region_id: int, entity_id: int) -> EntityAddress {
+    return EntityAddress {
+        provider_id: provider_id,
+        region_id: region_id,
+        entity_id: entity_id
+    }
+}
+
+/// ---------- VLTIP Memory Addressing ----------
+
+type VLTIPAddress {
+    layer: int,
+    domain: string,
+    cell_id: int
+}
+
+fn vltip_canonical(va: VLTIPAddress) -> string {
+    return "A:L" + str(va.layer) + ":" + va.domain + ":0x" + hex_pad(va.cell_id, 4)
+}
+
+fn vltip_parse(addr_str: string) -> VLTIPAddress {
+    let parts = split(addr_str, ":")
+    if len(parts) != 4 or parts[0] != "A" {
+        raise ValueError("Invalid VLTIP address: " + addr_str)
+    }
+    let layer = int(slice_string(parts[1], 1, len(parts[1])))
+    let domain = parts[2]
+    let cell_id = hex_to_int(parts[3])
+    return VLTIPAddress {
+        layer: layer,
+        domain: domain,
+        cell_id: cell_id
+    }
+}
+
+/// ---------- Address Space Statistics ----------
+
+fn address_space_stats() -> Dict[string, int] {
+    return {
+        "total_providers": 65536,
+        "total_regions": 65536,
+        "creases_per_region": 4294967296,
+        "neurons_per_crease": 4294967296,
+        "neurons_per_region": 18446744073709551616,
+        "total_addressable": 79228162514264337593543950336
+    }
+}
+
+export NRSIPRegion, REGION_NAMES, REGION_BY_NAME
+export NeuronAddress, neuron_address_ipv6, neuron_address_region_name
+export neuron_address_prefix_48, neuron_address_in_allocation
+export encode_neuron_address, decode_neuron_address, decode_from_string
+export EntityAddress, entity_address_ipv6, allocate_entity_address
+export VLTIPAddress, vltip_canonical, vltip_parse
+export address_space_stats

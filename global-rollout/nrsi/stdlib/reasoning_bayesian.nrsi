@@ -1,0 +1,312 @@
+/// NRS Reasoning — Probabilistic Confidence & Bayesian Updating.
+///
+/// Bayesian-like confidence updating, evidence accumulation, prior/posterior
+/// tracking, and proper uncertainty quantification.
+///
+/// Uses log-odds for numerical stability with multiple updates.
+///
+/// All transformer-free. No external ML dependencies.
+/// Ported from nrsip/reasoning_bayesian.py.
+
+module reasoning_bayesian
+
+import time from "std/time"
+import math from "std/math"
+import CausalGraph, GraphEdge, RelationType from "reasoning_graph"
+
+/// ── Evidence Representation ──
+
+enum EvidenceType {
+    DIRECT_OBSERVATION = "direct_observation",
+    EXPERT_TESTIMONY = "expert_testimony",
+    INFERENCE = "inference",
+    ANALOGY = "analogy",
+    DEFAULT_KNOWLEDGE = "default",
+    CONVERSATIONAL = "conversational",
+    CONTRADICTORY = "contradictory"
+}
+
+let _EVIDENCE_STRENGTH = {
+    "direct_observation": 0.9,
+    "expert_testimony": 0.8,
+    "inference": 0.6,
+    "analogy": 0.4,
+    "default": 0.3,
+    "conversational": 0.5,
+    "contradictory": -0.7
+}
+
+type Evidence {
+    evidence_id: string,
+    evidence_type: string,
+    supports: bool,
+    strength: float,
+    source: string,
+    timestamp: float,
+    description: string
+}
+
+fn make_evidence(evidence_id: string, evidence_type: string,
+                 supports: bool, strength: float, source: string,
+                 description: string) -> Evidence {
+    return Evidence {
+        evidence_id: evidence_id,
+        evidence_type: evidence_type,
+        supports: supports,
+        strength: strength,
+        source: source,
+        timestamp: time.time(),
+        description: description
+    }
+}
+
+/// ── Belief State ──
+
+type BeliefState {
+    proposition_id: string,
+    prior: float,
+    posterior: float,
+    evidence_count: int,
+    supporting_evidence: int,
+    contradicting_evidence: int,
+    evidence_history: List[Evidence],
+    last_updated: float
+}
+
+fn belief_uncertainty(b: BeliefState) -> float {
+    if b.evidence_count == 0 {
+        return 1.0
+    }
+    let p = max(min(b.posterior, 0.999), 0.001)
+    let ent = -(p * math.log2(p) + (1.0 - p) * math.log2(1.0 - p))
+    return ent
+}
+
+fn belief_confidence_label(b: BeliefState) -> string {
+    let p = b.posterior
+    if p >= 0.9 { return "established" }
+    if p >= 0.7 { return "likely" }
+    if p >= 0.5 { return "tentative" }
+    if p >= 0.3 { return "uncertain" }
+    return "unlikely"
+}
+
+/// ── Bayesian Updater ──
+
+class BayesianUpdater {
+    fn init(self, default_prior: float = 0.5) {
+        self._beliefs = {}
+        self._default_prior = default_prior
+    }
+
+    fn get_belief(self, prop_id: string) -> BeliefState {
+        let b = self._beliefs.get(prop_id, nil)
+        if b == nil {
+            b = BeliefState {
+                proposition_id: prop_id,
+                prior: self._default_prior,
+                posterior: self._default_prior,
+                evidence_count: 0,
+                supporting_evidence: 0,
+                contradicting_evidence: 0,
+                evidence_history: [],
+                last_updated: time.time()
+            }
+            self._beliefs[prop_id] = b
+        }
+        return b
+    }
+
+    fn update(self, prop_id: string, evidence: Evidence) -> BeliefState {
+        let belief = self.get_belief(prop_id)
+        let log_odds = self._to_log_odds(belief.posterior)
+
+        let base_strength = _EVIDENCE_STRENGTH.get(evidence.evidence_type, 0.5)
+        let weight = base_strength * evidence.strength
+
+        if !evidence.supports {
+            weight = -weight
+        }
+
+        let recency_bonus = 1.0
+        if belief.evidence_count > 0 {
+            let hours_since_last = (time.time() - belief.last_updated) / 3600.0
+            recency_bonus = min(1.0 + hours_since_last * 0.1, 1.5)
+        }
+
+        log_odds += weight * recency_bonus
+        log_odds = max(min(log_odds, 6.0), -6.0)
+
+        belief.posterior = self._from_log_odds(log_odds)
+        belief.evidence_count += 1
+        belief.evidence_history.append(evidence)
+        belief.last_updated = time.time()
+
+        if evidence.supports {
+            belief.supporting_evidence += 1
+        } else {
+            belief.contradicting_evidence += 1
+        }
+        return belief
+    }
+
+    fn update_from_multiple(self, prop_id: string,
+                            evidences: List[Evidence]) -> BeliefState {
+        for ev in evidences {
+            self.update(prop_id, ev)
+        }
+        return self.get_belief(prop_id)
+    }
+
+    fn most_uncertain(self, top_k: int) -> List[any] {
+        let beliefs = []
+        for k in self._beliefs.keys() {
+            beliefs.append(self._beliefs[k])
+        }
+        beliefs.sort_by(fn(b: BeliefState) -> float {
+            return -belief_uncertainty(b)
+        })
+        if beliefs.len() <= top_k {
+            return beliefs
+        }
+        return beliefs.slice(0, top_k)
+    }
+
+    fn most_confident(self, top_k: int) -> List[any] {
+        let beliefs = []
+        for k in self._beliefs.keys() {
+            beliefs.append(self._beliefs[k])
+        }
+        beliefs.sort_by(fn(b: BeliefState) -> float {
+            return -b.posterior
+        })
+        if beliefs.len() <= top_k {
+            return beliefs
+        }
+        return beliefs.slice(0, top_k)
+    }
+
+    fn _to_log_odds(self, p: float) -> float {
+        let clamped = max(min(p, 0.999), 0.001)
+        return math.log(clamped / (1.0 - clamped))
+    }
+
+    fn _from_log_odds(self, lo: float) -> float {
+        return 1.0 / (1.0 + math.exp(-lo))
+    }
+}
+
+/// ── Graph Confidence Manager ──
+
+class GraphConfidenceManager {
+    fn init(self, graph: CausalGraph) {
+        self._graph = graph
+        self._updater = BayesianUpdater()
+        self._updater.init(0.5)
+        self._synced = false
+    }
+
+    fn sync_from_graph(self) -> int {
+        let count = 0
+        let edges = self._graph.all_edges()
+        for edge in edges {
+            let belief = self._updater.get_belief(edge.edge_id)
+            belief.prior = edge.confidence
+            belief.posterior = edge.confidence
+            count += 1
+        }
+        self._synced = true
+        return count
+    }
+
+    fn add_evidence_for_edge(self, edge_id: string, evidence: Evidence,
+                             sync_back: bool) -> BeliefState {
+        let belief = self._updater.update(edge_id, evidence)
+        if sync_back {
+            self._sync_edge(edge_id, belief.posterior)
+        }
+        return belief
+    }
+
+    fn add_evidence_for_relation(self, source: string, target: string,
+                                 relation: RelationType, evidence: Evidence,
+                                 sync_back: bool) -> Optional[BeliefState] {
+        let edge = self._graph.get_edge(source, relation, target)
+        if edge == nil { return nil }
+        return self.add_evidence_for_edge(edge.edge_id, evidence, sync_back)
+    }
+
+    fn recalculate_derived(self) -> int {
+        let updated = 0
+        let edges = self._graph.all_edges()
+        for edge in edges {
+            if !edge.derived { continue }
+            if edge.provenance == nil { continue }
+            if edge.provenance.len() == 0 { continue }
+
+            let parent_confidences = []
+            for parent_eid in edge.provenance {
+                let parent = self._graph.get_edge_by_id(parent_eid)
+                if parent != nil {
+                    parent_confidences.append(parent.confidence)
+                }
+            }
+
+            if parent_confidences.len() > 0 {
+                let new_conf = 1.0
+                for c in parent_confidences {
+                    new_conf = new_conf * c
+                }
+                new_conf = new_conf * 0.9
+                edge.confidence = new_conf
+                updated += 1
+            }
+        }
+        return updated
+    }
+
+    fn get_belief(self, edge_id: string) -> BeliefState {
+        return self._updater.get_belief(edge_id)
+    }
+
+    fn uncertainty_report(self) -> any {
+        let most_uncertain = self._updater.most_uncertain(5)
+        let most_confident = self._updater.most_confident(5)
+
+        let uncertain_list = []
+        for b in most_uncertain {
+            uncertain_list.append({
+                "id": b.proposition_id,
+                "posterior": b.posterior,
+                "uncertainty": belief_uncertainty(b),
+                "evidence_count": b.evidence_count
+            })
+        }
+
+        let confident_list = []
+        for b in most_confident {
+            confident_list.append({
+                "id": b.proposition_id,
+                "posterior": b.posterior,
+                "label": belief_confidence_label(b)
+            })
+        }
+
+        return {
+            "total_beliefs": self._updater._beliefs.len(),
+            "most_uncertain": uncertain_list,
+            "most_confident": confident_list
+        }
+    }
+
+    fn _sync_edge(self, edge_id: string, new_confidence: float) {
+        let edge = self._graph.get_edge_by_id(edge_id)
+        if edge != nil {
+            edge.confidence = new_confidence
+        }
+    }
+}
+
+export EvidenceType, Evidence, make_evidence
+export BeliefState, belief_uncertainty, belief_confidence_label
+export BayesianUpdater, GraphConfidenceManager

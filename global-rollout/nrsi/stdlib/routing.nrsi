@@ -1,0 +1,74 @@
+/// NRSI Routing Policy — Tier Classification and Routing Thresholds
+///
+/// Declarative tier breakpoints, complexity thresholds, and
+/// routing norms for the T0 Router.
+
+module routing
+
+import NRSIData, TrustLevel from "types"
+
+/// ---------- Tier Thresholds ----------
+
+type TierThreshold {
+    tier: String,
+    complexity_min: Float,
+    complexity_max: Float,
+    max_lobes: Int,
+    cache_eligible: Bool
+}
+
+/// ---------- Routing Norms ----------
+
+norm cache_before_compute {
+    type: obligation,
+    scope: global,
+    action: "check_pvs_cache",
+    priority: 100,
+    condition: true
+}
+
+norm route_t1_fast {
+    type: obligation,
+    scope: tier("T1"),
+    action: "single_lobe_only",
+    priority: 90,
+    condition: complexity <= 25
+}
+
+norm route_t2_standard {
+    type: obligation,
+    scope: tier("T2"),
+    action: "two_lobes_max",
+    priority: 85,
+    condition: complexity > 25 and complexity <= 50
+}
+
+norm route_t3_complex {
+    type: obligation,
+    scope: tier("T3"),
+    action: "multi_lobe_parallel",
+    priority: 80,
+    condition: complexity > 50 and complexity <= 75
+}
+
+norm route_t4_expert {
+    type: obligation,
+    scope: tier("T4"),
+    action: "all_lobes_cross_domain",
+    priority: 75,
+    condition: complexity > 75
+}
+
+/// ---------- Routing Gates ----------
+
+gate tier_classification(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain != "unknown"
+    validate complexity_scored
+    validate tier_assigned
+}
+
+gate cache_validation(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.60
+    validate hash_match
+    validate not_stale
+}

@@ -1,0 +1,644 @@
+/// NRS Analogy Engine — Cross-Domain Structure Mapping.
+///
+/// Implements Gentner's Structure-Mapping Theory for analogical reasoning.
+/// 32 pre-built domain pairs, fuzzy concept lookup, inference transfer.
+
+module analogy_engine
+
+import re from "std/regex"
+import logging from "std/logging"
+
+let logger = logging.getLogger("nrs.analogy")
+
+/// ── Data Structures ────────────────────────────────────────────────────
+
+type Concept {
+    name: string,
+    domain: string,
+    attributes: Dict[string, any]
+}
+
+type Relation {
+    predicate: string,
+    arguments: List[string],
+    is_higher_order: bool,
+    weight: float
+}
+
+type StructureMapping {
+    source_domain: string,
+    target_domain: string,
+    concept_mappings: Dict[string, string],
+    relation_mappings: List[List[string]],
+    structural_score: float,
+    surface_score: float,
+    systematicity_score: float,
+    overall_score: float
+}
+
+type AnalogyResult {
+    source: string,
+    target: string,
+    mapping: Optional[StructureMapping],
+    explanation: string,
+    inferences: List[string],
+    confidence: float
+}
+
+/// ── Stem-based fuzzy matching ──────────────────────────────────────────
+
+let SUFFIX_RE = re.compile("(tion|sion|ment|ness|ity|ing|ous|ive|ful|less|able|ible|ence|ance|er|or|ed|ly|es|s)$")
+
+fn _stem(word: string) -> string {
+    let w = word.lower().replace("_", "").replace("-", "")
+    if w.len() > 5 {
+        w = SUFFIX_RE.sub("", w)
+    }
+    return w
+}
+
+fn _fuzzy_match(query: string, candidates: List[string], threshold: float) -> Optional[string] {
+    let q_stem = _stem(query)
+    let best: Optional[string] = None
+    let best_score = threshold
+    for c in candidates {
+        let c_stem = _stem(c)
+        if q_stem == c_stem { return c }
+        if q_stem in c_stem || c_stem in q_stem {
+            let min_len = q_stem.len()
+            if c_stem.len() < min_len { min_len = c_stem.len() }
+            let max_len = q_stem.len()
+            if c_stem.len() > max_len { max_len = c_stem.len() }
+            if max_len == 0 { max_len = 1 }
+            let overlap = min_len / max_len
+            if overlap > best_score {
+                best = c
+                best_score = overlap
+            }
+        }
+    }
+    return best
+}
+
+/// ── Concept Store ──────────────────────────────────────────────────────
+
+class ConceptStore {
+    fn new() -> ConceptStore {
+        let cs = ConceptStore {}
+        cs.concepts = {}
+        cs.relations = {}
+        cs.domain_pairs = []
+        cs._load_builtin_domains()
+        return cs
+    }
+
+    fn domains(self) -> List[any] { return self.concepts.keys() }
+    fn get_concepts(self, domain: string) -> List[any] { return self.concepts.get(domain, []) }
+    fn get_relations(self, domain: string) -> List[any] { return self.relations.get(domain, []) }
+
+    fn paired_domain(self, domain: string) -> Optional[string] {
+        for pair in self.domain_pairs {
+            if pair[0] == domain { return pair[1] }
+            if pair[1] == domain { return pair[0] }
+        }
+        return None
+    }
+
+    fn resolve_domain(self, name: string) -> Optional[string] {
+        return _fuzzy_match(name, self.domains(), 0.5)
+    }
+
+    fn add_domain(self, domain: string, concepts: List[Concept], relations: List[Relation]) -> void {
+        self.concepts[domain] = concepts
+        self.relations[domain] = relations
+    }
+
+    fn add_pair(self, domain_a: string, domain_b: string) -> void {
+        for pair in self.domain_pairs {
+            if (pair[0] == domain_a && pair[1] == domain_b) || (pair[0] == domain_b && pair[1] == domain_a) {
+                return
+            }
+        }
+        self.domain_pairs.append([domain_a, domain_b])
+    }
+
+    fn _add(self, domain: string, concept_data: List[List[any]], relation_data: List[List[any]]) -> void {
+        let concepts: List[Concept] = []
+        for cd in concept_data {
+            concepts.append(Concept { name: cd[0], domain: domain, attributes: cd[1] })
+        }
+        self.concepts[domain] = concepts
+        let relations: List[Relation] = []
+        for rd in relation_data {
+            relations.append(Relation { predicate: rd[0], arguments: rd[1], is_higher_order: rd[2], weight: 1.0 })
+        }
+        self.relations[domain] = relations
+    }
+
+    fn _load_builtin_domains(self) -> void {
+        self._add("heart_circulatory", [["heart", {"type": "organ", "function": "pump blood"}], ["blood", {"type": "fluid", "carries": "oxygen"}], ["blood_vessels", {"type": "conduit", "material": "tissue"}]], [["powers", ["heart", "blood_flow"], false], ["flows_through", ["blood", "blood_vessels"], false], ["delivers", ["blood", "oxygen"], false]])
+        self._add("pump_plumbing", [["pump", {"type": "machine", "function": "move water"}], ["water", {"type": "fluid", "carries": "minerals"}], ["pipes", {"type": "conduit", "material": "metal"}]], [["powers", ["pump", "water_flow"], false], ["flows_through", ["water", "pipes"], false], ["delivers", ["water", "minerals"], false]])
+        self.domain_pairs.append(["heart_circulatory", "pump_plumbing"])
+
+        self._add("brain_nervous", [["brain", {"type": "organ", "function": "process thoughts"}], ["neurons", {"type": "cell", "count": "86 billion"}], ["synapses", {"type": "junction", "function": "signal transfer"}]], [["processes", ["brain", "thoughts"], false], ["transmit", ["neurons", "signals"], false], ["connect", ["synapses", "neurons"], false]])
+        self._add("computer", [["cpu", {"type": "chip", "function": "process data"}], ["wires", {"type": "conductor", "material": "copper"}], ["bus", {"type": "junction", "function": "data transfer"}]], [["processes", ["cpu", "data"], false], ["transmit", ["wires", "electricity"], false], ["connect", ["bus", "components"], false]])
+        self.domain_pairs.append(["brain_nervous", "computer"])
+
+        self._add("atom", [["nucleus", {"type": "core", "charge": "positive"}], ["electrons", {"type": "particle", "charge": "negative"}], ["electron_cloud", {"type": "region", "probability": "orbital"}]], [["attracts", ["nucleus", "electrons"], false], ["orbit", ["electrons", "nucleus"], false], ["binds", ["nuclear_force", "protons"], true]])
+        self._add("solar_system", [["sun", {"type": "star", "mass": "central"}], ["planets", {"type": "body", "trajectory": "elliptical"}], ["orbital_paths", {"type": "region", "shape": "ellipse"}]], [["attracts", ["sun", "planets"], false], ["orbit", ["planets", "sun"], false], ["binds", ["gravity", "system"], true]])
+        self.domain_pairs.append(["atom", "solar_system"])
+
+        self._add("cell", [["cell_nucleus", {"type": "organelle", "function": "control center"}], ["mitochondria", {"type": "organelle", "function": "energy"}], ["ribosomes", {"type": "organelle", "function": "protein synthesis"}], ["cell_membrane", {"type": "boundary", "function": "selective barrier"}]], [["controls", ["cell_nucleus", "cell_functions"], false], ["provides_energy", ["mitochondria", "cell"], false], ["produces", ["ribosomes", "proteins"], false], ["regulates_entry", ["cell_membrane", "molecules"], false]])
+        self._add("factory", [["management", {"type": "leadership", "function": "decision making"}], ["power_plant", {"type": "facility", "function": "energy"}], ["assembly_line", {"type": "facility", "function": "production"}], ["security_gate", {"type": "boundary", "function": "access control"}]], [["controls", ["management", "operations"], false], ["provides_energy", ["power_plant", "factory"], false], ["produces", ["assembly_line", "products"], false], ["regulates_entry", ["security_gate", "personnel"], false]])
+        self.domain_pairs.append(["cell", "factory"])
+
+        self._add("government", [["president", {"type": "leader", "scope": "national"}], ["congress", {"type": "legislature", "function": "lawmaking"}], ["courts", {"type": "judiciary", "function": "interpretation"}]], [["leads", ["president", "country"], false], ["makes", ["congress", "laws"], false], ["enforces", ["courts", "laws"], false]])
+        self._add("corporation", [["ceo", {"type": "leader", "scope": "company-wide"}], ["board", {"type": "governance", "function": "policy"}], ["legal_dept", {"type": "department", "function": "compliance"}]], [["leads", ["ceo", "company"], false], ["makes", ["board", "policy"], false], ["enforces", ["legal_dept", "policy"], false]])
+        self.domain_pairs.append(["government", "corporation"])
+
+        self._add("immune_system", [["white_blood_cells", {"type": "cell", "function": "defense"}], ["antibodies", {"type": "protein", "function": "targeting"}], ["bone_marrow", {"type": "organ", "function": "cell production"}]], [["fight", ["white_blood_cells", "pathogens"], false], ["target", ["antibodies", "antigens"], false], ["produces", ["bone_marrow", "white_blood_cells"], false]])
+        self._add("military", [["soldiers", {"type": "personnel", "function": "combat"}], ["missiles", {"type": "weapon", "function": "targeting"}], ["training_base", {"type": "facility", "function": "recruitment"}]], [["fight", ["soldiers", "enemies"], false], ["target", ["missiles", "threats"], false], ["produces", ["training_base", "soldiers"], false]])
+        self.domain_pairs.append(["immune_system", "military"])
+
+        self._add("ecosystem", [["organisms", {"type": "living", "role": "participant"}], ["predator", {"type": "consumer", "trophic": "top"}], ["decomposers", {"type": "recycler", "function": "nutrient return"}]], [["compete", ["organisms", "resources"], false], ["consumes", ["predator", "prey"], false], ["recycles", ["decomposers", "dead_matter"], false]])
+        self._add("economy", [["companies", {"type": "entity", "role": "participant"}], ["monopoly", {"type": "entity", "power": "dominant"}], ["bankruptcy_court", {"type": "institution", "function": "asset recovery"}]], [["compete", ["companies", "market_share"], false], ["absorbs", ["monopoly", "competitor"], false], ["recycles", ["bankruptcy_court", "failed_assets"], false]])
+        self.domain_pairs.append(["ecosystem", "economy"])
+
+        self._add("river", [["water", {"type": "fluid", "state": "flowing"}], ["tributaries", {"type": "branch", "direction": "inward"}], ["delta", {"type": "outlet", "pattern": "branching"}]], [["flows_through", ["water", "river_channel"], false], ["feed", ["tributaries", "main_river"], false], ["disperses", ["delta", "water"], false]])
+        self._add("highway", [["traffic", {"type": "flow", "state": "moving"}], ["on_ramps", {"type": "branch", "direction": "inward"}], ["interchange", {"type": "outlet", "pattern": "branching"}]], [["flows_through", ["traffic", "highway_lanes"], false], ["feed", ["on_ramps", "highway"], false], ["disperses", ["interchange", "traffic"], false]])
+        self.domain_pairs.append(["river", "highway"])
+
+        self._add("tree", [["root", {"type": "anchor", "function": "nutrient absorption"}], ["trunk", {"type": "main structure", "function": "support"}], ["branches", {"type": "extension", "function": "reach"}], ["leaves", {"type": "endpoint", "function": "photosynthesis"}]], [["supports", ["root", "tree"], false], ["extend_from", ["branches", "trunk"], false], ["produce", ["leaves", "energy"], false], ["enables", ["root_system", "growth"], true]])
+        self._add("organization", [["founder", {"type": "anchor", "function": "vision"}], ["headquarters", {"type": "main structure", "function": "coordination"}], ["departments", {"type": "extension", "function": "specialization"}], ["employees", {"type": "endpoint", "function": "execution"}]], [["supports", ["founder", "company"], false], ["extend_from", ["departments", "headquarters"], false], ["produce", ["employees", "output"], false], ["enables", ["leadership", "growth"], true]])
+        self.domain_pairs.append(["tree", "organization"])
+
+        self._add("dna", [["genes", {"type": "sequence", "encodes": "traits"}], ["transcription", {"type": "process", "function": "copying"}], ["mutations", {"type": "change", "effect": "variation"}]], [["encode", ["genes", "proteins"], false], ["copies", ["transcription", "dna_sequence"], false], ["alters", ["mutations", "gene_expression"], false]])
+        self._add("blueprint", [["specifications", {"type": "document", "encodes": "design"}], ["printing", {"type": "process", "function": "reproduction"}], ["revisions", {"type": "change", "effect": "modification"}]], [["encode", ["specifications", "components"], false], ["copies", ["printing", "blueprint_original"], false], ["alters", ["revisions", "design_output"], false]])
+        self.domain_pairs.append(["dna", "blueprint"])
+
+        self._add("electrical_circuit", [["battery", {"type": "source", "provides": "voltage"}], ["current", {"type": "flow", "unit": "amperes"}], ["resistor", {"type": "component", "function": "impede flow"}]], [["drives", ["battery", "current"], false], ["flows_through", ["current", "wire"], false], ["impedes", ["resistor", "current"], false]])
+        self._add("water_system", [["reservoir", {"type": "source", "provides": "pressure"}], ["water_flow", {"type": "flow", "unit": "liters_per_sec"}], ["valve", {"type": "component", "function": "restrict flow"}]], [["drives", ["reservoir", "water_flow"], false], ["flows_through", ["water_flow", "pipe"], false], ["impedes", ["valve", "water_flow"], false]])
+        self.domain_pairs.append(["electrical_circuit", "water_system"])
+
+        self._add("memory", [["memories", {"type": "mental record", "storage": "neural"}], ["recall", {"type": "process", "function": "retrieval"}], ["forgetting", {"type": "process", "function": "decay"}]], [["stores", ["brain", "memories"], false], ["retrieves", ["recall", "memories"], false], ["degrades", ["forgetting", "memories"], false]])
+        self._add("library", [["books", {"type": "record", "storage": "shelves"}], ["catalog_search", {"type": "process", "function": "retrieval"}], ["deterioration", {"type": "process", "function": "decay"}]], [["stores", ["library_building", "books"], false], ["retrieves", ["catalog_search", "books"], false], ["degrades", ["deterioration", "books"], false]])
+        self.domain_pairs.append(["memory", "library"])
+
+        self._add("evolution", [["species", {"type": "population", "changes": "over generations"}], ["natural_selection", {"type": "mechanism", "selects": "fittest"}], ["mutation", {"type": "variation", "source": "random"}]], [["selects", ["natural_selection", "fittest_species"], false], ["introduces_variation", ["mutation", "gene_pool"], false], ["adapts", ["species", "environment"], false]])
+        self._add("market_competition", [["products", {"type": "offering", "changes": "over cycles"}], ["consumer_choice", {"type": "mechanism", "selects": "best value"}], ["innovation", {"type": "variation", "source": "r_and_d"}]], [["selects", ["consumer_choice", "best_products"], false], ["introduces_variation", ["innovation", "product_line"], false], ["adapts", ["products", "market_demand"], false]])
+        self.domain_pairs.append(["evolution", "market_competition"])
+
+        self._add("infection", [["pathogen", {"type": "agent", "goal": "replication"}], ["host_cell", {"type": "target", "function": "hijacked"}], ["immune_response", {"type": "defense", "function": "elimination"}]], [["invades", ["pathogen", "host_cell"], false], ["replicates_in", ["pathogen", "host_cell"], false], ["destroys", ["immune_response", "pathogen"], false]])
+        self._add("computer_virus", [["malware", {"type": "agent", "goal": "replication"}], ["host_system", {"type": "target", "function": "compromised"}], ["antivirus", {"type": "defense", "function": "removal"}]], [["invades", ["malware", "host_system"], false], ["replicates_in", ["malware", "host_system"], false], ["destroys", ["antivirus", "malware"], false]])
+        self.domain_pairs.append(["infection", "computer_virus"])
+
+        self._add("photosynthesis", [["chlorophyll", {"type": "molecule", "function": "light capture"}], ["sunlight", {"type": "energy", "source": "solar"}], ["glucose", {"type": "product", "stores": "chemical energy"}]], [["absorbs", ["chlorophyll", "sunlight"], false], ["converts", ["chlorophyll", "light_to_chemical_energy"], false], ["stores", ["glucose", "energy"], false]])
+        self._add("solar_panel", [["photovoltaic_cell", {"type": "device", "function": "light capture"}], ["solar_radiation", {"type": "energy", "source": "solar"}], ["battery_storage", {"type": "product", "stores": "electrical energy"}]], [["absorbs", ["photovoltaic_cell", "solar_radiation"], false], ["converts", ["photovoltaic_cell", "light_to_electrical_energy"], false], ["stores", ["battery_storage", "energy"], false]])
+        self.domain_pairs.append(["photosynthesis", "solar_panel"])
+
+        self._add("digestion", [["stomach", {"type": "organ", "function": "breakdown"}], ["enzymes", {"type": "catalyst", "function": "decomposition"}], ["nutrients", {"type": "output", "destination": "bloodstream"}]], [["breaks_down", ["stomach", "food"], false], ["catalyzes", ["enzymes", "decomposition"], false], ["absorbs", ["intestines", "nutrients"], false]])
+        self._add("recycling", [["shredder", {"type": "machine", "function": "breakdown"}], ["solvents", {"type": "catalyst", "function": "decomposition"}], ["raw_materials", {"type": "output", "destination": "manufacturing"}]], [["breaks_down", ["shredder", "waste"], false], ["catalyzes", ["solvents", "decomposition"], false], ["absorbs", ["processing_plant", "raw_materials"], false]])
+        self.domain_pairs.append(["digestion", "recycling"])
+
+        self._add("seeds", [["seed", {"type": "origin", "contains": "potential"}], ["soil", {"type": "medium", "provides": "nutrients"}], ["plant", {"type": "outcome", "grows": "over time"}]], [["germinates_in", ["seed", "soil"], false], ["nourishes", ["soil", "seed"], false], ["grows_into", ["seed", "plant"], false]])
+        self._add("ideas", [["idea", {"type": "origin", "contains": "potential"}], ["mind", {"type": "medium", "provides": "creativity"}], ["innovation_outcome", {"type": "outcome", "develops": "over time"}]], [["germinates_in", ["idea", "mind"], false], ["nourishes", ["mind", "idea"], false], ["grows_into", ["idea", "innovation_outcome"], false]])
+        self.domain_pairs.append(["seeds", "ideas"])
+
+        self._add("volcano", [["magma", {"type": "substance", "state": "pressurized"}], ["tectonic_pressure", {"type": "force", "builds": "gradually"}], ["eruption", {"type": "event", "release": "catastrophic"}]], [["builds_pressure", ["tectonic_pressure", "magma_chamber"], false], ["contains", ["earth_crust", "magma"], false], ["releases", ["eruption", "magma"], false]])
+        self._add("pressure_cooker", [["steam", {"type": "substance", "state": "pressurized"}], ["heat_source", {"type": "force", "builds": "gradually"}], ["valve_release", {"type": "event", "release": "controlled"}]], [["builds_pressure", ["heat_source", "sealed_chamber"], false], ["contains", ["sealed_lid", "steam"], false], ["releases", ["valve_release", "steam"], false]])
+        self.domain_pairs.append(["volcano", "pressure_cooker"])
+
+        self._add("bone_structure", [["bones", {"type": "structure", "material": "calcium"}], ["joints", {"type": "connector", "allows": "movement"}], ["marrow", {"type": "interior", "produces": "blood cells"}]], [["supports", ["bones", "body"], false], ["connects", ["joints", "bones"], false], ["houses", ["bones", "marrow"], false]])
+        self._add("building_frame", [["steel_beams", {"type": "structure", "material": "steel"}], ["bolted_joints", {"type": "connector", "allows": "flex"}], ["conduits", {"type": "interior", "carries": "utilities"}]], [["supports", ["steel_beams", "building"], false], ["connects", ["bolted_joints", "steel_beams"], false], ["houses", ["steel_beams", "conduits"], false]])
+        self.domain_pairs.append(["bone_structure", "building_frame"])
+
+        self._add("war", [["general", {"type": "leader", "function": "strategy"}], ["troops", {"type": "units", "function": "execute orders"}], ["territory", {"type": "objective", "value": "strategic"}]], [["commands", ["general", "troops"], false], ["captures", ["troops", "territory"], false], ["sacrifices", ["general", "troops_for_advantage"], true]])
+        self._add("chess", [["player", {"type": "leader", "function": "strategy"}], ["pieces", {"type": "units", "function": "execute moves"}], ["squares", {"type": "objective", "value": "positional"}]], [["commands", ["player", "pieces"], false], ["captures", ["pieces", "squares"], false], ["sacrifices", ["player", "pieces_for_advantage"], true]])
+        self.domain_pairs.append(["war", "chess"])
+
+        self._add("trial", [["prosecutor", {"type": "advocate", "position": "accusing"}], ["defense_attorney", {"type": "advocate", "position": "defending"}], ["judge", {"type": "arbiter", "function": "ruling"}]], [["presents_case", ["prosecutor", "evidence"], false], ["counters", ["defense_attorney", "prosecution_claims"], false], ["decides", ["judge", "verdict"], false]])
+        self._add("debate", [["proponent", {"type": "advocate", "position": "for"}], ["opponent", {"type": "advocate", "position": "against"}], ["audience", {"type": "arbiter", "function": "judgment"}]], [["presents_case", ["proponent", "arguments"], false], ["counters", ["opponent", "proponent_claims"], false], ["decides", ["audience", "winner"], false]])
+        self.domain_pairs.append(["trial", "debate"])
+
+        self._add("weather", [["sunshine", {"type": "condition", "valence": "positive"}], ["storm", {"type": "condition", "valence": "negative"}], ["barometric_pressure", {"type": "driver", "function": "determines state"}]], [["produces", ["sunshine", "warmth"], false], ["produces", ["storm", "disruption"], false], ["influences", ["barometric_pressure", "weather_state"], true]])
+        self._add("mood", [["happiness", {"type": "state", "valence": "positive"}], ["anger", {"type": "state", "valence": "negative"}], ["hormones", {"type": "driver", "function": "determines state"}]], [["produces", ["happiness", "contentment"], false], ["produces", ["anger", "conflict"], false], ["influences", ["hormones", "emotional_state"], true]])
+        self.domain_pairs.append(["weather", "mood"])
+
+        self._add("ocean_currents", [["current", {"type": "flow", "driven_by": "temperature differential"}], ["gyre", {"type": "pattern", "shape": "circular"}], ["upwelling", {"type": "event", "brings": "nutrients"}]], [["distributes", ["current", "heat"], false], ["circulates", ["gyre", "water"], false], ["enriches", ["upwelling", "surface_waters"], false]])
+        self._add("trade_routes", [["shipping_lane", {"type": "flow", "driven_by": "economic demand"}], ["trade_network", {"type": "pattern", "shape": "interconnected"}], ["port_city", {"type": "event", "brings": "wealth"}]], [["distributes", ["shipping_lane", "goods"], false], ["circulates", ["trade_network", "commodities"], false], ["enriches", ["port_city", "local_economy"], false]])
+        self.domain_pairs.append(["ocean_currents", "trade_routes"])
+
+        self._add("muscles", [["muscle_fibers", {"type": "actuator", "converts": "chemical to mechanical"}], ["atp", {"type": "fuel", "source": "metabolism"}], ["fatigue", {"type": "limit", "cause": "depletion"}]], [["converts", ["muscle_fibers", "chemical_to_kinetic_energy"], false], ["fuels", ["atp", "muscle_contraction"], false], ["limits", ["fatigue", "muscle_output"], false]])
+        self._add("engines", [["pistons", {"type": "actuator", "converts": "thermal to mechanical"}], ["gasoline", {"type": "fuel", "source": "petroleum"}], ["overheating", {"type": "limit", "cause": "excess heat"}]], [["converts", ["pistons", "thermal_to_kinetic_energy"], false], ["fuels", ["gasoline", "combustion"], false], ["limits", ["overheating", "engine_output"], false]])
+        self.domain_pairs.append(["muscles", "engines"])
+
+        self._add("telescope_scale", [["telescope", {"type": "instrument", "direction": "outward"}], ["galaxy", {"type": "subject", "scale": "astronomical"}], ["light_years", {"type": "measure", "magnitude": "vast"}]], [["reveals", ["telescope", "distant_objects"], false], ["magnifies", ["telescope", "galaxy"], false], ["measures", ["light_years", "cosmic_distance"], false]])
+        self._add("microscope_scale", [["microscope", {"type": "instrument", "direction": "inward"}], ["cell_structure", {"type": "subject", "scale": "microscopic"}], ["nanometers", {"type": "measure", "magnitude": "tiny"}]], [["reveals", ["microscope", "tiny_objects"], false], ["magnifies", ["microscope", "cell_structure"], false], ["measures", ["nanometers", "molecular_distance"], false]])
+        self.domain_pairs.append(["telescope_scale", "microscope_scale"])
+
+        self._add("democracy", [["voters", {"type": "participant", "power": "electoral"}], ["candidates", {"type": "option", "compete_for": "votes"}], ["election", {"type": "mechanism", "selects": "winner"}]], [["choose", ["voters", "candidates"], false], ["compete_for", ["candidates", "votes"], false], ["determines", ["election", "leadership"], false]])
+        self._add("marketplace", [["consumers", {"type": "participant", "power": "purchasing"}], ["products_offered", {"type": "option", "compete_for": "sales"}], ["market_forces", {"type": "mechanism", "selects": "survivors"}]], [["choose", ["consumers", "products_offered"], false], ["compete_for", ["products_offered", "revenue"], false], ["determines", ["market_forces", "winners"], false]])
+        self.domain_pairs.append(["democracy", "marketplace"])
+
+        self._add("neural_network", [["nodes", {"type": "unit", "function": "computation"}], ["connections", {"type": "link", "property": "weighted"}], ["activation", {"type": "signal", "function": "propagation"}]], [["transmit", ["connections", "activation"], false], ["aggregates", ["nodes", "inputs"], false], ["strengthens", ["learning", "connections"], true]])
+        self._add("highway_system", [["intersections", {"type": "unit", "function": "routing"}], ["road_segments", {"type": "link", "property": "capacity-limited"}], ["vehicles", {"type": "signal", "function": "transport"}]], [["transmit", ["road_segments", "vehicles"], false], ["aggregates", ["intersections", "traffic_flows"], false], ["strengthens", ["expansion", "road_segments"], true]])
+        self.domain_pairs.append(["neural_network", "highway_system"])
+
+        self._add("forest_fire", [["fire", {"type": "agent", "behavior": "spreading"}], ["dry_brush", {"type": "fuel", "enables": "propagation"}], ["firebreak", {"type": "barrier", "function": "containment"}]], [["spreads_through", ["fire", "dry_brush"], false], ["consumes", ["fire", "fuel_source"], false], ["blocks", ["firebreak", "fire"], false]])
+        self._add("epidemic", [["disease", {"type": "agent", "behavior": "spreading"}], ["susceptible_population", {"type": "fuel", "enables": "transmission"}], ["quarantine", {"type": "barrier", "function": "containment"}]], [["spreads_through", ["disease", "susceptible_population"], false], ["consumes", ["disease", "host_health"], false], ["blocks", ["quarantine", "disease"], false]])
+        self.domain_pairs.append(["forest_fire", "epidemic"])
+
+        self._add("pregnancy", [["embryo", {"type": "developing entity", "stage": "early"}], ["gestation", {"type": "process", "duration": "9 months"}], ["birth", {"type": "milestone", "marks": "completion"}]], [["develops_during", ["embryo", "gestation"], false], ["nourishes", ["placenta", "embryo"], false], ["culminates_in", ["gestation", "birth"], false]])
+        self._add("project_development", [["prototype", {"type": "developing entity", "stage": "early"}], ["development_cycle", {"type": "process", "duration": "months"}], ["launch", {"type": "milestone", "marks": "completion"}]], [["develops_during", ["prototype", "development_cycle"], false], ["nourishes", ["funding", "prototype"], false], ["culminates_in", ["development_cycle", "launch"], false]])
+        self.domain_pairs.append(["pregnancy", "project_development"])
+
+        self._add("breathing", [["lungs", {"type": "organ", "function": "gas exchange"}], ["inhalation", {"type": "phase", "direction": "inward"}], ["exhalation", {"type": "phase", "direction": "outward"}]], [["draws_in", ["inhalation", "air"], false], ["expels", ["exhalation", "carbon_dioxide"], false], ["rhythmically_alternates", ["inhalation", "exhalation"], true]])
+        self._add("tides", [["ocean_body", {"type": "body", "function": "water cycling"}], ["high_tide", {"type": "phase", "direction": "inward"}], ["low_tide", {"type": "phase", "direction": "outward"}]], [["draws_in", ["high_tide", "water"], false], ["expels", ["low_tide", "water"], false], ["rhythmically_alternates", ["high_tide", "low_tide"], true]])
+        self.domain_pairs.append(["breathing", "tides"])
+
+        self._add("language", [["words", {"type": "unit", "carries": "meaning"}], ["grammar", {"type": "structure", "governs": "arrangement"}], ["sentence", {"type": "composition", "expresses": "thought"}]], [["compose", ["words", "sentence"], false], ["governs", ["grammar", "word_arrangement"], false], ["conveys", ["sentence", "meaning"], false]])
+        self._add("music", [["notes", {"type": "unit", "carries": "tone"}], ["harmony_rules", {"type": "structure", "governs": "arrangement"}], ["melody", {"type": "composition", "expresses": "emotion"}]], [["compose", ["notes", "melody"], false], ["governs", ["harmony_rules", "note_arrangement"], false], ["conveys", ["melody", "emotion"], false]])
+        self.domain_pairs.append(["language", "music"])
+
+        self._add("map", [["map_features", {"type": "representation", "of": "terrain"}], ["scale", {"type": "ratio", "connects": "map to territory"}], ["legend", {"type": "key", "translates": "symbols"}]], [["represents", ["map_features", "territory"], false], ["reduces", ["scale", "complexity"], false], ["interprets", ["legend", "map_features"], false]])
+        self._add("model", [["parameters", {"type": "representation", "of": "system"}], ["abstraction_level", {"type": "ratio", "connects": "model to reality"}], ["documentation", {"type": "key", "translates": "variables"}]], [["represents", ["parameters", "real_system"], false], ["reduces", ["abstraction_level", "complexity"], false], ["interprets", ["documentation", "parameters"], false]])
+        self.domain_pairs.append(["map", "model"])
+
+        logger.debug("ConceptStore loaded " + string(self.concepts.len()) + " domains, " + string(self.domain_pairs.len()) + " pairs")
+    }
+}
+
+/// ── Structure Mapper ───────────────────────────────────────────────────
+
+class StructureMapper {
+    fn new(store: ConceptStore) -> StructureMapper {
+        let sm = StructureMapper {}
+        sm._store = store
+        sm.STRUCTURAL_WEIGHT = 0.5
+        sm.SYSTEMATICITY_WEIGHT = 0.3
+        sm.SURFACE_WEIGHT = 0.2
+        sm.HIGHER_ORDER_BONUS = 2.0
+        return sm
+    }
+
+    fn map_domains(self, source: string, target: string) -> StructureMapping {
+        let src_rels = self._store.get_relations(source)
+        let tgt_rels = self._store.get_relations(target)
+        let src_concepts = self._store.get_concepts(source)
+        let tgt_concepts = self._store.get_concepts(target)
+
+        if src_rels.len() == 0 || tgt_rels.len() == 0 {
+            return StructureMapping { source_domain: source, target_domain: target, concept_mappings: {}, relation_mappings: [], structural_score: 0.0, surface_score: 0.0, systematicity_score: 0.0, overall_score: 0.0 }
+        }
+
+        let concept_mappings: Dict[string, string] = {}
+        let relation_mappings: List[List[string]] = []
+        let matched = 0.0
+        let total_weight = 0.0
+
+        for sr in src_rels {
+            let weight = 1.0
+            if sr.is_higher_order { weight = self.HIGHER_ORDER_BONUS }
+            total_weight += weight
+            for tr in tgt_rels {
+                if sr.predicate == tr.predicate {
+                    relation_mappings.append([sr.predicate + "(" + sr.arguments.join(",") + ")", tr.predicate + "(" + tr.arguments.join(",") + ")"])
+                    matched += weight
+                    let ai = 0
+                    while ai < sr.arguments.len() && ai < tr.arguments.len() {
+                        if sr.arguments[ai] not in concept_mappings {
+                            concept_mappings[sr.arguments[ai]] = tr.arguments[ai]
+                        }
+                        ai += 1
+                    }
+                    break
+                }
+            }
+        }
+
+        let structural = 0.0
+        if total_weight > 0 { structural = matched / total_weight }
+        let systematicity = self._systematicity(src_rels, tgt_rels, concept_mappings)
+        let surface = self._surface_similarity(src_concepts, tgt_concepts, concept_mappings)
+        let overall = self.STRUCTURAL_WEIGHT * structural + self.SYSTEMATICITY_WEIGHT * systematicity + self.SURFACE_WEIGHT * surface
+
+        return StructureMapping { source_domain: source, target_domain: target, concept_mappings: concept_mappings, relation_mappings: relation_mappings, structural_score: round(structural, 4), surface_score: round(surface, 4), systematicity_score: round(systematicity, 4), overall_score: round(overall, 4) }
+    }
+
+    fn _systematicity(self, src_rels: List[Relation], tgt_rels: List[Relation], concept_map: Dict[string, string]) -> float {
+        if concept_map.len() == 0 { return 0.0 }
+        let src_predicates: Set[string] = Set.new()
+        for r in src_rels { src_predicates.add(r.predicate) }
+        let tgt_predicates: Set[string] = Set.new()
+        for r in tgt_rels { tgt_predicates.add(r.predicate) }
+        let shared = src_predicates.intersection(tgt_predicates)
+        if shared.len() == 0 { return 0.0 }
+        let mapped_args: Set[string] = Set.from(concept_map.keys())
+        let connected = 0
+        for r in src_rels {
+            if r.predicate in shared {
+                if mapped_args.intersection(Set.from(r.arguments)).len() > 0 {
+                    connected += 1
+                }
+            }
+        }
+        let max_rels = src_rels.len()
+        if max_rels == 0 { max_rels = 1 }
+        let result = connected / max_rels
+        if result > 1.0 { result = 1.0 }
+        return result
+    }
+
+    fn _surface_similarity(self, src_concepts: List[Concept], tgt_concepts: List[Concept], concept_map: Dict[string, string]) -> float {
+        if concept_map.len() == 0 || src_concepts.len() == 0 || tgt_concepts.len() == 0 { return 0.0 }
+        let src_by_name: Dict[string, Concept] = {}
+        for c in src_concepts { src_by_name[c.name] = c }
+        let tgt_by_name: Dict[string, Concept] = {}
+        for c in tgt_concepts { tgt_by_name[c.name] = c }
+        let total = 0
+        let shared = 0.0
+        for sc_name, tc_name in concept_map.items() {
+            let sc = src_by_name.get(sc_name, None)
+            let tc = tgt_by_name.get(tc_name, None)
+            if sc == None || tc == None { continue }
+            let all_keys = Set.from(sc.attributes.keys()).union(Set.from(tc.attributes.keys()))
+            if all_keys.len() == 0 { continue }
+            total += all_keys.len()
+            for k in all_keys {
+                if k in sc.attributes && k in tc.attributes {
+                    if sc.attributes[k] == tc.attributes[k] {
+                        shared += 1
+                    } else {
+                        shared += 0.25
+                    }
+                }
+            }
+        }
+        if total == 0 { return 0.0 }
+        return shared / total
+    }
+}
+
+/// ── NL generation helpers ──────────────────────────────────────────────
+
+let NICE_NAME_RE = re.compile("[_\\-]+")
+
+fn _nice(name: string) -> string { return NICE_NAME_RE.sub(" ", name) }
+fn _a_or_an(word: string) -> string {
+    if word[0].lower() in "aeiou" { return "an" }
+    return "a"
+}
+
+fn _build_explanation(mapping: StructureMapping, store: ConceptStore) -> string {
+    let src = _nice(mapping.source_domain)
+    let tgt = _nice(mapping.target_domain)
+    let src_rels = store.get_relations(mapping.source_domain)
+    let tgt_rels = store.get_relations(mapping.target_domain)
+    let src_by_pred: Dict[string, Relation] = {}
+    for r in src_rels { src_by_pred[r.predicate] = r }
+    let tgt_by_pred: Dict[string, Relation] = {}
+    for r in tgt_rels { tgt_by_pred[r.predicate] = r }
+    let shared_preds: List[string] = []
+    for p in src_by_pred.keys() {
+        if p in tgt_by_pred { shared_preds.append(p) }
+    }
+    if shared_preds.len() == 0 {
+        return src.title() + " shares structural similarity with " + tgt + "."
+    }
+    let clauses: List[string] = []
+    let count = 0
+    for pred in shared_preds {
+        if count >= 3 { break }
+        let sr = src_by_pred[pred]
+        let tr = tgt_by_pred[pred]
+        let src_subj = src
+        if sr.arguments.len() > 0 { src_subj = _nice(sr.arguments[0]) }
+        let src_obj = ""
+        if sr.arguments.len() > 1 { src_obj = _nice(sr.arguments[1]) }
+        let tgt_subj = tgt
+        if tr.arguments.len() > 0 { tgt_subj = _nice(tr.arguments[0]) }
+        let tgt_obj = ""
+        if tr.arguments.len() > 1 { tgt_obj = _nice(tr.arguments[1]) }
+        let verb = _nice(pred)
+        if src_obj != "" && tgt_obj != "" {
+            clauses.append("just as " + src_subj + " " + verb + " " + src_obj + ", " + tgt_subj + " " + verb + " " + tgt_obj)
+        } else {
+            clauses.append(src_subj + " " + verb + " in the same way " + tgt_subj + " " + verb)
+        }
+        count += 1
+    }
+    return src.title() + " is like " + tgt + " — " + clauses.join("; and ") + "."
+}
+
+fn _build_inferences(mapping: StructureMapping, store: ConceptStore) -> List[any] {
+    let inferences: List[string] = []
+    let src_rels = store.get_relations(mapping.source_domain)
+    let tgt_rels = store.get_relations(mapping.target_domain)
+    let tgt_preds: Set[string] = Set.new()
+    for r in tgt_rels { tgt_preds.add(r.predicate) }
+    for sr in src_rels {
+        if sr.predicate not in tgt_preds {
+            let mapped_args: List[string] = []
+            for a in sr.arguments {
+                mapped_args.append(mapping.concept_mappings.get(a, _nice(a)))
+            }
+            inferences.append("If " + _nice(mapping.source_domain) + " exhibits '" + _nice(sr.predicate) + "' between " + _nice(sr.arguments[0]) + " and " + _nice(sr.arguments[sr.arguments.len() - 1]) + ", then " + _nice(mapping.target_domain) + " may exhibit an analogous '" + _nice(sr.predicate) + "' between " + _nice(mapped_args[0]) + " and " + _nice(mapped_args[mapped_args.len() - 1]) + ".")
+        }
+    }
+    if inferences.len() == 0 {
+        let count = 0
+        for sc, tc in mapping.concept_mappings.items() {
+            if count >= 2 { break }
+            inferences.append("Properties of " + _nice(sc) + " in " + _nice(mapping.source_domain) + " likely have counterparts for " + _nice(tc) + " in " + _nice(mapping.target_domain) + ".")
+            count += 1
+        }
+    }
+    return inferences
+}
+
+/// ── Analogy Engine ─────────────────────────────────────────────────────
+
+class AnalogyEngine {
+    fn new(store: Optional[ConceptStore]) -> AnalogyEngine {
+        let ae = AnalogyEngine {}
+        if store != None { ae._store = store } else { ae._store = ConceptStore.new() }
+        ae._mapper = StructureMapper.new(ae._store)
+        ae._cache = {}
+        return ae
+    }
+
+    fn find_analogy(self, concept: string, target_domain: string) -> AnalogyResult {
+        let source_domain = self._domain_of(concept)
+        if source_domain == None {
+            return AnalogyResult { source: concept, target: target_domain, mapping: None, explanation: "No domain found containing '" + concept + "'.", inferences: [], confidence: 0.0 }
+        }
+        if target_domain != "" {
+            let resolved = self._store.resolve_domain(target_domain)
+            if resolved == None { resolved = target_domain }
+            return self._build_result(source_domain, resolved)
+        }
+        let best: Optional[AnalogyResult] = None
+        for domain in self._store.domains() {
+            if domain == source_domain { continue }
+            let result = self._build_result(source_domain, domain)
+            if best == None || result.confidence > best.confidence {
+                best = result
+            }
+        }
+        if best != None { return best }
+        return AnalogyResult { source: concept, target: "none", mapping: None, explanation: "No suitable analogy found.", inferences: [], confidence: 0.0 }
+    }
+
+    fn explain_by_analogy(self, concept: string, familiar_domain: string) -> string {
+        let source_domain = self._domain_of(concept)
+        let target = self._store.resolve_domain(familiar_domain)
+        if target == None { target = familiar_domain }
+        if source_domain == None { return "Unable to locate '" + concept + "' in the knowledge base." }
+        let mapping = self._get_mapping(source_domain, target)
+        let src_rels = self._store.get_relations(source_domain)
+        let tgt_rels = self._store.get_relations(target)
+        let src_by_pred: Dict[string, Relation] = {}
+        for r in src_rels { src_by_pred[r.predicate] = r }
+        let tgt_by_pred: Dict[string, Relation] = {}
+        for r in tgt_rels { tgt_by_pred[r.predicate] = r }
+        let shared: List[string] = []
+        for p in src_by_pred.keys() {
+            if p in tgt_by_pred { shared.append(p) }
+        }
+        let src_nice = _nice(source_domain)
+        let tgt_nice = _nice(target)
+        if shared.len() == 0 {
+            return "Think of " + src_nice + " as " + _a_or_an(tgt_nice) + " " + tgt_nice + ": both share a similar underlying structure."
+        }
+        let clauses: List[string] = []
+        let count = 0
+        for pred in shared {
+            if count >= 3 { break }
+            let sr = src_by_pred[pred]
+            let tr = tgt_by_pred[pred]
+            let verb = _nice(pred)
+            if sr.arguments.len() >= 2 && tr.arguments.len() >= 2 {
+                clauses.append(_nice(sr.arguments[0]) + " " + verb + " " + _nice(sr.arguments[1]) + " in " + src_nice + ", much like " + _nice(tr.arguments[0]) + " " + verb + " " + _nice(tr.arguments[1]) + " in " + tgt_nice)
+            } else {
+                let s_args: List[string] = []
+                for a in sr.arguments { s_args.append(_nice(a)) }
+                let t_args: List[string] = []
+                for a in tr.arguments { t_args.append(_nice(a)) }
+                clauses.append(s_args.join(" and ") + " " + verb + " in " + src_nice + ", much like " + t_args.join(" and ") + " " + verb + " in " + tgt_nice)
+            }
+            count += 1
+        }
+        return "Think of " + src_nice + " as " + _a_or_an(tgt_nice) + " " + tgt_nice + ": " + clauses.join("; ") + "."
+    }
+
+    fn transfer_inference(self, source: string, source_property: string, target: string) -> string {
+        let src_domain = self._domain_of(source)
+        let tgt_domain = self._domain_of(target)
+        if src_domain == None || tgt_domain == None {
+            let missing = source
+            if src_domain != None { missing = target }
+            return "Cannot resolve '" + missing + "' to a known domain."
+        }
+        let mapping = self._get_mapping(src_domain, tgt_domain)
+        let mapped_target = mapping.concept_mappings.get(source, _nice(target))
+        let prop_stem = _stem(source_property)
+        let tgt_rels = self._store.get_relations(tgt_domain)
+        for tr in tgt_rels {
+            if _stem(tr.predicate) == prop_stem {
+                let t_args: List[string] = []
+                for a in tr.arguments { t_args.append(_nice(a)) }
+                return "Since " + _nice(source) + " exhibits '" + _nice(source_property) + "' in " + _nice(src_domain) + ", the analogous property in " + _nice(tgt_domain) + " is '" + _nice(tr.predicate) + "' involving " + t_args.join(" and ") + "."
+            }
+        }
+        let src_rels = self._store.get_relations(src_domain)
+        for sr in src_rels {
+            if _stem(sr.predicate) == prop_stem {
+                let mapped_args: List[string] = []
+                for a in sr.arguments { mapped_args.append(_nice(mapping.concept_mappings.get(a, a))) }
+                return "Since " + _nice(source) + " exhibits '" + _nice(source_property) + "' in " + _nice(src_domain) + ", we infer that " + _nice(mapped_target) + " may exhibit an analogous relationship involving " + mapped_args.join(" and ") + " in " + _nice(tgt_domain) + "."
+            }
+        }
+        return "Since " + _nice(source) + " has the property '" + _nice(source_property) + "' in " + _nice(src_domain) + ", " + _nice(mapped_target) + " likely has a corresponding property in " + _nice(tgt_domain) + " — but the specific form could not be determined from the current knowledge base."
+    }
+
+    fn generate_analogy(self, concept_a: string, concept_b: string) -> AnalogyResult {
+        let domain_a = self._domain_of(concept_a)
+        let domain_b = self._domain_of(concept_b)
+        if domain_a == None && domain_b == None {
+            return AnalogyResult { source: concept_a, target: concept_b, mapping: None, explanation: "Neither '" + concept_a + "' nor '" + concept_b + "' could be resolved to a known domain.", inferences: [], confidence: 0.0 }
+        }
+        if domain_a == None {
+            return AnalogyResult { source: concept_a, target: concept_b, mapping: None, explanation: "Could not resolve '" + concept_a + "' to a known domain.", inferences: [], confidence: 0.0 }
+        }
+        if domain_b == None {
+            return AnalogyResult { source: concept_a, target: concept_b, mapping: None, explanation: "Could not resolve '" + concept_b + "' to a known domain.", inferences: [], confidence: 0.0 }
+        }
+        if domain_a == domain_b {
+            return AnalogyResult { source: concept_a, target: concept_b, mapping: None, explanation: "Both '" + concept_a + "' and '" + concept_b + "' belong to the same domain (" + _nice(domain_a) + "); no cross-domain analogy needed.", inferences: [], confidence: 1.0 }
+        }
+        return self._build_result(domain_a, domain_b)
+    }
+
+    fn rate_analogy(self, source: string, target: string) -> float {
+        let src_domain = self._store.resolve_domain(source)
+        if src_domain == None { src_domain = self._domain_of(source) }
+        let tgt_domain = self._store.resolve_domain(target)
+        if tgt_domain == None { tgt_domain = self._domain_of(target) }
+        if src_domain == None || tgt_domain == None { return 0.0 }
+        if src_domain == tgt_domain { return 1.0 }
+        let mapping = self._get_mapping(src_domain, tgt_domain)
+        return mapping.overall_score
+    }
+
+    fn ingest_domain(self, domain: string, concepts: List[Concept], relations: List[Relation]) -> void {
+        self._store.add_domain(domain, concepts, relations)
+        logger.info("Ingested domain '" + domain + "' with " + string(concepts.len()) + " concepts, " + string(relations.len()) + " relations")
+    }
+
+    fn _domain_of(self, concept: string) -> Optional[string] {
+        let concept_lower = concept.lower().replace(" ", "_")
+        for domain, concepts in self._store.concepts.items() {
+            for c in concepts {
+                if c.name == concept_lower || c.name == concept { return domain }
+            }
+        }
+        for domain, relations in self._store.relations.items() {
+            for r in relations {
+                for arg in r.arguments {
+                    if arg == concept_lower || arg == concept { return domain }
+                }
+            }
+        }
+        for domain, concepts in self._store.concepts.items() {
+            let names: List[string] = []
+            for c in concepts { names.append(c.name) }
+            let match = _fuzzy_match(concept, names, 0.5)
+            if match != None { return domain }
+        }
+        for domain, relations in self._store.relations.items() {
+            let all_args: List[string] = []
+            for r in relations { all_args.extend(r.arguments) }
+            let match = _fuzzy_match(concept, all_args, 0.5)
+            if match != None { return domain }
+        }
+        return self._store.resolve_domain(concept)
+    }
+
+    fn _get_mapping(self, source: string, target: string) -> StructureMapping {
+        let key = source + "::" + target
+        if key not in self._cache {
+            self._cache[key] = self._mapper.map_domains(source, target)
+        }
+        return self._cache[key]
+    }
+
+    fn _build_result(self, source: string, target: string) -> AnalogyResult {
+        let mapping = self._get_mapping(source, target)
+        let explanation = _build_explanation(mapping, self._store)
+        let inferences = _build_inferences(mapping, self._store)
+        return AnalogyResult { source: source, target: target, mapping: mapping, explanation: explanation, inferences: inferences, confidence: mapping.overall_score }
+    }
+}
+
+export Concept, Relation, StructureMapping, AnalogyResult
+export ConceptStore, StructureMapper, AnalogyEngine

@@ -1,0 +1,105 @@
+/// NRSI Standard Gates — Validation Pipelines for Trust Elevation
+///
+/// Gates are the ONLY way to elevate trust levels.
+/// Each gate declares what it requires and what validation it performs.
+
+module gates
+
+import TrustLevel, NRSIData, EpistemicType from "types"
+
+/// ---------- Factual Verification Gate ----------
+/// Elevates raw observations to validated facts
+
+gate factual_verify(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.70
+    require data.domain != "unknown"
+    validate source_check
+    validate consistency_check
+}
+
+/// ---------- Logical Proof Gate ----------
+/// Validates deductive reasoning chains
+
+gate logical_proof(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.epistemic == EpistemicType.DEDUCTIVE
+    require confidence >= 0.90
+    validate proof_completeness
+    validate contradiction_check
+}
+
+/// ---------- Computational Verification Gate ----------
+/// Validates mathematical and computational results
+
+gate computational_verify(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.epistemic == EpistemicType.COMPUTATIONAL
+    require confidence >= 0.95
+    validate deterministic_replay
+    validate precision_check
+}
+
+/// ---------- Causal Validation Gate ----------
+/// Validates causal claims with evidence chains
+
+gate causal_verify(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.epistemic == EpistemicType.CAUSAL
+    require confidence >= 0.75
+    validate chain_completeness
+    validate confound_check
+}
+
+/// ---------- Cross-Source Corroboration Gate ----------
+/// Elevates validated data to trusted through multi-source agreement
+
+gate corroborate(data: validated[NRSIData]) -> trusted[NRSIData] {
+    require confidence >= 0.85
+    validate multi_source_agreement
+    validate temporal_consistency
+    validate domain_expert_review
+}
+
+/// ---------- Certification Gate ----------
+/// Highest trust — requires formal verification evidence
+
+gate certify(data: trusted[NRSIData]) -> certified[NRSIData] {
+    require confidence >= 0.99
+    validate formal_proof
+    validate reproducibility_check
+    validate peer_review
+    validate audit_trail_complete
+}
+
+/// ---------- Medical Safety Gate ----------
+/// Domain-specific gate for medical claims
+
+gate medical_safety(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain == "medical"
+    require confidence >= 0.85
+    validate clinical_evidence_check
+    validate contraindication_check
+    validate dosage_validation
+}
+
+/// ---------- Legal Compliance Gate ----------
+/// Domain-specific gate for legal assertions
+
+gate legal_compliance(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain == "legal"
+    require confidence >= 0.90
+    validate statute_check
+    validate jurisdiction_check
+    validate precedent_check
+}
+
+/// ---------- Financial Accuracy Gate ----------
+
+gate financial_verify(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain == "financial"
+    require confidence >= 0.95
+    validate calculation_audit
+    validate regulatory_check
+    validate market_data_freshness
+}
+
+export factual_verify, logical_proof, computational_verify, causal_verify
+export corroborate, certify
+export medical_safety, legal_compliance, financial_verify

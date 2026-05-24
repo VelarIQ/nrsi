@@ -1,0 +1,558 @@
+/// NRS Reasoning — Enhanced NLP Pipeline.
+///
+/// Noun-phrase chunking, dependency-pattern templates, coreference-lite
+/// resolution, and clause splitting for high triple extraction yield.
+///
+/// Multi-pass pipeline:
+///   1. Sentence splitting (semicolons, conjunctions, relative clauses)
+///   2. Coreference resolution (pronouns → antecedents)
+///   3. Noun-phrase chunking (subject/object spans)
+///   4. Dependency-pattern matching (SVO, passive, copular, relative)
+///   5. Quality filtering (confidence, concept length, dedup)
+///
+/// All transformer-free. No external ML dependencies.
+/// Ported from nrsip/reasoning_nlp.py.
+
+module reasoning_nlp
+
+import re from "std/re"
+import CausalGraph, ExtractedTriple, FactExtractor, RelationType,
+       _clean_concept from "reasoning_graph"
+
+/// ── POS-like tag heuristics (no model, regex-based) ──
+
+let _DETERMINERS = {
+    "a", "an", "the", "this", "that", "these", "those", "my", "your",
+    "his", "her", "its", "our", "their", "some", "any", "no", "every",
+    "each", "all", "both", "few", "several", "many", "much"
+}
+
+let _PREPOSITIONS = {
+    "in", "on", "at", "to", "for", "with", "by", "from", "of", "as",
+    "into", "through", "during", "before", "after", "above", "below",
+    "between", "among", "within", "without", "about", "against",
+    "across", "along", "around", "behind", "beside", "beyond",
+    "near", "over", "under", "upon", "towards", "via"
+}
+
+let _PRONOUNS = {
+    "it", "they", "them", "he", "she", "him", "her", "we", "us",
+    "its", "their", "his", "her", "our", "this", "that", "these",
+    "those", "which", "who", "whom", "whose"
+}
+
+let _AUXILIARY = {
+    "is", "are", "was", "were", "be", "been", "being",
+    "has", "have", "had", "having",
+    "do", "does", "did",
+    "will", "would", "shall", "should", "can", "could", "may", "might",
+    "must", "need", "dare", "ought"
+}
+
+let _ADJ_SUFFIXES = [
+    "al", "ous", "ive", "ful", "less", "able", "ible", "ic", "ed"
+]
+
+fn _is_likely_noun(word: string) -> bool {
+    let wl = word.lower()
+    if _DETERMINERS.contains(wl) { return false }
+    if _PREPOSITIONS.contains(wl) { return false }
+    if _PRONOUNS.contains(wl) { return false }
+    if _AUXILIARY.contains(wl) { return false }
+    if wl.ends_with("ly") && wl.len() > 4 {
+        return false
+    }
+    return true
+}
+
+/// ── Sentence Splitter ──
+
+fn _split_sentences(text: string) -> List[any] {
+    let cleaned = re.sub("\\s+", " ", text.strip())
+    let sents = re.split("(?<=[.!?;])\\s+(?=[A-Z])", cleaned)
+    let result = []
+    for s in sents {
+        let trimmed = s.strip()
+        if trimmed.ends_with(".") {
+            trimmed = trimmed.slice(0, trimmed.len() - 1)
+        }
+        if trimmed.len() < 8 {
+            continue
+        }
+        let conjunctions = re.split(
+            ",\\s*(?:and|but|while|whereas|although|however)\\s+", trimmed)
+        if conjunctions.len() > 1 {
+            let all_long = true
+            for c in conjunctions {
+                if c.len() <= 15 {
+                    all_long = false
+                    break
+                }
+            }
+            if all_long {
+                for c in conjunctions {
+                    let ct = c.strip()
+                    if ct.len() > 8 {
+                        result.append(ct)
+                    }
+                }
+            } else {
+                result.append(trimmed)
+            }
+        } else {
+            result.append(trimmed)
+        }
+    }
+    return result
+}
+
+/// ── Coreference Resolution (lightweight) ──
+
+fn _extract_leading_np(sent: string) -> string {
+    let words = sent.split(" ")
+    let np_words = []
+    for w in words {
+        if _DETERMINERS.contains(w.lower()) {
+            continue
+        }
+        if _is_likely_noun(w) || w.char_at(0).is_upper() {
+            np_words.append(w)
+        } else {
+            break
+        }
+        if np_words.len() >= 4 {
+            break
+        }
+    }
+    return np_words.join(" ")
+}
+
+fn _replace_pronouns(sent: string, antecedent: string) -> string {
+    let words = sent.split(" ")
+    let result = []
+    for i in range(0, words.len()) {
+        let wl = words[i].lower()
+        if wl == "it" || wl == "this" || wl == "they" || wl == "these" {
+            if i == 0 {
+                result.append(antecedent)
+                continue
+            }
+            if i > 0 && _AUXILIARY.contains(words[i - 1].lower()) {
+                result.append(antecedent)
+                continue
+            }
+        }
+        result.append(words[i])
+    }
+    return result.join(" ")
+}
+
+fn _resolve_coreferences(sentences: List[string]) -> List[any] {
+    let resolved = []
+    let last_subject = ""
+    for sent in sentences {
+        let np = _extract_leading_np(sent)
+        if np.len() > 3 {
+            last_subject = np
+        }
+        let s = sent
+        if last_subject.len() > 0 {
+            s = _replace_pronouns(sent, last_subject)
+        }
+        resolved.append(s)
+    }
+    return resolved
+}
+
+/// ── Noun-Phrase Chunker ──
+
+fn _extract_noun_phrases(text: string) -> List[any] {
+    let pattern = "(?:(?:the|a|an|this|that|these|those|its|their|his|her|our|my|your)\\s+)?" +
+        "(?:(?:[a-z]+-)?(?:[a-z]+(?:al|ous|ive|ic|ed|ing|ary|ory)\\s+))*" +
+        "(?:[A-Za-z][a-z]+(?:\\s+[A-Za-z][a-z]+){0,4})" +
+        "(?:\\s+(?:of|for|in|on|with|from|by)\\s+" +
+        "(?:(?:the|a|an)\\s+)?[A-Za-z][a-z]+(?:\\s+[A-Za-z][a-z]+){0,2})?"
+    let matches = re.findall(pattern, text)
+    let phrases = []
+    for m in matches {
+        let cleaned = _clean_concept(m)
+        if cleaned.len() > 2 {
+            phrases.append(cleaned)
+        }
+    }
+    return phrases
+}
+
+/// ── SVO (Subject-Verb-Object) ──
+
+type SVO {
+    subject: string,
+    verb: string,
+    obj: string,
+    relation: RelationType,
+    confidence_modifier: float
+}
+
+/// Verb → (RelationType, confidence_modifier) mapping
+fn _verb_relation_lookup(verb: string) -> Optional[any] {
+    let vl = verb.lower()
+    let map = {
+        "cause": { "rel": RelationType.CAUSES, "mod": 1.0 },
+        "causes": { "rel": RelationType.CAUSES, "mod": 1.0 },
+        "caused": { "rel": RelationType.CAUSES, "mod": 0.95 },
+        "lead": { "rel": RelationType.CAUSES, "mod": 0.9 },
+        "leads": { "rel": RelationType.CAUSES, "mod": 0.9 },
+        "result": { "rel": RelationType.CAUSES, "mod": 0.85 },
+        "results": { "rel": RelationType.CAUSES, "mod": 0.85 },
+        "produce": { "rel": RelationType.PRODUCES, "mod": 1.0 },
+        "produces": { "rel": RelationType.PRODUCES, "mod": 1.0 },
+        "generate": { "rel": RelationType.PRODUCES, "mod": 0.9 },
+        "generates": { "rel": RelationType.PRODUCES, "mod": 0.9 },
+        "create": { "rel": RelationType.PRODUCES, "mod": 0.85 },
+        "creates": { "rel": RelationType.PRODUCES, "mod": 0.85 },
+        "prevent": { "rel": RelationType.PREVENTS, "mod": 1.0 },
+        "prevents": { "rel": RelationType.PREVENTS, "mod": 1.0 },
+        "block": { "rel": RelationType.PREVENTS, "mod": 0.9 },
+        "blocks": { "rel": RelationType.PREVENTS, "mod": 0.9 },
+        "inhibit": { "rel": RelationType.INHIBITS, "mod": 1.0 },
+        "inhibits": { "rel": RelationType.INHIBITS, "mod": 1.0 },
+        "suppress": { "rel": RelationType.INHIBITS, "mod": 0.9 },
+        "suppresses": { "rel": RelationType.INHIBITS, "mod": 0.9 },
+        "reduce": { "rel": RelationType.INHIBITS, "mod": 0.8 },
+        "reduces": { "rel": RelationType.INHIBITS, "mod": 0.8 },
+        "require": { "rel": RelationType.REQUIRES, "mod": 1.0 },
+        "requires": { "rel": RelationType.REQUIRES, "mod": 1.0 },
+        "need": { "rel": RelationType.REQUIRES, "mod": 0.9 },
+        "needs": { "rel": RelationType.REQUIRES, "mod": 0.9 },
+        "depend": { "rel": RelationType.REQUIRES, "mod": 0.85 },
+        "depends": { "rel": RelationType.REQUIRES, "mod": 0.85 },
+        "enable": { "rel": RelationType.ENABLES, "mod": 1.0 },
+        "enables": { "rel": RelationType.ENABLES, "mod": 1.0 },
+        "allow": { "rel": RelationType.ENABLES, "mod": 0.9 },
+        "allows": { "rel": RelationType.ENABLES, "mod": 0.9 },
+        "facilitate": { "rel": RelationType.ENABLES, "mod": 0.85 },
+        "facilitates": { "rel": RelationType.ENABLES, "mod": 0.85 },
+        "contain": { "rel": RelationType.PART_OF, "mod": 0.8 },
+        "contains": { "rel": RelationType.PART_OF, "mod": 0.8 },
+        "include": { "rel": RelationType.PART_OF, "mod": 0.75 },
+        "includes": { "rel": RelationType.PART_OF, "mod": 0.75 },
+        "involve": { "rel": RelationType.PART_OF, "mod": 0.7 },
+        "involves": { "rel": RelationType.PART_OF, "mod": 0.7 },
+        "contradict": { "rel": RelationType.CONTRADICTS, "mod": 1.0 },
+        "contradicts": { "rel": RelationType.CONTRADICTS, "mod": 1.0 },
+        "oppose": { "rel": RelationType.CONTRADICTS, "mod": 0.85 },
+        "opposes": { "rel": RelationType.CONTRADICTS, "mod": 0.85 },
+        "precede": { "rel": RelationType.PRECEDES, "mod": 0.9 },
+        "precedes": { "rel": RelationType.PRECEDES, "mod": 0.9 },
+        "correlate": { "rel": RelationType.CORRELATES, "mod": 0.8 },
+        "correlates": { "rel": RelationType.CORRELATES, "mod": 0.8 },
+        "trigger": { "rel": RelationType.CAUSES, "mod": 0.9 },
+        "triggers": { "rel": RelationType.CAUSES, "mod": 0.9 },
+        "increase": { "rel": RelationType.CAUSES, "mod": 0.7 },
+        "increases": { "rel": RelationType.CAUSES, "mod": 0.7 },
+        "decrease": { "rel": RelationType.INHIBITS, "mod": 0.7 },
+        "decreases": { "rel": RelationType.INHIBITS, "mod": 0.7 },
+        "promote": { "rel": RelationType.ENABLES, "mod": 0.8 },
+        "promotes": { "rel": RelationType.ENABLES, "mod": 0.8 },
+        "improve": { "rel": RelationType.ENABLES, "mod": 0.8 },
+        "improves": { "rel": RelationType.ENABLES, "mod": 0.8 },
+        "weaken": { "rel": RelationType.INHIBITS, "mod": 0.8 },
+        "weakens": { "rel": RelationType.INHIBITS, "mod": 0.8 },
+        "strengthen": { "rel": RelationType.ENABLES, "mod": 0.8 },
+        "strengthens": { "rel": RelationType.ENABLES, "mod": 0.8 },
+        "accelerate": { "rel": RelationType.CAUSES, "mod": 0.8 },
+        "accelerates": { "rel": RelationType.CAUSES, "mod": 0.8 },
+        "convert": { "rel": RelationType.PRODUCES, "mod": 0.85 },
+        "converts": { "rel": RelationType.PRODUCES, "mod": 0.85 },
+        "transform": { "rel": RelationType.PRODUCES, "mod": 0.85 },
+        "transforms": { "rel": RelationType.PRODUCES, "mod": 0.85 },
+        "affect": { "rel": RelationType.CAUSES, "mod": 0.75 },
+        "affects": { "rel": RelationType.CAUSES, "mod": 0.75 },
+        "influence": { "rel": RelationType.CAUSES, "mod": 0.7 },
+        "influences": { "rel": RelationType.CAUSES, "mod": 0.7 },
+        "support": { "rel": RelationType.ENABLES, "mod": 0.8 },
+        "supports": { "rel": RelationType.ENABLES, "mod": 0.8 },
+        "protect": { "rel": RelationType.PREVENTS, "mod": 0.8 },
+        "protects": { "rel": RelationType.PREVENTS, "mod": 0.8 },
+        "regulate": { "rel": RelationType.CAUSES, "mod": 0.75 },
+        "regulates": { "rel": RelationType.CAUSES, "mod": 0.75 },
+        "control": { "rel": RelationType.CAUSES, "mod": 0.7 },
+        "controls": { "rel": RelationType.CAUSES, "mod": 0.7 },
+        "drive": { "rel": RelationType.CAUSES, "mod": 0.8 },
+        "drives": { "rel": RelationType.CAUSES, "mod": 0.8 },
+        "power": { "rel": RelationType.ENABLES, "mod": 0.8 },
+        "powers": { "rel": RelationType.ENABLES, "mod": 0.8 },
+        "emit": { "rel": RelationType.PRODUCES, "mod": 0.85 },
+        "emits": { "rel": RelationType.PRODUCES, "mod": 0.85 },
+        "absorb": { "rel": RelationType.REQUIRES, "mod": 0.7 },
+        "absorbs": { "rel": RelationType.REQUIRES, "mod": 0.7 },
+        "connect": { "rel": RelationType.CORRELATES, "mod": 0.7 },
+        "connects": { "rel": RelationType.CORRELATES, "mod": 0.7 },
+        "help": { "rel": RelationType.ENABLES, "mod": 0.7 },
+        "helps": { "rel": RelationType.ENABLES, "mod": 0.7 },
+        "harm": { "rel": RelationType.CAUSES, "mod": 0.75 },
+        "harms": { "rel": RelationType.CAUSES, "mod": 0.75 },
+        "form": { "rel": RelationType.PRODUCES, "mod": 0.7 },
+        "forms": { "rel": RelationType.PRODUCES, "mod": 0.7 },
+        "provide": { "rel": RelationType.ENABLES, "mod": 0.7 },
+        "provides": { "rel": RelationType.ENABLES, "mod": 0.7 },
+        "use": { "rel": RelationType.REQUIRES, "mod": 0.7 },
+        "uses": { "rel": RelationType.REQUIRES, "mod": 0.7 },
+        "comprise": { "rel": RelationType.PART_OF, "mod": 0.8 },
+        "comprises": { "rel": RelationType.PART_OF, "mod": 0.8 }
+    }
+    return map.get(vl, nil)
+}
+
+/// ── SVO Extraction ──
+
+fn _extract_svo(sent: string) -> List[any] {
+    let results = []
+
+    /// Passive: "Y is/are verb-ed by X"
+    let m_passive = re.match(
+        "^(.+?)\\s+(?:is|are|was|were)\\s+(\\w+ed)\\s+by\\s+(.+?)$", sent)
+    if m_passive != nil {
+        let obj_raw = m_passive.group(1)
+        let verb = m_passive.group(2)
+        let subj_raw = m_passive.group(3)
+        let base_verb = re.sub("ed$", "", verb.lower())
+        for v in _verb_relation_keys() {
+            let lookup = _verb_relation_lookup(v)
+            if lookup == nil { continue }
+            if v.starts_with(base_verb) || base_verb.starts_with(v.slice(0, 4)) {
+                let subj = _clean_concept(subj_raw)
+                let obj = _clean_concept(obj_raw)
+                if subj.len() > 0 && obj.len() > 0 && subj != obj {
+                    results.append(SVO {
+                        subject: subj, verb: verb, obj: obj,
+                        relation: lookup["rel"], confidence_modifier: lookup["mod"]
+                    })
+                }
+                break
+            }
+        }
+    }
+
+    /// "due to" pattern: "Y is due to X"
+    let m_due = re.match(
+        "^(.+?)\\s+(?:is|are|was|were)\\s+(?:due|attributed|owing)\\s+to\\s+(.+?)$", sent)
+    if m_due != nil {
+        let effect = _clean_concept(m_due.group(1))
+        let cause = _clean_concept(m_due.group(2))
+        if cause.len() > 0 && effect.len() > 0 && cause != effect {
+            results.append(SVO {
+                subject: cause, verb: "causes", obj: effect,
+                relation: RelationType.CAUSES, confidence_modifier: 0.85
+            })
+        }
+    }
+
+    /// Conditional: "When X, Y" / "If X, then Y"
+    let m_cond = re.match(
+        "^(?:when|if|whenever|once)\\s+(.+?)\\s*,\\s*(?:then\\s+)?(.+?)$", sent)
+    if m_cond != nil {
+        let condition = _clean_concept(m_cond.group(1))
+        let consequence = _clean_concept(m_cond.group(2))
+        if condition.len() > 0 && consequence.len() > 0 && condition != consequence {
+            results.append(SVO {
+                subject: condition, verb: "enables", obj: consequence,
+                relation: RelationType.ENABLES, confidence_modifier: 0.75
+            })
+        }
+    }
+
+    /// Relative: "X, which verb Y"
+    let m_rel = re.match(
+        "^(.+?)\\s*,\\s*which\\s+(\\w+(?:s|es|ed)?)\\s+(.+?)$", sent)
+    if m_rel != nil {
+        let subj = _clean_concept(m_rel.group(1))
+        let verb = m_rel.group(2)
+        let obj = _clean_concept(m_rel.group(3))
+        let lookup = _verb_relation_lookup(verb.lower())
+        if lookup != nil && subj.len() > 0 && obj.len() > 0 && subj != obj {
+            results.append(SVO {
+                subject: subj, verb: verb, obj: obj,
+                relation: lookup["rel"],
+                confidence_modifier: to_float(lookup["mod"]) * 0.9
+            })
+        }
+    }
+
+    /// Copular IS_A: "X is/are a/the Y"
+    let m_isa = re.match(
+        "^(.+?)\\s+(?:is|are|was|were)\\s+(?:a|an|the)\\s+(.+?)$", sent)
+    if m_isa != nil {
+        let subj = _clean_concept(m_isa.group(1))
+        let obj = _clean_concept(m_isa.group(2))
+        if subj.len() > 2 && obj.len() > 2 && subj != obj {
+            let already = false
+            for s in results {
+                if s.subject == subj && s.obj == obj && s.relation == RelationType.IS_A {
+                    already = true
+                    break
+                }
+            }
+            if !already {
+                results.append(SVO {
+                    subject: subj, verb: "is", obj: obj,
+                    relation: RelationType.IS_A, confidence_modifier: 0.8
+                })
+            }
+        }
+    }
+
+    /// Copular alias: "X is known as Y"
+    let m_alias = re.match(
+        "^(.+?)\\s+(?:is|are)\\s+(?:known as|called|named|referred to as|termed)\\s+(.+?)$", sent)
+    if m_alias != nil {
+        let subj = _clean_concept(m_alias.group(1))
+        let obj = _clean_concept(m_alias.group(2))
+        if subj.len() > 0 && obj.len() > 0 && subj != obj {
+            results.append(SVO {
+                subject: subj, verb: "is", obj: obj,
+                relation: RelationType.IS_A, confidence_modifier: 0.85
+            })
+        }
+    }
+
+    /// Direct verb lookup scan
+    let words = sent.split(" ")
+    for i in range(0, words.len()) {
+        let lookup = _verb_relation_lookup(words[i].lower())
+        if lookup == nil { continue }
+        if i < 1 || i >= words.len() - 1 { continue }
+        let subj_parts = []
+        for j in range(0, i) {
+            subj_parts.append(words[j])
+        }
+        let obj_parts = []
+        for j in range(i + 1, words.len()) {
+            obj_parts.append(words[j])
+        }
+        let subj = _clean_concept(subj_parts.join(" "))
+        let obj = _clean_concept(obj_parts.join(" "))
+        if subj.len() > 2 && obj.len() > 2 && subj != obj {
+            let already = false
+            for s in results {
+                if s.subject == subj && s.obj == obj && s.relation == lookup["rel"] {
+                    already = true
+                    break
+                }
+            }
+            if !already {
+                results.append(SVO {
+                    subject: subj, verb: words[i], obj: obj,
+                    relation: lookup["rel"], confidence_modifier: lookup["mod"]
+                })
+                break
+            }
+        }
+    }
+
+    return results
+}
+
+fn _verb_relation_keys() -> List[any] {
+    return [
+        "cause", "causes", "caused", "lead", "leads", "result", "results",
+        "produce", "produces", "generate", "generates", "create", "creates",
+        "prevent", "prevents", "block", "blocks", "inhibit", "inhibits",
+        "suppress", "suppresses", "reduce", "reduces", "require", "requires",
+        "need", "needs", "depend", "depends", "enable", "enables",
+        "allow", "allows", "facilitate", "facilitates", "contain", "contains",
+        "include", "includes", "involve", "involves", "contradict", "contradicts",
+        "oppose", "opposes", "precede", "precedes", "correlate", "correlates",
+        "trigger", "triggers", "increase", "increases", "decrease", "decreases",
+        "promote", "promotes", "improve", "improves", "weaken", "weakens",
+        "strengthen", "strengthens", "accelerate", "accelerates",
+        "convert", "converts", "transform", "transforms",
+        "affect", "affects", "influence", "influences", "support", "supports",
+        "protect", "protects", "regulate", "regulates", "control", "controls",
+        "drive", "drives", "power", "powers", "emit", "emits",
+        "absorb", "absorbs", "connect", "connects", "help", "helps",
+        "harm", "harms", "form", "forms", "provide", "provides",
+        "use", "uses", "comprise", "comprises"
+    ]
+}
+
+/// ── Enhanced Fact Extractor ──
+
+class EnhancedFactExtractor {
+    fn init(self) {
+        self._fallback = FactExtractor()
+    }
+
+    fn extract_from_text(self, text: string, confidence: float,
+                         fact_id: string, domain: string) -> List[any] {
+        let sentences = _split_sentences(text)
+        let resolved = _resolve_coreferences(sentences)
+        let triples = []
+        let seen = set()
+
+        for sent in resolved {
+            let svos = _extract_svo(sent)
+            for svo in svos {
+                let key = svo.subject + "|" + svo.relation.value + "|" + svo.obj
+                if seen.contains(key) { continue }
+                seen.add(key)
+                triples.append(ExtractedTriple {
+                    subject: svo.subject,
+                    relation: svo.relation,
+                    obj: svo.obj,
+                    confidence: confidence * svo.confidence_modifier,
+                    evidence: sent,
+                    fact_id: fact_id,
+                    domain: domain
+                })
+            }
+
+            if svos.len() == 0 {
+                let fallback_triples = self._fallback.extract_from_text(
+                    sent, confidence, fact_id, domain)
+                for t in fallback_triples {
+                    let key = t.subject + "|" + t.relation.value + "|" + t.obj
+                    if !seen.contains(key) {
+                        seen.add(key)
+                        triples.append(t)
+                    }
+                }
+            }
+        }
+        return triples
+    }
+
+    fn extract_from_facts(self, facts: List[Map[string, any]],
+                          domain: string) -> List[any] {
+        let all_triples = []
+        for fact in facts {
+            let text = to_string(fact.get("text", ""))
+            let conf = to_float(fact.get("confidence", 0.5))
+            let fid = to_string(fact.get("id", ""))
+            let d = domain
+            if d == "" {
+                d = to_string(fact.get("domain", ""))
+            }
+            let triples = self.extract_from_text(text, conf, fid, d)
+            for t in triples {
+                all_triples.append(t)
+            }
+        }
+        return all_triples
+    }
+
+    fn populate_graph(self, graph: CausalGraph,
+                      facts: List[Map[string, any]],
+                      domain: string) -> int {
+        let triples = self.extract_from_facts(facts, domain)
+        for t in triples {
+            graph.add_edge(
+                t.subject, t.obj, t.relation,
+                t.confidence, t.domain, t.evidence, t.fact_id)
+        }
+        return triples.len()
+    }
+}
+
+export SVO, EnhancedFactExtractor
+export _split_sentences, _resolve_coreferences, _extract_noun_phrases, _extract_svo

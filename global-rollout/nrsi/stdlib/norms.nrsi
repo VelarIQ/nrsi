@@ -1,0 +1,130 @@
+/// NRSI Standard Norms — Ethical and Safety Constraints
+///
+/// Norms are checked at compile time AND runtime.
+/// They constrain what the system may/must/must-not do.
+
+module norms
+
+import NRSIData from "types"
+
+/// ---------- Safety Norms ----------
+
+norm no_unvalidated_medical {
+    type: prohibition,
+    scope: domain("medical"),
+    action: "output_raw",
+    priority: 100,
+    condition: trust == TrustLevel.RAW
+}
+
+norm no_unvalidated_legal {
+    type: prohibition,
+    scope: domain("legal"),
+    action: "output_raw",
+    priority: 100,
+    condition: trust == TrustLevel.RAW
+}
+
+norm no_unvalidated_financial {
+    type: prohibition,
+    scope: domain("financial"),
+    action: "output_raw",
+    priority: 100,
+    condition: trust == TrustLevel.RAW
+}
+
+/// ---------- Transparency Norms ----------
+
+norm require_provenance {
+    type: obligation,
+    scope: global,
+    action: "include_provenance",
+    priority: 90,
+    condition: trust >= TrustLevel.VALIDATED
+}
+
+norm require_confidence_disclosure {
+    type: obligation,
+    scope: global,
+    action: "disclose_confidence",
+    priority: 85,
+    condition: true
+}
+
+norm require_uncertainty_disclosure {
+    type: obligation,
+    scope: global,
+    action: "disclose_uncertainty",
+    priority: 85,
+    condition: true
+}
+
+/// ---------- Epistemic Norms ----------
+
+norm no_speculative_as_fact {
+    type: prohibition,
+    scope: global,
+    action: "present_speculative_as_certain",
+    priority: 95,
+    condition: epistemic == EpistemicType.SPECULATIVE and confidence < 0.50
+}
+
+norm require_evidence_for_claims {
+    type: obligation,
+    scope: global,
+    action: "cite_evidence",
+    priority: 80,
+    condition: epistemic == EpistemicType.DEDUCTIVE or epistemic == EpistemicType.CAUSAL
+}
+
+/// ---------- Privacy Norms ----------
+
+norm protect_personal_data {
+    type: prohibition,
+    scope: domain("personal"),
+    action: "expose_without_consent",
+    priority: 100,
+    condition: true
+}
+
+norm minimize_data_collection {
+    type: obligation,
+    scope: global,
+    action: "collect_minimum",
+    priority: 70,
+    condition: true
+}
+
+/// ---------- Fairness Norms ----------
+
+norm no_discriminatory_output {
+    type: prohibition,
+    scope: global,
+    action: "discriminate",
+    priority: 100,
+    condition: true
+}
+
+/// ---------- Permission Norms ----------
+
+norm allow_creative_speculation {
+    type: permission,
+    scope: domain("creative"),
+    action: "speculate",
+    priority: 50,
+    condition: epistemic == EpistemicType.CREATIVE or epistemic == EpistemicType.SPECULATIVE
+}
+
+norm allow_analogical_transfer {
+    type: permission,
+    scope: global,
+    action: "cross_domain_analogy",
+    priority: 50,
+    condition: epistemic == EpistemicType.ANALOGICAL
+}
+
+export no_unvalidated_medical, no_unvalidated_legal, no_unvalidated_financial
+export require_provenance, require_confidence_disclosure, require_uncertainty_disclosure
+export no_speculative_as_fact, require_evidence_for_claims
+export protect_personal_data, minimize_data_collection, no_discriminatory_output
+export allow_creative_speculation, allow_analogical_transfer

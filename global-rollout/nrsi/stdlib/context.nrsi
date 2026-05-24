@@ -1,0 +1,113 @@
+/// NRSI Context Window Management — Token Tracking and Compaction
+///
+/// Prevents context overflow by tracking token counts, compacting
+/// conversation history, and extracting key facts into VLT.
+///
+/// Unlike flat summary compaction, NRS compacts into structured VLT
+/// entries with H-Score provenance so recalled facts carry their
+/// original trust level.
+
+module context
+
+import TrustLevel, NRSIData, EpistemicType, Confidence from "types"
+import factual_verify, corroborate from "gates"
+
+/// ---------- Memory Fact ----------
+
+type MemoryFact {
+    content: string,
+    h_score: float,
+    domain: string,
+    source_turn: int,
+    timestamp: float,
+    fact_hash: string
+}
+
+/// ---------- Compaction Result ----------
+
+type CompactionResult {
+    compacted: bool,
+    messages_before: int,
+    messages_after: int,
+    tokens_freed: int,
+    facts_extracted: int,
+    summary: string
+}
+
+/// ---------- Context Thresholds ----------
+/// AUTOCOMPACT_BUFFER_TOKENS = 13000
+/// MAX_CONSECUTIVE_FAILURES = 3
+/// CHARS_PER_TOKEN_ESTIMATE = 4.0
+
+fn should_compact(total_tokens: int, effective_window: int, buffer: int) -> bool {
+    if effective_window <= 0 {
+        return false
+    }
+    let threshold = effective_window - buffer
+    if threshold < 0 {
+        threshold = 0
+    }
+    return total_tokens > threshold
+}
+
+/// ---------- Memory Extraction Gate ----------
+/// Only facts above min_h_score get extracted into VLT
+
+gate memory_extraction(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.30
+    require data.domain != "unknown"
+    validate content_substantive
+    validate not_duplicate
+}
+
+/// ---------- Compaction Gate ----------
+/// Validates that compaction preserved essential information
+
+gate compaction_verify(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.50
+    validate facts_preserved
+    validate recent_messages_kept
+    validate summary_coherent
+}
+
+/// ---------- VLT Storage Gate ----------
+/// Facts entering VLT must pass trust verification
+
+gate vlt_storage(data: validated[NRSIData]) -> trusted[NRSIData] {
+    require confidence >= 0.60
+    validate provenance_chain_intact
+    validate h_score_attached
+    validate domain_tagged
+}
+
+/// ---------- Extraction Functions ----------
+
+fn extract_fact(message: string, h_score: float, domain: string) -> validated[NRSIData] {
+    let data = raw(message, domain)
+    return memory_extraction(data)
+}
+
+fn compact_messages(summary: string) -> validated[NRSIData] {
+    let data = raw(summary, "compaction")
+    return compaction_verify(data)
+}
+
+fn store_in_vlt(fact: string, domain: string) -> trusted[NRSIData] {
+    let validated_fact = factual_verify(raw(fact, domain))
+    return vlt_storage(validated_fact)
+}
+
+/// ---------- Persistent Session Memory ----------
+
+persist session_facts {
+    decay: 0.005
+    reinforcement: 0.15
+    conflict_resolution: "revision"
+    backing: "vlt"
+}
+
+export MemoryFact, CompactionResult
+export should_compact
+export memory_extraction, compaction_verify, vlt_storage
+export extract_fact, compact_messages, store_in_vlt
+export session_facts

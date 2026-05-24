@@ -1,0 +1,360 @@
+/// NRS Domain Registry — Single Source of Truth for Domain Knowledge Routing.
+///
+/// Every domain (telecom, finance, healthcare, legal, etc.) is defined here
+/// with its keyword signals, lobe affinities, knowledge pack paths, and
+/// confidence profiles.  All other modules (router, orchestration,
+/// nervous_system, signal_compression) import from this registry instead
+/// of maintaining their own scattered keyword lists.
+
+module nrs_domain_registry
+
+import logging from "std/logging"
+
+let _log = logging.getLogger("nrs.domain-registry")
+
+/// ── Domain Profile ───────────────────────────────────────────────────
+
+type DomainProfile {
+    name: string,
+    display_name: string,
+    keywords: List[string],
+    lobe_affinities: Dict[string, float],
+    knowledge_pack_paths: List[string],
+    confidence_floor: float,
+    parent_domain: Optional[string]
+}
+
+/// ── Domain Definitions ───────────────────────────────────────────────
+
+let DOMAINS = {
+    "telecom": DomainProfile {
+        name: "telecom",
+        display_name: "Telecommunications",
+        keywords: [
+            "cell", "tower", "lac", "rnc", "msc", "smsc", "imsi", "earfcn",
+            "bts", "handover", "5g", "lte", "gsm", "umts", "nr", "band",
+            "signaling", "ss7", "diameter", "sip", "roaming", "mme", "enodeb",
+            "gnodeb", "sgw", "pgw", "ims", "volte", "sms", "mms", "hlr",
+            "hss", "pcrf", "ocs", "sccp", "isup", "map", "camel", "ran",
+            "core network", "backhaul", "fronthaul", "spectrum", "rsrp",
+            "rsrq", "sinr", "throughput", "latency", "jitter", "packet loss",
+            "qos", "qci", "bearer", "pdn", "apn", "tac", "plmn", "arfcn"
+        ],
+        lobe_affinities: {
+            "causal": 0.40,
+            "logical": 0.30,
+            "mathematical": 0.20,
+            "linguistic": 0.10
+        },
+        knowledge_pack_paths: [
+            "knowledge/telecom_core.json",
+            "knowledge/telecom_signaling.json",
+            "knowledge/telecom_bands.json"
+        ],
+        confidence_floor: 0.80,
+        parent_domain: "technology"
+    },
+
+    "finance": DomainProfile {
+        name: "finance",
+        display_name: "Finance & Banking",
+        keywords: [
+            "portfolio", "equity", "derivative", "hedge", "bond", "interest",
+            "return", "risk", "investment", "market", "stock", "option",
+            "futures", "swap", "yield", "dividend", "valuation", "dcf",
+            "npv", "irr", "capm", "beta", "alpha", "sharpe", "volatility",
+            "var", "cvar", "credit", "debit", "balance", "ledger",
+            "settlement", "clearing", "custodian", "broker", "exchange",
+            "otc", "etf", "mutual fund", "reit", "forex", "currency",
+            "inflation", "gdp", "monetary policy", "fiscal", "treasury",
+            "account", "transaction", "revenue", "profit", "loss",
+            "asset", "liability", "capital", "liquidity", "solvency"
+        ],
+        lobe_affinities: {
+            "mathematical": 0.40,
+            "logical": 0.25,
+            "causal": 0.20,
+            "planning": 0.15
+        },
+        knowledge_pack_paths: [
+            "knowledge/finance_core.json",
+            "knowledge/finance_regulations.json"
+        ],
+        confidence_floor: 0.85,
+        parent_domain: nil
+    },
+
+    "healthcare": DomainProfile {
+        name: "healthcare",
+        display_name: "Healthcare & Medicine",
+        keywords: [
+            "diagnosis", "treatment", "symptom", "drug", "patient",
+            "clinical", "disease", "therapy", "dosage", "prognosis",
+            "surgery", "cancer", "immune", "pathology", "radiology",
+            "pharmacology", "contraindication", "adverse", "efficacy",
+            "biomarker", "genomic", "ehr", "emr", "icd", "cpt",
+            "drg", "fhir", "hl7", "dicom", "snomed", "loinc",
+            "vital signs", "blood pressure", "heart rate", "bmi",
+            "lab result", "prescription", "referral", "triage",
+            "comorbidity", "mortality", "morbidity", "epidemiology",
+            "vaccine", "antibiotic", "analgesic", "anesthesia"
+        ],
+        lobe_affinities: {
+            "causal": 0.35,
+            "logical": 0.30,
+            "memory": 0.20,
+            "linguistic": 0.15
+        },
+        knowledge_pack_paths: [
+            "knowledge/healthcare_core.json",
+            "knowledge/healthcare_standards.json"
+        ],
+        confidence_floor: 0.90,
+        parent_domain: nil
+    },
+
+    "legal": DomainProfile {
+        name: "legal",
+        display_name: "Law & Compliance",
+        keywords: [
+            "statute", "precedent", "jurisdiction", "liability",
+            "contract", "tort", "plaintiff", "defendant", "appeal",
+            "regulation", "compliance", "court", "rights", "law",
+            "legislation", "amendment", "clause", "provision",
+            "arbitration", "mediation", "discovery", "deposition",
+            "injunction", "damages", "negligence", "fiduciary",
+            "intellectual property", "patent", "trademark", "copyright",
+            "gdpr", "hipaa", "sox", "pci", "aml", "kyc",
+            "due diligence", "indemnity", "warranty", "breach"
+        ],
+        lobe_affinities: {
+            "logical": 0.45,
+            "linguistic": 0.25,
+            "memory": 0.20,
+            "analogical": 0.10
+        },
+        knowledge_pack_paths: [
+            "knowledge/legal_core.json"
+        ],
+        confidence_floor: 0.85,
+        parent_domain: nil
+    },
+
+    "engineering": DomainProfile {
+        name: "engineering",
+        display_name: "Engineering",
+        keywords: [
+            "stress", "load", "material", "tolerance", "design",
+            "structural", "thermal", "circuit", "voltage", "current",
+            "resistance", "capacitance", "inductance", "frequency",
+            "bandwidth", "amplifier", "transistor", "semiconductor",
+            "pcb", "fpga", "asic", "cad", "fem", "cfd",
+            "mechanical", "electrical", "civil", "chemical",
+            "manufacturing", "quality", "reliability", "mtbf"
+        ],
+        lobe_affinities: {
+            "mathematical": 0.35,
+            "causal": 0.25,
+            "logical": 0.25,
+            "spatial": 0.15
+        },
+        knowledge_pack_paths: ["knowledge/technology.json"],
+        confidence_floor: 0.80,
+        parent_domain: nil
+    },
+
+    "physics": DomainProfile {
+        name: "physics",
+        display_name: "Physics",
+        keywords: [
+            "energy", "force", "mass", "velocity", "quantum",
+            "relativity", "thermodynamic", "electromagnetic",
+            "gravity", "particle", "wave", "photon", "electron",
+            "proton", "neutron", "quark", "boson", "fermion",
+            "entropy", "enthalpy", "momentum", "acceleration",
+            "field", "potential", "kinetic", "nuclear", "plasma",
+            "optics", "acoustics", "fluid dynamics"
+        ],
+        lobe_affinities: {
+            "mathematical": 0.40,
+            "causal": 0.30,
+            "logical": 0.20,
+            "analogical": 0.10
+        },
+        knowledge_pack_paths: ["knowledge/general.json"],
+        confidence_floor: 0.80,
+        parent_domain: "science"
+    },
+
+    "mathematics": DomainProfile {
+        name: "mathematics",
+        display_name: "Mathematics",
+        keywords: [
+            "theorem", "proof", "integral", "derivative", "topology",
+            "algebra", "matrix", "equation", "convergence", "series",
+            "limit", "function", "set", "group", "ring", "field",
+            "vector", "tensor", "manifold", "differential",
+            "probability", "statistics", "distribution", "variance",
+            "regression", "hypothesis", "correlation", "bayesian",
+            "combinatorics", "graph theory", "number theory",
+            "calculate", "compute", "formula", "solve"
+        ],
+        lobe_affinities: {
+            "mathematical": 0.50,
+            "logical": 0.35,
+            "analogical": 0.15
+        },
+        knowledge_pack_paths: ["knowledge/general.json"],
+        confidence_floor: 0.85,
+        parent_domain: nil
+    },
+
+    "technology": DomainProfile {
+        name: "technology",
+        display_name: "Technology & Computing",
+        keywords: [
+            "computer", "software", "algorithm", "network", "encryption",
+            "machine learning", "database", "api", "cloud", "neural network",
+            "server", "client", "protocol", "tcp", "http", "dns",
+            "kubernetes", "docker", "microservice", "devops", "ci/cd",
+            "git", "linux", "python", "javascript", "rust", "go",
+            "compiler", "runtime", "memory", "cpu", "gpu", "storage"
+        ],
+        lobe_affinities: {
+            "logical": 0.35,
+            "mathematical": 0.25,
+            "planning": 0.20,
+            "causal": 0.20
+        },
+        knowledge_pack_paths: ["knowledge/technology.json"],
+        confidence_floor: 0.75,
+        parent_domain: nil
+    },
+
+    "science": DomainProfile {
+        name: "science",
+        display_name: "Natural Sciences",
+        keywords: [
+            "atom", "molecule", "chemistry", "biology", "evolution",
+            "dna", "cell", "organism", "ecosystem", "climate",
+            "geology", "astronomy", "cosmology", "experiment",
+            "hypothesis", "observation", "measurement", "control",
+            "variable", "peer review", "replication"
+        ],
+        lobe_affinities: {
+            "causal": 0.30,
+            "logical": 0.30,
+            "mathematical": 0.25,
+            "analogical": 0.15
+        },
+        knowledge_pack_paths: ["knowledge/general.json"],
+        confidence_floor: 0.80,
+        parent_domain: nil
+    },
+
+    "history": DomainProfile {
+        name: "history",
+        display_name: "History",
+        keywords: [
+            "century", "era", "dynasty", "empire", "revolution",
+            "war", "treaty", "civilization", "ancient", "medieval",
+            "renaissance", "colonial", "industrial", "modern",
+            "archaeological", "historical", "chronicle", "artifact"
+        ],
+        lobe_affinities: {
+            "temporal": 0.40,
+            "memory": 0.30,
+            "linguistic": 0.20,
+            "causal": 0.10
+        },
+        knowledge_pack_paths: ["knowledge/general.json"],
+        confidence_floor: 0.75,
+        parent_domain: nil
+    },
+
+    /// `general` is the catch-all fallback domain.  keywords is intentionally
+    /// empty so that detect_domain() only selects it when no specialized domain
+    /// scores any keyword hits — i.e. it acts as the default, not a competitor.
+    "general": DomainProfile {
+        name: "general",
+        display_name: "General Knowledge",
+        keywords: [],
+        lobe_affinities: {
+            "linguistic": 0.40,
+            "logical": 0.30,
+            "memory": 0.20,
+            "metacognitive": 0.10
+        },
+        knowledge_pack_paths: ["knowledge/general.json"],
+        confidence_floor: 0.70,
+        parent_domain: nil
+    }
+}
+
+/// ── Detection and Lookup ─────────────────────────────────────────────
+
+fn detect_domain(query: string) -> DomainProfile {
+    let query_lower = query.lower()
+    let best_domain = "general"
+    let best_score = 0
+
+    for domain_name in DOMAINS {
+        let profile = DOMAINS[domain_name]
+        if domain_name == "general" { continue }
+
+        let score = 0
+        for kw in profile.keywords {
+            if kw in query_lower {
+                score = score + 1
+                if len(kw) > 5 { score = score + 1 }
+            }
+        }
+
+        if score > best_score {
+            best_score = score
+            best_domain = domain_name
+        }
+    }
+
+    return DOMAINS[best_domain]
+}
+
+fn get_domain(name: string) -> Optional[DomainProfile] {
+    return DOMAINS.get(name, nil)
+}
+
+fn get_lobe_weights(domain: string) -> Dict[string, float] {
+    let profile = DOMAINS.get(domain, nil)
+    if profile == nil {
+        return DOMAINS["general"].lobe_affinities
+    }
+    return profile.lobe_affinities
+}
+
+fn get_knowledge_paths(domain: string) -> List[string] {
+    let profile = DOMAINS.get(domain, nil)
+    if profile == nil { return [] }
+    return profile.knowledge_pack_paths
+}
+
+fn get_confidence_floor(domain: string) -> float {
+    let profile = DOMAINS.get(domain, nil)
+    if profile == nil { return 0.70 }
+    return profile.confidence_floor
+}
+
+fn all_domains() -> List[string] {
+    return list(DOMAINS.keys())
+}
+
+fn all_keywords_for_domain(domain: string) -> List[string] {
+    let profile = DOMAINS.get(domain, nil)
+    if profile == nil { return [] }
+    return profile.keywords
+}
+
+/// ── Exports ──────────────────────────────────────────────────────────
+
+export DomainProfile, DOMAINS
+export detect_domain, get_domain, get_lobe_weights, get_knowledge_paths
+export get_confidence_floor, all_domains, all_keywords_for_domain

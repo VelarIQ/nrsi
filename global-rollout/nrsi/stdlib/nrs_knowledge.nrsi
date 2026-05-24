@@ -1,0 +1,343 @@
+/// Persistent versioned knowledge management — facts, patterns, and knowledge bases.
+///
+/// Immutable patterns with version evolution. Facts carry confidence, source,
+/// and deprecation metadata. NRSI trust elevation via gate-validated retrieval.
+///
+/// Ported from nrsip/nrs_knowledge.py.
+
+module nrs_knowledge
+
+
+import time from "std/time"
+import json from "std/json"
+import os from "std/os"
+import TrustLevel, NRSIData, nrsi_raw,
+       confidence_validate from "nrs_types"
+
+let CONFIDENCE_HIGH = 0.95
+let CONFIDENCE_LOW = 0.50
+import KnowledgeMutationError, KnowledgeNotFoundError from "nrs_errors"
+
+/// ── Knowledge Fact ──
+
+type KnowledgeFact {
+    name: string,
+    value: any,
+    confidence: float,
+    source: string,
+    unit: Optional[string],
+    validated_by: Optional[string],
+    registered_at: float,
+    deprecated: bool,
+    deprecated_at: Optional[float],
+    deprecated_by: Optional[string],
+    deprecated_reason: Optional[string]
+}
+
+fn knowledge_fact_to_dict(f: KnowledgeFact) -> any {
+    let d = {
+        "name": f.name,
+        "value": f.value,
+        "confidence": f.confidence,
+        "source": f.source,
+        "unit": f.unit,
+        "validated_by": f.validated_by,
+        "registered_at": f.registered_at,
+        "deprecated": f.deprecated
+    }
+    if f.deprecated {
+        d["deprecated_at"] = f.deprecated_at
+        d["deprecated_by"] = f.deprecated_by
+        d["deprecated_reason"] = f.deprecated_reason
+    }
+    return d
+}
+
+/// ── Knowledge Pattern ──
+
+class KnowledgePattern {
+    fn init(self, domain: string, version: string,
+            immutable: bool, description: Optional[string],
+            parent_version: Optional[string]) {
+        self._domain = domain
+        self._version = version
+        self._immutable = immutable
+        self._description = description
+        self._parent_version = parent_version
+        self._facts = {}
+        self._audit_log = []
+        self._created_at = time.time()
+    }
+
+    fn register(self, name: string, value: any, confidence: float,
+                source: string, unit: Optional[string],
+                validated_by: Optional[string]) -> KnowledgeFact {
+        if self._facts.get(name, nil) != nil {
+            if self._immutable {
+                raise KnowledgeMutationError(
+                    self._domain + "@" + self._version, name,
+                    "Use evolve() to create a new version with modifications.")
+            }
+        }
+        let conf = confidence_validate(confidence)
+        let fact = KnowledgeFact {
+            name: name,
+            value: value,
+            confidence: conf,
+            source: source,
+            unit: unit,
+            validated_by: validated_by,
+            registered_at: time.time(),
+            deprecated: false,
+            deprecated_at: nil,
+            deprecated_by: nil,
+            deprecated_reason: nil
+        }
+        self._facts[name] = fact
+        self._audit_log.append({
+            "action": "register",
+            "fact": name,
+            "confidence": conf,
+            "source": source,
+            "timestamp": time.time()
+        })
+        return fact
+    }
+
+    fn deprecate(self, fact: string, reason: string, deprecated_by: string) {
+        let f = self.get(fact, true)
+        f.deprecated = true
+        f.deprecated_at = time.time()
+        f.deprecated_by = deprecated_by
+        f.deprecated_reason = reason
+        self._audit_log.append({
+            "action": "deprecate",
+            "fact": fact,
+            "reason": reason,
+            "deprecated_by": deprecated_by,
+            "timestamp": time.time()
+        })
+    }
+
+    fn get(self, fact: string, include_deprecated: bool) -> KnowledgeFact {
+        let f = self._facts.get(fact, nil)
+        if f == nil {
+            raise KnowledgeNotFoundError(
+                self._domain + "@" + self._version, fact, nil)
+        }
+        if f.deprecated {
+            if !include_deprecated {
+                raise KnowledgeNotFoundError(
+                    self._domain + "@" + self._version, fact,
+                    "Fact '" + fact + "' is deprecated: " + to_string(f.deprecated_reason))
+            }
+        }
+        return f
+    }
+
+    fn get_value(self, fact: string) -> any {
+        return self.get(fact, false).value
+    }
+
+    fn has(self, fact: string) -> bool {
+        let f = self._facts.get(fact, nil)
+        if f == nil {
+            return false
+        }
+        return !f.deprecated
+    }
+
+    fn get_as_nrsi(self, fact: string) -> NRSIData {
+        let f = self.get(fact, false)
+        let nrsi = nrsi_raw(f.value, nil)
+        let gate_name = "knowledge_pattern:" + self._domain + "@" + self._version
+        let reason = "Knowledge fact '" + fact + "' from source '" + f.source + "'"
+        if f.confidence >= CONFIDENCE_HIGH {
+            nrsi = nrsi.elevate(TrustLevel.TRUSTED, f.confidence, gate_name, reason)
+        } else if f.confidence >= CONFIDENCE_LOW {
+            nrsi = nrsi.elevate(TrustLevel.VALIDATED, f.confidence, gate_name, reason)
+        }
+        return nrsi
+    }
+
+    fn evolve(self, version: string, description: Optional[string]) -> KnowledgePattern {
+        let new_pattern = KnowledgePattern()
+        new_pattern.init(self._domain, version, self._immutable,
+                         description, self._version)
+        for name in self._facts.keys() {
+            let fact = self._facts[name]
+            if !fact.deprecated {
+                let new_fact = KnowledgeFact {
+                    name: fact.name,
+                    value: fact.value,
+                    confidence: fact.confidence,
+                    source: fact.source,
+                    unit: fact.unit,
+                    validated_by: fact.validated_by,
+                    registered_at: fact.registered_at,
+                    deprecated: false,
+                    deprecated_at: nil,
+                    deprecated_by: nil,
+                    deprecated_reason: nil
+                }
+                new_pattern._facts[name] = new_fact
+            }
+        }
+        new_pattern._audit_log.append({
+            "action": "evolved_from",
+            "parent_version": self._version,
+            "inherited_facts": new_pattern._facts.len(),
+            "timestamp": time.time()
+        })
+        return new_pattern
+    }
+
+    fn to_dict(self) -> any {
+        let facts_dict = {}
+        for n in self._facts.keys() {
+            facts_dict[n] = knowledge_fact_to_dict(self._facts[n])
+        }
+        return {
+            "domain": self._domain,
+            "version": self._version,
+            "immutable": self._immutable,
+            "description": self._description,
+            "parent_version": self._parent_version,
+            "created_at": self._created_at,
+            "facts": facts_dict,
+            "audit_log": self._audit_log.copy()
+        }
+    }
+
+    fn save(self, path: string) {
+        let data = json.dumps(self.to_dict(), false)
+        open(path, "w").write(data)
+    }
+
+    fn facts(self) -> any {
+        let result = {}
+        for n in self._facts.keys() {
+            let f = self._facts[n]
+            if !f.deprecated {
+                result[n] = f
+            }
+        }
+        return result
+    }
+
+    fn all_facts(self) -> any {
+        return self._facts.copy()
+    }
+
+    fn audit_log(self) -> List[any] {
+        return self._audit_log.copy()
+    }
+
+    fn domain(self) -> string {
+        return self._domain
+    }
+
+    fn version(self) -> string {
+        return self._version
+    }
+}
+
+fn load_knowledge_pattern(path: string) -> KnowledgePattern {
+    let raw = open(path).read()
+    let data = json.loads(raw)
+    let pattern = KnowledgePattern()
+    pattern.init(
+        data["domain"],
+        data["version"],
+        data.get("immutable", true),
+        data.get("description", nil),
+        data.get("parent_version", nil)
+    )
+    pattern._created_at = data.get("created_at", time.time())
+    let facts_data = data.get("facts", {})
+    for name in facts_data.keys() {
+        let fd = facts_data[name]
+        let fact = KnowledgeFact {
+            name: fd["name"],
+            value: fd["value"],
+            confidence: fd["confidence"],
+            source: fd["source"],
+            unit: fd.get("unit", nil),
+            validated_by: fd.get("validated_by", nil),
+            registered_at: fd.get("registered_at", time.time()),
+            deprecated: fd.get("deprecated", false),
+            deprecated_at: fd.get("deprecated_at", nil),
+            deprecated_by: fd.get("deprecated_by", nil),
+            deprecated_reason: fd.get("deprecated_reason", nil)
+        }
+        pattern._facts[name] = fact
+    }
+    pattern._audit_log = data.get("audit_log", [])
+    return pattern
+}
+
+/// ── Knowledge Base ──
+
+class KnowledgeBase {
+    fn init(self, name: string) {
+        self._name = name
+        self._patterns = {}
+    }
+
+    fn add(self, pattern: KnowledgePattern) {
+        let domain = pattern.domain()
+        let version = pattern.version()
+        if self._patterns.get(domain, nil) == nil {
+            self._patterns[domain] = {}
+        }
+        self._patterns[domain][version] = pattern
+    }
+
+    fn get_pattern(self, domain: string, version: Optional[string]) -> KnowledgePattern {
+        if self._patterns.get(domain, nil) == nil {
+            raise KnowledgeNotFoundError(domain, "*",
+                "Domain '" + domain + "' not found in knowledge base.")
+        }
+        let versions = self._patterns[domain]
+        if version != nil {
+            if versions.get(version, nil) == nil {
+                raise KnowledgeNotFoundError(
+                    domain + "@" + version, "*",
+                    "Version '" + version + "' not found for domain '" + domain + "'.")
+            }
+            return versions[version]
+        }
+        let keys = versions.keys()
+        return versions[keys[keys.len() - 1]]
+    }
+
+    fn query(self, domain: string, fact: string, version: Optional[string]) -> any {
+        return self.get_pattern(domain, version).get_value(fact)
+    }
+
+    fn domains(self) -> List[any] {
+        return self._patterns.keys()
+    }
+
+    fn stats(self) -> any {
+        let total_facts = 0
+        let total_patterns = 0
+        for domain in self._patterns.keys() {
+            let versions = self._patterns[domain]
+            total_patterns += versions.len()
+            for v in versions.keys() {
+                total_facts += versions[v].facts().len()
+            }
+        }
+        return {
+            "name": self._name,
+            "domains": self._patterns.len(),
+            "total_patterns": total_patterns,
+            "total_facts": total_facts
+        }
+    }
+}
+
+export KnowledgeFact, knowledge_fact_to_dict
+export KnowledgePattern, load_knowledge_pattern
+export KnowledgeBase

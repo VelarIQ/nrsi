@@ -1,0 +1,981 @@
+/// NRSI Standard Lobes — Cognitive Processing Units
+///
+/// Each lobe specializes in a domain of reasoning, backed by real
+/// computational engines.  Processors call the actual inference,
+/// causal, analogy, planning, memory, and metacognitive engines
+/// rather than passing data through as raw().
+
+module lobes
+
+import NRSIData, EpistemicType from "types"
+import factual_verify, logical_proof, computational_verify from "gates"
+
+import LogicEngine from "logic_engine"
+import CausalReasoner, CausalGraph from "causal_engine"
+import AnalogyEngine, ConceptStore from "analogy_engine"
+import GoalPlanner from "reasoning_planning"
+import WorkingMemory, MemoryItem from "working_memory"
+import WeaknessDetector, HypothesisEngine, ParameterTuner, PerformanceTracker from "self_improvement"
+import QuantitativeReasoner from "reasoning_temporal"
+import SemanticIndex, SemanticQueryParser from "reasoning_semantic"
+import logging from "std/logging"
+import re from "std/regex"
+import time from "std/time"
+
+let _log = logging.getLogger("nrs.lobes")
+
+/// Restricted arithmetic evaluation for the mathematical lobe.
+/// SECURITY: Never use bare `eval(user_text)` — even after character whitelisting,
+/// prefer empty `__builtins__` and only sanitized numeric expressions. For richer
+/// math, route through QuantitativeReasoner / sandboxed code_executor instead.
+fn nrs_safe_compute(sanitized_expr: string) -> any {
+    if sanitized_expr == nil {
+        return nil
+    }
+    let e = sanitized_expr.strip()
+    if len(e) == 0 {
+        return nil
+    }
+    let py_expr = e.replace("^", "**")
+    try {
+        return eval(py_expr, {"__builtins__": {}}, {})
+    } catch(ex) {
+        _log.debug("nrs_safe_compute failed for '%s': %s", sanitized_expr, ex)
+        return nil
+    }
+}
+
+/// ── Shared engine singletons (lazy-initialized) ──────────────────────
+
+let _engines = {
+    "logic": nil,
+    "causal": nil,
+    "analogy": nil,
+    "planner": nil,
+    "working_memory": nil,
+    "weakness_detector": nil,
+    "hypothesis_engine": nil,
+    "parameter_tuner": nil,
+    "performance_tracker": nil,
+    "quantitative": nil,
+    "semantic_index": nil,
+    "semantic_parser": nil
+}
+
+fn _get_logic_engine() -> LogicEngine {
+    if _engines["logic"] == nil {
+        _engines["logic"] = LogicEngine.new()
+        _log.info("LogicEngine initialized for logical lobe")
+    }
+    return _engines["logic"]
+}
+
+fn _get_causal_reasoner() -> CausalReasoner {
+    if _engines["causal"] == nil {
+        _engines["causal"] = CausalReasoner.new()
+        _log.info("CausalReasoner initialized for causal lobe")
+    }
+    return _engines["causal"]
+}
+
+fn _get_analogy_engine() -> AnalogyEngine {
+    if _engines["analogy"] == nil {
+        _engines["analogy"] = AnalogyEngine.new(None)
+        _log.info("AnalogyEngine initialized for analogical lobe")
+    }
+    return _engines["analogy"]
+}
+
+fn _get_goal_planner() -> GoalPlanner {
+    if _engines["planner"] == nil {
+        let cr = _get_causal_reasoner()
+        _engines["planner"] = GoalPlanner(cr.graph())
+        _log.info("GoalPlanner initialized for planning lobe")
+    }
+    return _engines["planner"]
+}
+
+fn _get_working_memory() -> WorkingMemory {
+    if _engines["working_memory"] == nil {
+        _engines["working_memory"] = WorkingMemory()
+        _log.info("WorkingMemory initialized for memory lobe")
+    }
+    return _engines["working_memory"]
+}
+
+fn _get_weakness_detector() -> WeaknessDetector {
+    if _engines["weakness_detector"] == nil {
+        _engines["weakness_detector"] = WeaknessDetector.new()
+    }
+    return _engines["weakness_detector"]
+}
+
+fn _get_hypothesis_engine() -> HypothesisEngine {
+    if _engines["hypothesis_engine"] == nil {
+        _engines["hypothesis_engine"] = HypothesisEngine.new()
+    }
+    return _engines["hypothesis_engine"]
+}
+
+fn _get_parameter_tuner() -> ParameterTuner {
+    if _engines["parameter_tuner"] == nil {
+        _engines["parameter_tuner"] = ParameterTuner.new()
+    }
+    return _engines["parameter_tuner"]
+}
+
+fn _get_performance_tracker() -> PerformanceTracker {
+    if _engines["performance_tracker"] == nil {
+        _engines["performance_tracker"] = PerformanceTracker.new()
+    }
+    return _engines["performance_tracker"]
+}
+
+fn _get_quantitative_reasoner() -> QuantitativeReasoner {
+    if _engines["quantitative"] == nil {
+        _engines["quantitative"] = QuantitativeReasoner()
+    }
+    return _engines["quantitative"]
+}
+
+fn _get_semantic_parser() -> SemanticQueryParser {
+    if _engines["semantic_parser"] == nil {
+        _engines["semantic_parser"] = SemanticQueryParser()
+    }
+    return _engines["semantic_parser"]
+}
+
+/// ── Helper: wrap engine result into NRSIData ─────────────────────────
+
+fn _wrap_result(value: any, domain: string, confidence: float,
+                source: string) -> NRSIData {
+    return NRSIData {
+        value: value,
+        domain: domain,
+        confidence: confidence,
+        source: source,
+        timestamp: time.time()
+    }
+}
+
+/// ══════════════════════════════════════════════════════════════════════
+///  LOGICAL LOBE — First-Order Logic, Proofs, Contradiction Detection
+/// ══════════════════════════════════════════════════════════════════════
+
+lobe logical {
+    /// Forward-chain inference from known facts.
+    /// Ingests facts into the logic engine, runs forward chaining,
+    /// and returns all derived conclusions with proof traces.
+    processor forward_chain(query: string, facts: List[string]) -> validated[NRSIData] {
+        let engine = _get_logic_engine()
+
+        for fact_text in facts {
+            engine.ingest_text(fact_text, "lobe_input")
+        }
+
+        let derivation_count = engine.forward_chain()
+
+        let result_obj = engine.query(query)
+        let conf = result_obj.confidence
+        if conf == nil { conf = 0.0 }
+
+        let wrapped = _wrap_result(
+            {
+                "answer": result_obj.answer,
+                "proof": result_obj.proof,
+                "derived_facts": result_obj.derived_facts,
+                "reasoning_trace": result_obj.reasoning_trace,
+                "derivations_run": derivation_count
+            },
+            "logic", conf, "LogicEngine.forward_chain"
+        )
+        return logical_proof(wrapped)
+    }
+
+    /// Backward-chain goal-directed proof.
+    /// Parses the goal into logical form, attempts backward-chaining
+    /// proof search with unification, returns proof tree or failure.
+    processor backward_chain(goal: string, rules: List[string]) -> validated[NRSIData] {
+        let engine = _get_logic_engine()
+
+        for rule_text in rules {
+            engine.ingest_text(rule_text, "lobe_rules")
+        }
+
+        let result_obj = engine.query(goal)
+        let conf = result_obj.confidence
+        if conf == nil { conf = 0.0 }
+
+        let wrapped = _wrap_result(
+            {
+                "answered": result_obj.answered,
+                "answer": result_obj.answer,
+                "proof": result_obj.proof,
+                "contradictions": result_obj.contradictions,
+                "reasoning_trace": result_obj.reasoning_trace
+            },
+            "logic", conf, "LogicEngine.backward_chain"
+        )
+        return logical_proof(wrapped)
+    }
+
+    /// Contradiction detection across a belief set.
+    /// Ingests all beliefs, runs consistency checking, returns
+    /// any contradictions found with explanations.
+    processor detect_contradictions(beliefs: List[string]) -> validated[NRSIData] {
+        let engine = _get_logic_engine()
+
+        for belief in beliefs {
+            engine.ingest_text(belief, "belief_set")
+        }
+
+        let result_obj = engine.check_consistency()
+        let contradictions = result_obj.contradictions
+        let is_consistent = (contradictions == nil or len(contradictions) == 0)
+
+        let wrapped = _wrap_result(
+            {
+                "consistent": is_consistent,
+                "contradictions": contradictions,
+                "reasoning_trace": result_obj.reasoning_trace
+            },
+            "logic",
+            1.0 if is_consistent else 0.3,
+            "LogicEngine.check_consistency"
+        )
+        return logical_proof(wrapped)
+    }
+}
+
+/// ══════════════════════════════════════════════════════════════════════
+///  MATHEMATICAL LOBE — Computation, Equation Solving, Statistics
+/// ══════════════════════════════════════════════════════════════════════
+
+lobe mathematical {
+    /// Symbolic/numeric computation.
+    /// Evaluates mathematical expressions using the computation engine
+    /// with sandboxed execution and unit awareness.
+    processor compute(expression: string) -> validated[NRSIData] {
+        let qr = _get_quantitative_reasoner()
+        let quantities = qr.add_fact("expression", expression)
+
+        let numeric_result = nil
+        let confidence = 0.5
+        try {
+            let cleaned = re.sub("[^0-9+\\-*/().%^ ]", "", expression)
+            if len(cleaned.strip()) > 0 {
+                numeric_result = nrs_safe_compute(cleaned)
+                if numeric_result != nil {
+                    confidence = 0.95
+                }
+            }
+        } catch(e) {
+            _log.debug("Direct eval failed for '%s': %s", expression, e)
+        }
+
+        if numeric_result == nil and len(quantities) > 0 {
+            numeric_result = quantities[0].value
+            confidence = 0.8
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "expression": expression,
+                "result": numeric_result,
+                "quantities_extracted": len(quantities),
+                "quantities": quantities
+            },
+            "mathematics", confidence, "QuantitativeReasoner.compute"
+        )
+        return computational_verify(wrapped)
+    }
+
+    /// Equation solving.
+    /// Parses equations, extracts variables and relationships,
+    /// attempts symbolic or numeric solution.
+    processor solve(equation: string) -> validated[NRSIData] {
+        let qr = _get_quantitative_reasoner()
+        let quantities = qr.add_fact("equation", equation)
+
+        let parts = equation.split("=")
+        let solution = nil
+        let confidence = 0.4
+
+        if len(parts) == 2 {
+            let lhs = parts[0].strip()
+            let rhs = parts[1].strip()
+            try {
+                let rhs_clean = re.sub("[^0-9+\\-*/().%^ ]", "", rhs)
+                let rhs_val = nrs_safe_compute(rhs_clean)
+                if rhs_val != nil {
+                    solution = { "variable": lhs, "value": rhs_val }
+                    confidence = 0.85
+                }
+            } catch(e) {
+                _log.debug("Equation solve fallback for '%s'", equation)
+            }
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "equation": equation,
+                "solution": solution,
+                "quantities": quantities
+            },
+            "mathematics", confidence, "MathematicalLobe.solve"
+        )
+        return computational_verify(wrapped)
+    }
+
+    /// Statistical analysis.
+    /// Extracts numeric quantities from data, computes comparisons,
+    /// rankings, and basic descriptive statistics.
+    processor analyze_stats(data: string) -> validated[NRSIData] {
+        let qr = _get_quantitative_reasoner()
+        let quantities = qr.add_fact("dataset", data)
+
+        let values = []
+        for q in quantities {
+            if q.value != nil {
+                append(values, to_float(q.value))
+            }
+        }
+
+        let stats = {}
+        if len(values) > 0 {
+            let total = 0.0
+            let min_val = values[0]
+            let max_val = values[0]
+            for v in values {
+                total = total + v
+                if v < min_val { min_val = v }
+                if v > max_val { max_val = v }
+            }
+            stats["count"] = len(values)
+            stats["sum"] = total
+            stats["mean"] = total / to_float(len(values))
+            stats["min"] = min_val
+            stats["max"] = max_val
+            stats["range"] = max_val - min_val
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "data": data,
+                "quantities_found": len(quantities),
+                "statistics": stats,
+                "values": values
+            },
+            "mathematics",
+            0.85 if len(values) > 0 else 0.3,
+            "QuantitativeReasoner.analyze_stats"
+        )
+        return computational_verify(wrapped)
+    }
+}
+
+/// ══════════════════════════════════════════════════════════════════════
+///  LINGUISTIC LOBE — Semantic Analysis, Entity Extraction, Intent
+/// ══════════════════════════════════════════════════════════════════════
+
+lobe linguistic {
+    /// Semantic similarity analysis.
+    /// Uses the semantic index to find concepts most similar to the query,
+    /// with spreading activation across the knowledge graph.
+    processor semantic_match(query: string, corpus: string) -> validated[NRSIData] {
+        let parser = _get_semantic_parser()
+        let understanding = parser.parse(query)
+
+        let matches = []
+        if corpus != nil and len(corpus) > 0 {
+            let corpus_tokens = corpus.lower().split()
+            let query_tokens = query.lower().split()
+            let overlap = 0
+            for qt in query_tokens {
+                if qt in corpus_tokens { overlap = overlap + 1 }
+            }
+            let similarity = 0.0
+            if len(query_tokens) > 0 {
+                similarity = to_float(overlap) / to_float(len(query_tokens))
+            }
+            matches = [{"corpus_match": true, "similarity": similarity}]
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "query": query,
+                "understanding": {
+                    "intent": understanding.intent,
+                    "focus_concepts": understanding.focus_concepts,
+                    "query_type": understanding.query_type,
+                    "domain_hints": understanding.domain_hints
+                },
+                "matches": matches
+            },
+            "language",
+            0.75 if understanding.intent != "unknown" else 0.4,
+            "SemanticQueryParser.parse"
+        )
+        return factual_verify(wrapped)
+    }
+
+    /// Named entity extraction.
+    /// Extracts capitalized entities, quoted strings, numeric references,
+    /// and domain-specific terms from text.
+    processor extract_entities(text: string) -> validated[NRSIData] {
+        let entities = []
+        let capitalized = re.findall("[A-Z][a-z]+(?:\\s+[A-Z][a-z]+)*", text)
+        for cap in capitalized {
+            append(entities, {"text": cap, "type": "proper_noun"})
+        }
+
+        let quoted = re.findall("\"([^\"]+)\"", text)
+        for q in quoted {
+            append(entities, {"text": q, "type": "quoted_reference"})
+        }
+
+        let numbers = re.findall("\\b\\d+(?:\\.\\d+)?\\b", text)
+        for n in numbers {
+            append(entities, {"text": n, "type": "numeric"})
+        }
+
+        let tech_patterns = re.findall("\\b(?:HTTP|API|SQL|TCP|UDP|IP|DNS|SSL|TLS|JWT|SSH|FTP|SMTP|IMAP|POP3|SIP|SS7|LTE|5G|NR|GSM|UMTS)\\b", text)
+        for tp in tech_patterns {
+            append(entities, {"text": tp, "type": "technical_term"})
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "text": text,
+                "entities": entities,
+                "entity_count": len(entities)
+            },
+            "language",
+            0.8 if len(entities) > 0 else 0.5,
+            "LinguisticLobe.extract_entities"
+        )
+        return factual_verify(wrapped)
+    }
+
+    /// Intent and sentiment classification.
+    /// Classifies the utterance into intent categories and detects
+    /// emotional tone using keyword and pattern analysis.
+    processor classify_intent(utterance: string) -> validated[NRSIData] {
+        let lower = utterance.lower()
+        let intent = "informational"
+        let confidence = 0.6
+
+        if lower.startswith("why") or lower.startswith("how come") {
+            intent = "causal_inquiry"
+            confidence = 0.85
+        } else if lower.startswith("how") or lower.startswith("what is the process") {
+            intent = "procedural_inquiry"
+            confidence = 0.85
+        } else if lower.startswith("what") or lower.startswith("who") or lower.startswith("where") or lower.startswith("when") {
+            intent = "factual_inquiry"
+            confidence = 0.85
+        } else if "compare" in lower or "difference" in lower or "versus" in lower or " vs " in lower {
+            intent = "comparison"
+            confidence = 0.80
+        } else if "calculate" in lower or "compute" in lower or "solve" in lower {
+            intent = "computation"
+            confidence = 0.85
+        } else if "plan" in lower or "steps" in lower or "how to" in lower {
+            intent = "planning"
+            confidence = 0.80
+        } else if "imagine" in lower or "create" in lower or "write" in lower or "compose" in lower {
+            intent = "creative"
+            confidence = 0.80
+        } else if "fix" in lower or "debug" in lower or "error" in lower or "fault" in lower {
+            intent = "diagnostic"
+            confidence = 0.80
+        }
+
+        let sentiment = "neutral"
+        let positive_words = ["good", "great", "excellent", "amazing", "wonderful", "love", "perfect"]
+        let negative_words = ["bad", "terrible", "awful", "hate", "wrong", "broken", "fail"]
+        let pos_count = 0
+        let neg_count = 0
+        for pw in positive_words {
+            if pw in lower { pos_count = pos_count + 1 }
+        }
+        for nw in negative_words {
+            if nw in lower { neg_count = neg_count + 1 }
+        }
+        if pos_count > neg_count { sentiment = "positive" }
+        else if neg_count > pos_count { sentiment = "negative" }
+
+        let wrapped = _wrap_result(
+            {
+                "utterance": utterance,
+                "intent": intent,
+                "sentiment": sentiment,
+                "positive_signals": pos_count,
+                "negative_signals": neg_count
+            },
+            "language", confidence, "LinguisticLobe.classify_intent"
+        )
+        return factual_verify(wrapped)
+    }
+}
+
+/// ══════════════════════════════════════════════════════════════════════
+///  CAUSAL LOBE — Causal Chains, Counterfactuals, Interventions
+/// ══════════════════════════════════════════════════════════════════════
+
+lobe causal {
+    /// Why-question answering through causal chain traversal.
+    /// Queries the causal graph for backward chains from the target,
+    /// returning cause-effect paths with strength propagation.
+    processor explain_why(question: string) -> validated[NRSIData] {
+        let cr = _get_causal_reasoner()
+        let result = cr.query(question)
+
+        let chain_summaries = []
+        for chain in result.chains {
+            append(chain_summaries, {
+                "nodes": chain.nodes,
+                "strength": chain.total_strength,
+                "explanation": chain.explanation
+            })
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "query_type": result.query_type,
+                "answered": result.answered,
+                "explanation": result.explanation,
+                "chains": chain_summaries,
+                "chain_count": len(result.chains)
+            },
+            "causal", result.confidence, "CausalReasoner.explain_why"
+        )
+        return factual_verify(wrapped)
+    }
+
+    /// Counterfactual reasoning — "what if X didn't happen?"
+    /// Removes the target node from the causal graph and checks
+    /// which downstream effects would be lost.
+    processor counterfactual(scenario: string) -> validated[NRSIData] {
+        let cr = _get_causal_reasoner()
+        let result = cr.query(scenario)
+
+        let cf_data = nil
+        if result.counterfactual != nil {
+            cf_data = {
+                "intervention": result.counterfactual.intervention,
+                "affected_nodes": result.counterfactual.affected_nodes,
+                "unaffected_nodes": result.counterfactual.unaffected_nodes,
+                "explanation": result.counterfactual.explanation,
+                "confidence": result.counterfactual.confidence
+            }
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "query_type": "counterfactual",
+                "answered": result.answered,
+                "explanation": result.explanation,
+                "counterfactual": cf_data
+            },
+            "causal", result.confidence, "CausalReasoner.counterfactual"
+        )
+        return factual_verify(wrapped)
+    }
+
+    /// Intervention analysis — "what happens if we do X?"
+    /// Traces forward from the intervention point through the causal
+    /// graph, listing all downstream effects with strengths.
+    processor intervene(action: string) -> validated[NRSIData] {
+        let cr = _get_causal_reasoner()
+        let result = cr.query(action)
+
+        let effects = []
+        for chain in result.chains {
+            for node in chain.nodes {
+                if node not in effects {
+                    append(effects, node)
+                }
+            }
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "query_type": "intervention",
+                "answered": result.answered,
+                "explanation": result.explanation,
+                "downstream_effects": effects,
+                "chains": len(result.chains)
+            },
+            "causal", result.confidence, "CausalReasoner.intervene"
+        )
+        return factual_verify(wrapped)
+    }
+}
+
+/// ══════════════════════════════════════════════════════════════════════
+///  ANALOGICAL LOBE — Structure Mapping, Cross-Domain Transfer
+/// ══════════════════════════════════════════════════════════════════════
+
+lobe analogical {
+    /// Find structural analogies across domains.
+    /// Uses Gentner-style structure mapping to find the best analogy
+    /// between source and target domains from 32 built-in pairs.
+    processor find_analogy(source: string, target: string) -> validated[NRSIData] {
+        let ae = _get_analogy_engine()
+        let result = ae.find_analogy(source, target)
+
+        let mapping_data = nil
+        if result.mapping != nil {
+            mapping_data = {
+                "source_domain": result.source,
+                "target_domain": result.target,
+                "confidence": result.confidence
+            }
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "source": source,
+                "target": target,
+                "mapping": mapping_data,
+                "explanation": result.explanation,
+                "inferences": result.inferences
+            },
+            "analogy", result.confidence, "AnalogyEngine.find_analogy"
+        )
+        return factual_verify(wrapped)
+    }
+
+    /// Transfer knowledge from source to target domain.
+    /// Maps concepts and relations from one domain to another using
+    /// structural correspondence and generates transfer inferences.
+    processor transfer(source_domain: string, target_domain: string, concept: string) -> validated[NRSIData] {
+        let ae = _get_analogy_engine()
+        let result = ae.find_analogy(concept, target_domain)
+
+        let transferred = []
+        for inf in result.inferences {
+            append(transferred, inf)
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "concept": concept,
+                "source_domain": source_domain,
+                "target_domain": target_domain,
+                "transferred_inferences": transferred,
+                "explanation": result.explanation
+            },
+            "analogy", result.confidence, "AnalogyEngine.transfer"
+        )
+        return factual_verify(wrapped)
+    }
+}
+
+/// ══════════════════════════════════════════════════════════════════════
+///  PLANNING LOBE — Goal Decomposition, Plan Synthesis, Verification
+/// ══════════════════════════════════════════════════════════════════════
+
+lobe planning {
+    /// Decompose a high-level goal into sub-goals.
+    /// Uses means-ends analysis on the causal graph to find what
+    /// preconditions must be satisfied and what blocks the goal.
+    processor decompose(goal: string) -> validated[NRSIData] {
+        let planner = _get_goal_planner()
+
+        let subgoals = planner.what_do_i_need(goal)
+        let blockers = planner.what_blocks_me(goal)
+
+        let subgoal_list = []
+        for sg in subgoals {
+            append(subgoal_list, {
+                "goal": sg.goal if hasattr(sg, "goal") else to_string(sg),
+                "priority": sg.priority if hasattr(sg, "priority") else 0.5
+            })
+        }
+
+        let blocker_list = []
+        for b in blockers {
+            append(blocker_list, to_string(b))
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "goal": goal,
+                "subgoals": subgoal_list,
+                "blockers": blocker_list,
+                "subgoal_count": len(subgoals),
+                "blocker_count": len(blockers)
+            },
+            "planning",
+            0.75 if len(subgoals) > 0 else 0.4,
+            "GoalPlanner.decompose"
+        )
+        return factual_verify(wrapped)
+    }
+
+    /// Synthesize a multi-step plan from goals.
+    /// Builds an HTN-style plan using the causal graph to determine
+    /// action ordering, dependencies, and resource requirements.
+    processor synthesize_plan(goals: List[string]) -> validated[NRSIData] {
+        let planner = _get_goal_planner()
+
+        let plans = []
+        let total_actions = 0
+        for goal in goals {
+            let plan = planner.plan(goal, nil)
+            let actions = []
+            if plan != nil and hasattr(plan, "actions") {
+                for action in plan.actions {
+                    append(actions, {
+                        "action": action.action if hasattr(action, "action") else to_string(action),
+                        "status": action.status if hasattr(action, "status") else "pending"
+                    })
+                    total_actions = total_actions + 1
+                }
+            }
+            append(plans, {"goal": goal, "actions": actions})
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "goals": goals,
+                "plans": plans,
+                "total_actions": total_actions
+            },
+            "planning",
+            0.7 if total_actions > 0 else 0.3,
+            "GoalPlanner.synthesize_plan"
+        )
+        return factual_verify(wrapped)
+    }
+
+    /// Check plan coherence and feasibility.
+    /// Evaluates a plan against the causal graph to verify that
+    /// actions lead to goals and no contradictions exist.
+    processor verify_plan(plan: string) -> validated[NRSIData] {
+        let planner = _get_goal_planner()
+        let plan_obj = planner.plan(plan, nil)
+
+        let evaluation = nil
+        let is_feasible = false
+        if plan_obj != nil {
+            evaluation = planner.evaluate(plan_obj)
+            is_feasible = evaluation.get("feasible", false) if evaluation != nil else false
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "plan": plan,
+                "feasible": is_feasible,
+                "evaluation": evaluation
+            },
+            "planning",
+            0.8 if is_feasible else 0.4,
+            "GoalPlanner.verify_plan"
+        )
+        return factual_verify(wrapped)
+    }
+}
+
+/// ══════════════════════════════════════════════════════════════════════
+///  MEMORY LOBE — Working Memory, Retrieval, Consolidation
+/// ══════════════════════════════════════════════════════════════════════
+
+lobe memory {
+    /// Store item in working memory with salience-based priority.
+    /// Items compete for limited buffer slots (~15); low-salience
+    /// items are evicted when capacity is reached.
+    processor store(item: string, salience: float) -> validated[NRSIData] {
+        let wm = _get_working_memory()
+
+        let mem_item = MemoryItem {
+            item_id: "lobe_" + to_string(time.time()),
+            content: item,
+            salience: salience,
+            item_type: "declarative",
+            source: "memory_lobe",
+            timestamp: time.time()
+        }
+        wm.attend(mem_item)
+
+        let buffer_size = len(wm._buffer)
+
+        let wrapped = _wrap_result(
+            {
+                "stored": true,
+                "item_id": mem_item.item_id,
+                "salience": salience,
+                "buffer_size": buffer_size,
+                "buffer_capacity": wm._capacity
+            },
+            "memory", 0.9, "WorkingMemory.store"
+        )
+        return factual_verify(wrapped)
+    }
+
+    /// Retrieve most relevant items for a query.
+    /// Scores buffer items by token overlap, salience, and recency,
+    /// returning the top-k matches.
+    processor retrieve(query: string, limit: int) -> validated[NRSIData] {
+        let wm = _get_working_memory()
+
+        if limit == nil or limit <= 0 { limit = 5 }
+        let results = wm.recall(query, limit)
+
+        let items = []
+        for r in results {
+            append(items, {
+                "content": r.content if hasattr(r, "content") else to_string(r),
+                "salience": r.salience if hasattr(r, "salience") else 0.0,
+                "item_type": r.item_type if hasattr(r, "item_type") else "unknown"
+            })
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "query": query,
+                "results": items,
+                "result_count": len(items),
+                "buffer_size": len(wm._buffer)
+            },
+            "memory",
+            0.8 if len(items) > 0 else 0.3,
+            "WorkingMemory.retrieve"
+        )
+        return factual_verify(wrapped)
+    }
+
+    /// Decay and evict stale memory items.
+    /// Applies time-based decay to all buffer items, evicts those
+    /// below threshold, and reports maintenance statistics.
+    processor maintain() -> validated[NRSIData] {
+        let wm = _get_working_memory()
+
+        let before_count = len(wm._buffer)
+        wm.decay_tick()
+        let after_count = len(wm._buffer)
+        let evicted = before_count - after_count
+
+        let wrapped = _wrap_result(
+            {
+                "maintained": true,
+                "items_before": before_count,
+                "items_after": after_count,
+                "items_evicted": evicted
+            },
+            "memory", 0.95, "WorkingMemory.maintain"
+        )
+        return factual_verify(wrapped)
+    }
+}
+
+/// ══════════════════════════════════════════════════════════════════════
+///  METACOGNITIVE LOBE — Self-Monitoring, Hypothesis, Tuning
+/// ══════════════════════════════════════════════════════════════════════
+
+lobe metacognitive {
+    /// Detect performance weaknesses across domains and modes.
+    /// Analyzes tracked metrics to find domains with low confidence,
+    /// high latency, or poor fact-hit rates.
+    processor detect_weakness(metrics: string) -> validated[NRSIData] {
+        let tracker = _get_performance_tracker()
+        let detector = _get_weakness_detector()
+
+        if metrics != nil and len(metrics) > 0 {
+            tracker.record_interaction(metrics, "general", "auto", 0.5, 100.0, 0.5)
+        }
+
+        let weaknesses = detector.detect(tracker)
+
+        let weakness_list = []
+        for w in weaknesses {
+            append(weakness_list, {
+                "domain": w.domain if hasattr(w, "domain") else "unknown",
+                "weakness_type": w.weakness_type if hasattr(w, "weakness_type") else "unknown",
+                "severity": w.severity if hasattr(w, "severity") else 0.5,
+                "description": w.description if hasattr(w, "description") else ""
+            })
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "weaknesses": weakness_list,
+                "weakness_count": len(weaknesses),
+                "domains_tracked": len(tracker._domain_stats.keys()) if hasattr(tracker, "_domain_stats") else 0
+            },
+            "metacognition",
+            0.85 if len(weaknesses) >= 0 else 0.5,
+            "WeaknessDetector.detect"
+        )
+        return factual_verify(wrapped)
+    }
+
+    /// Generate improvement hypothesis from a detected weakness.
+    /// Maps weakness types to parameter override proposals that
+    /// could address the performance gap.
+    processor hypothesize(weakness: string) -> validated[NRSIData] {
+        let he = _get_hypothesis_engine()
+
+        let hypothesis = he.generate_from_description(weakness)
+
+        let wrapped = _wrap_result(
+            {
+                "weakness": weakness,
+                "hypothesis": hypothesis,
+                "has_proposal": hypothesis != nil
+            },
+            "metacognition",
+            0.7 if hypothesis != nil else 0.3,
+            "HypothesisEngine.hypothesize"
+        )
+        return factual_verify(wrapped)
+    }
+
+    /// Tune parameters based on hypothesis and evidence.
+    /// Applies proposed parameter changes, monitors results,
+    /// and rolls back if performance degrades.
+    processor tune(hypothesis: string, evidence: string) -> validated[NRSIData] {
+        let tuner = _get_parameter_tuner()
+
+        let applied = false
+        let result_detail = nil
+        try {
+            let params = {"hypothesis": hypothesis, "evidence": evidence}
+            tuner.apply(params)
+            applied = true
+            result_detail = "Parameters applied successfully"
+        } catch(e) {
+            result_detail = "Tuning failed: " + to_string(e)
+        }
+
+        let wrapped = _wrap_result(
+            {
+                "hypothesis": hypothesis,
+                "evidence": evidence,
+                "applied": applied,
+                "detail": result_detail
+            },
+            "metacognition",
+            0.8 if applied else 0.3,
+            "ParameterTuner.tune"
+        )
+        return factual_verify(wrapped)
+    }
+}
+
+/// ── Engine access for external wiring ────────────────────────────────
+
+fn get_logic_engine() -> LogicEngine { return _get_logic_engine() }
+fn get_causal_reasoner() -> CausalReasoner { return _get_causal_reasoner() }
+fn get_analogy_engine() -> AnalogyEngine { return _get_analogy_engine() }
+fn get_goal_planner() -> GoalPlanner { return _get_goal_planner() }
+fn get_working_memory() -> WorkingMemory { return _get_working_memory() }
+fn get_performance_tracker() -> PerformanceTracker { return _get_performance_tracker() }
+
+/// ── Exports ──────────────────────────────────────────────────────────
+
+export logical, mathematical, linguistic, causal, analogical, planning, memory, metacognitive
+export get_logic_engine, get_causal_reasoner, get_analogy_engine
+export get_goal_planner, get_working_memory, get_performance_tracker

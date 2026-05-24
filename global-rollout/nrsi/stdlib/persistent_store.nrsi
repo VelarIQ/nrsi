@@ -1,0 +1,568 @@
+/// NRS Persistent Knowledge Store — Redis-backed durable storage.
+///
+/// Uses Redis infrastructure deployed across every NRS service.
+/// Falls back to in-memory dicts when Redis is unavailable.
+///
+/// Persists: CausalGraph, Bayesian beliefs, web knowledge, credibility,
+/// user profiles, conversation history, coherence commitments.
+///
+/// Key namespace: nrs:knowledge:{table}:{id}
+///
+/// Ported from nrsip/persistent_store.py.
+
+module persistent_store
+
+
+import time from "std/time"
+import log from "logging"
+import json from "std/json"
+import os from "std/os"
+
+let REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+let REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+let REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
+let REDIS_DB = int(os.environ.get("NRS_KNOWLEDGE_REDIS_DB", "2"))
+let KEY_PREFIX = "nrs:knowledge"
+
+/// ── Knowledge Store ──
+
+fn _redis_client() -> any {
+    try {
+        import redis from "std/redis"
+        return redis.Redis(
+            host: REDIS_HOST, port: REDIS_PORT,
+            password: REDIS_PASSWORD, db: REDIS_DB,
+            decode_responses: true, socket_connect_timeout: 3
+        )
+    } catch(e) {
+        return nil
+    }
+}
+
+class KnowledgeStore {
+    fn __init__(self, redis_client: any = nil) {
+        if redis_client != nil {
+            self._redis = redis_client
+        } else {
+            self._redis = _redis_client()
+        }
+        self._fallback = false
+        self._mem = {}
+
+        if self._redis == nil {
+            self._fallback = true
+        } else {
+            try {
+                self._redis.ping()
+                log.info("Knowledge store connected to Redis " + REDIS_HOST + ":" +
+                         to_string(REDIS_PORT) + " db=" + to_string(REDIS_DB))
+            } catch(e) {
+                log.warn("Redis unavailable (" + to_string(e) + ") — using in-memory fallback")
+                self._fallback = true
+                self._redis = nil
+            }
+        }
+    }
+
+    fn _key(self, table: string, item_id: string) -> string {
+        return KEY_PREFIX + ":" + table + ":" + item_id
+    }
+
+    fn _hset(self, table: string, item_id: string,
+             data: Map[string, string], ttl: Optional[int]) {
+        let key = self._key(table, item_id)
+        if self._fallback {
+            self._mem[key] = data
+        } else {
+            let pipe = self._redis.pipeline()
+            pipe.hset(key, data)
+            if ttl != nil {
+                pipe.expire(key, ttl)
+            }
+            pipe.execute()
+        }
+    }
+
+    fn _hget(self, table: string, item_id: string) -> Optional[Map[string, string]] {
+        let key = self._key(table, item_id)
+        if self._fallback {
+            return self._mem.get(key, nil)
+        }
+        let data = self._redis.hgetall(key)
+        if data == nil {
+            return nil
+        }
+        if data.len() == 0 {
+            return nil
+        }
+        return data
+    }
+
+    fn _hdel(self, table: string, item_id: string) {
+        let key = self._key(table, item_id)
+        if self._fallback {
+            self._mem.pop(key, nil)
+        } else {
+            self._redis.delete(key)
+        }
+    }
+
+    fn _scan_table(self, table: string, count: int) -> List[any] {
+        let pattern = KEY_PREFIX + ":" + table + ":"
+        let prefix_len = pattern.len()
+        if self._fallback {
+            let keys = []
+            for k in self._mem.keys() {
+                if k.startswith(pattern) {
+                    keys.append(k.slice(prefix_len, k.len()))
+                    if keys.len() >= count {
+                        break
+                    }
+                }
+            }
+            return keys
+        }
+        let keys = []
+        let cursor = 0
+        while keys.len() < count {
+            let result = self._redis.scan(cursor, pattern + "*", 200)
+            cursor = result[0]
+            for k in result[1] {
+                let key_str = to_string(k)
+                keys.append(key_str.slice(prefix_len, key_str.len()))
+            }
+            if cursor == 0 {
+                break
+            }
+        }
+        if keys.len() > count {
+            return keys.slice(0, count)
+        }
+        return keys
+    }
+
+    fn _table_count(self, table: string) -> int {
+        if self._fallback {
+            let prefix = KEY_PREFIX + ":" + table + ":"
+            let count = 0
+            for k in self._mem.keys() {
+                if k.startswith(prefix) {
+                    count += 1
+                }
+            }
+            return count
+        }
+        return self._scan_table(table, 100000).len()
+    }
+
+    /// ── Graph Persistence ──
+
+    fn save_graph(self, graph: any) -> any {
+        let t0 = time.time()
+        let node_count = 0
+        for nid in graph._nodes.keys() {
+            let node = graph._nodes[nid]
+            let data = {
+                "label": to_string(node.label),
+                "domain": to_string(node.domain),
+                "properties": json.dumps(node.properties, false)
+            }
+            if self._fallback {
+                self._mem[self._key("node", nid)] = data
+            } else {
+                self._redis.hset(self._key("node", nid), data)
+            }
+            node_count += 1
+        }
+
+        let edge_count = 0
+        for eid in graph._edges.keys() {
+            let edge = graph._edges[eid]
+            let rel = to_string(edge.relation)
+            let data = {
+                "source": edge.source,
+                "target": edge.target,
+                "relation": rel,
+                "confidence": to_string(edge.confidence),
+                "domain": edge.domain,
+                "evidence": edge.evidence,
+                "fact_id": to_string(edge.fact_id)
+            }
+            if self._fallback {
+                self._mem[self._key("edge", eid)] = data
+            } else {
+                self._redis.hset(self._key("edge", eid), data)
+            }
+            edge_count += 1
+        }
+
+        let elapsed = time.time() - t0
+        log.info("Saved graph to Redis: " + to_string(node_count) + " nodes, " +
+                 to_string(edge_count) + " edges in " + to_string(elapsed) + "s")
+        return {
+            "nodes": node_count,
+            "edges": edge_count
+        }
+    }
+
+    fn load_graph(self, graph: any) -> any {
+        let node_ids = self._scan_table("node", 50000)
+        let node_count = 0
+        for nid in node_ids {
+            let data = self._hget("node", nid)
+            if data != nil {
+                if graph._nodes.get(nid, nil) == nil {
+                    graph.add_node(nid, data.get("domain", "general"))
+                    node_count += 1
+                }
+            }
+        }
+
+        let edge_ids = self._scan_table("edge", 50000)
+        let edge_count = 0
+        for eid in edge_ids {
+            let data = self._hget("edge", eid)
+            if data == nil {
+                continue
+            }
+            let source = data.get("source", "")
+            let target = data.get("target", "")
+            if source != "" {
+                if target != "" {
+                    graph.add_edge(source, target, data.get("relation", "RELATED_TO"),
+                                   to_float(data.get("confidence", "0.5")),
+                                   data.get("domain", "general"),
+                                   data.get("evidence", ""),
+                                   data.get("fact_id", ""))
+                    edge_count += 1
+                }
+            }
+        }
+
+        log.info("Loaded graph from Redis: " + to_string(node_count) + " nodes, " +
+                 to_string(edge_count) + " edges")
+        return { "nodes": node_count, "edges": edge_count }
+    }
+
+    /// ── Bayesian State Persistence ──
+
+    fn save_bayesian_states(self, confidence_mgr: any) -> int {
+        let beliefs = confidence_mgr._updater._beliefs
+        let count = 0
+        for prop_id in beliefs.keys() {
+            let state = beliefs[prop_id]
+            let data = {
+                "prior": to_string(state.prior),
+                "posterior": to_string(state.posterior),
+                "log_odds": to_string(state._log_odds),
+                "uncertainty": to_string(state.uncertainty),
+                "evidence_count": to_string(state.evidence_count)
+            }
+            self._hset("bayesian", prop_id, data, nil)
+            count += 1
+        }
+        return count
+    }
+
+    fn load_bayesian_states(self, confidence_mgr: any) -> int {
+        let beliefs = confidence_mgr._updater._beliefs
+        let state_ids = self._scan_table("bayesian", 50000)
+        let count = 0
+        for prop_id in state_ids {
+            if beliefs.get(prop_id, nil) != nil {
+                continue
+            }
+            let data = self._hget("bayesian", prop_id)
+            if data == nil {
+                continue
+            }
+            beliefs[prop_id] = {
+                "proposition_id": prop_id,
+                "prior": to_float(data.get("prior", "0.5")),
+                "posterior": to_float(data.get("posterior", "0.5")),
+                "_log_odds": to_float(data.get("log_odds", "0.0"))
+            }
+            count += 1
+        }
+        return count
+    }
+
+    /// ── Credibility Persistence ──
+
+    fn save_credibility(self, credibility_tracker: any) -> int {
+        let count = 0
+        let domain_history = credibility_tracker._domain_history
+        for domain in domain_history.keys() {
+            let cred = domain_history[domain]
+            let data = {
+                "trust_score": to_string(cred.get("trust_score", 0.5)),
+                "total": to_string(cred.get("total", 0)),
+                "accepted": to_string(cred.get("accepted", 0)),
+                "rejected": to_string(cred.get("rejected", 0))
+            }
+            self._hset("credibility", domain, data, nil)
+            count += 1
+        }
+        return count
+    }
+
+    /// ── Web Knowledge Persistence ──
+
+    fn save_web_fact(self, fact_id: string, subject: string, relation: string,
+                     target: string, confidence: float, source_url: string,
+                     source_domain: string, credibility: float,
+                     ingested: bool) {
+        let ingested_str = "0"
+        if ingested {
+            ingested_str = "1"
+        }
+        self._hset("webfact", fact_id, {
+            "subject": subject, "relation": relation, "target": target,
+            "confidence": to_string(confidence), "source_url": source_url,
+            "source_domain": source_domain, "credibility": to_string(credibility),
+            "extracted_at": to_string(time.time()), "ingested": ingested_str
+        }, nil)
+    }
+
+    fn get_web_facts(self, min_confidence: float, limit: int) -> List[any] {
+        let fact_ids = self._scan_table("webfact", limit * 2)
+        let results = []
+        for fid in fact_ids {
+            let data = self._hget("webfact", fid)
+            if data != nil {
+                if to_float(data.get("confidence", "0")) >= min_confidence {
+                    let result = {}
+                    for k in data.keys() {
+                        result[k] = data[k]
+                    }
+                    result["fact_id"] = fid
+                    results.append(result)
+                    if results.len() >= limit {
+                        break
+                    }
+                }
+            }
+        }
+        return results
+    }
+
+    /// ── User Profile Persistence ──
+
+    fn save_user_profile(self, user_id: string, profile: Map[string, any]) {
+        self._hset("user", user_id, {
+            "display_name": to_string(profile.get("display_name", "")),
+            "preferences": json.dumps(profile.get("preferences", {}), false),
+            "belief_snapshot": json.dumps(profile.get("belief_snapshot", {}), false),
+            "interaction_count": to_string(profile.get("interaction_count", 0)),
+            "domains_of_interest": json.dumps(profile.get("domains_of_interest", []), false),
+            "first_seen": to_string(profile.get("first_seen", time.time())),
+            "last_seen": to_string(time.time()),
+            "credibility_score": to_string(profile.get("credibility_score", 0.5))
+        }, nil)
+    }
+
+    fn load_user_profile(self, user_id: string) -> Optional[Map[string, any]] {
+        let data = self._hget("user", user_id)
+        if data == nil {
+            return nil
+        }
+        return {
+            "user_id": user_id,
+            "display_name": data.get("display_name", ""),
+            "preferences": json.loads(data.get("preferences", "{}")),
+            "belief_snapshot": json.loads(data.get("belief_snapshot", "{}")),
+            "interaction_count": to_int(data.get("interaction_count", "0")),
+            "domains_of_interest": json.loads(data.get("domains_of_interest", "[]")),
+            "first_seen": to_float(data.get("first_seen", "0")),
+            "last_seen": to_float(data.get("last_seen", "0")),
+            "credibility_score": to_float(data.get("credibility_score", "0.5"))
+        }
+    }
+
+    fn list_users(self) -> List[any] {
+        return self._scan_table("user", 1000)
+    }
+
+    /// ── Conversation History ──
+
+    fn save_conversation_turn(self, user_id: string, session_id: string,
+                              role: string, content: string,
+                              concepts: Optional[List[string]], confidence: float) -> string {
+        let now = time.time()
+        let turn_id = session_id + ":" + to_string(now)
+        let c = concepts
+        if c == nil {
+            c = []
+        }
+        let data = {
+            "user_id": user_id, "session_id": session_id,
+            "role": role, "content": content,
+            "concepts": json.dumps(c, false),
+            "confidence": to_string(confidence),
+            "timestamp": to_string(now)
+        }
+        self._hset("conv", turn_id, data, 86400 * 30)
+
+        let list_key = KEY_PREFIX + ":conv_index:" + session_id
+        if self._fallback {
+            let existing = self._mem.get(list_key, {})
+            existing[turn_id] = to_string(now)
+            self._mem[list_key] = existing
+        } else {
+            self._redis.zadd(list_key, turn_id, now)
+            self._redis.expire(list_key, 86400 * 30)
+        }
+
+        return turn_id
+    }
+
+    fn get_conversation_history(self, user_id: string, session_id: string,
+                                limit: int) -> List[any] {
+        let turn_ids = []
+        if session_id != "" {
+            let list_key = KEY_PREFIX + ":conv_index:" + session_id
+            if self._fallback {
+                let index = self._mem.get(list_key, {})
+                let pairs = []
+                for k in index.keys() {
+                    pairs.append(Tuple(k, to_float(index[k])))
+                }
+                pairs.sort_by(fn(p: Tuple[string, float]) -> float { return -p[1] })
+                for i in range(0, min(pairs.len(), limit)) {
+                    turn_ids.append(pairs[i][0])
+                }
+            } else {
+                turn_ids = self._redis.zrevrange(list_key, 0, limit - 1)
+            }
+        } else {
+            turn_ids = self._scan_table("conv", limit)
+        }
+
+        let results = []
+        for tid in turn_ids {
+            let data = self._hget("conv", tid)
+            if data != nil {
+                if user_id != "" {
+                    if data.get("user_id", "") != user_id {
+                        continue
+                    }
+                }
+                let result = {}
+                for k in data.keys() {
+                    result[k] = data[k]
+                }
+                result["concepts"] = json.loads(data.get("concepts", "[]"))
+                result["turn_id"] = tid
+                results.append(result)
+            }
+        }
+        return results
+    }
+
+    /// ── Coherence Commitments ──
+
+    fn save_commitment(self, commitment_id: string, session_id: string,
+                       subject: string, relation: string, obj: string,
+                       confidence: float) {
+        self._hset("commitment", commitment_id, {
+            "session_id": session_id, "subject": subject,
+            "relation": relation, "obj": obj,
+            "timestamp": to_string(time.time()),
+            "confidence": to_string(confidence)
+        }, nil)
+    }
+
+    fn get_commitments(self, session_id: string, limit: int) -> List[any] {
+        let ids = self._scan_table("commitment", limit * 2)
+        let results = []
+        for cid in ids {
+            let data = self._hget("commitment", cid)
+            if data != nil {
+                if session_id != "" {
+                    if data.get("session_id", "") != session_id {
+                        continue
+                    }
+                }
+                let result = {}
+                for k in data.keys() {
+                    result[k] = data[k]
+                }
+                result["commitment_id"] = cid
+                results.append(result)
+                if results.len() >= limit {
+                    break
+                }
+            }
+        }
+        return results
+    }
+
+    /// ── Unified Save/Load ──
+
+    fn save_all(self, graph: Optional[any], confidence_mgr: Optional[any],
+                credibility_tracker: Optional[any]) -> any {
+        let stats = {}
+        if graph != nil {
+            stats["graph"] = self.save_graph(graph)
+        }
+        if confidence_mgr != nil {
+            stats["bayesian"] = self.save_bayesian_states(confidence_mgr)
+        }
+        if credibility_tracker != nil {
+            stats["credibility"] = self.save_credibility(credibility_tracker)
+        }
+        stats["timestamp"] = time.time()
+        if self._fallback {
+            stats["backend"] = "in-memory"
+        } else {
+            stats["backend"] = "redis"
+        }
+        return stats
+    }
+
+    fn load_all(self, graph: Optional[any], confidence_mgr: Optional[any]) -> any {
+        let stats = {}
+        if graph != nil {
+            stats["graph"] = self.load_graph(graph)
+        }
+        if confidence_mgr != nil {
+            stats["bayesian"] = self.load_bayesian_states(confidence_mgr)
+        }
+        stats["timestamp"] = time.time()
+        if self._fallback {
+            stats["backend"] = "in-memory"
+        } else {
+            stats["backend"] = "redis"
+        }
+        return stats
+    }
+
+    /// ── Stats ──
+
+    fn stats(self) -> any {
+        let tables = [ "node", "edge", "bayesian", "credibility",
+                                     "webfact", "user", "conv", "commitment" ]
+        let counts = {}
+        for t in tables {
+            counts[t] = self._table_count(t)
+        }
+        let backend = "in-memory"
+        if !self._fallback {
+            backend = "redis"
+        }
+        return {
+            "backend": backend,
+            "redis_host": REDIS_HOST,
+            "redis_db": REDIS_DB,
+            "counts": counts
+        }
+    }
+
+    fn close(self) {
+        if self._redis != nil {
+            self._redis.close()
+        }
+    }
+}
+
+export KnowledgeStore

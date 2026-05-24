@@ -1,0 +1,719 @@
+/// NRS Orchestration Layer — built on NRSI trust pipeline.
+///
+/// Every request enters as raw[T] and must earn trust through validation
+/// before reaching a downstream service. Features: correlation IDs,
+/// latency budgets, circuit breakers, retry with exponential backoff,
+/// NRSI trust elevation, SSRF guard, source reputation tracking.
+///
+/// Ported from nrsip/orchestrator.py.
+
+module orchestrator
+
+
+import time from "std/time"
+import log from "logging"
+import hashlib from "std/hashlib"
+import uuid from "std/uuid"
+import TrustLevel, NRSIData, nrsi_raw,
+       confidence_validate from "nrs_types"
+
+let CONFIDENCE_MEDIUM = 0.80
+let CONFIDENCE_LOW = 0.50
+import ValidationError, TrustError, ConfidenceError from "nrs_errors"
+
+/// ── Service Modality ──
+
+enum Modality {
+    TEXT = "text",
+    IMAGE = "image",
+    AUDIO = "audio",
+    VIDEO = "video",
+    CODE = "code",
+    IMAGE_GEN = "image_gen",
+    AUDIO_GEN = "audio_gen",
+    VIDEO_GEN = "video_gen",
+    MULTIMODAL = "multimodal"
+}
+
+enum RouteStatus {
+    SUCCESS = "success",
+    DEGRADED = "degraded",
+    CIRCUIT_OPEN = "circuit_open",
+    TIMEOUT = "timeout",
+    ERROR = "error"
+}
+
+/// ── Trace Span ──
+
+type TraceSpan {
+    span_id: string,
+    parent_id: string,
+    operation: string,
+    service: string,
+    start_ms: float,
+    end_ms: float,
+    status: string,
+    tags: Map[string, string],
+    events: List[Map[string, any]]
+}
+
+fn make_trace_span(operation: string, service: string, parent_id: string) -> TraceSpan {
+    return TraceSpan {
+        span_id: uuid.uuid4().hex.slice(0, 12),
+        parent_id: parent_id,
+        operation: operation,
+        service: service,
+        start_ms: time.time() * 1000.0,
+        end_ms: 0.0,
+        status: "ok",
+        tags: {},
+        events: []
+    }
+}
+
+fn span_duration_ms(s: TraceSpan) -> float {
+    if s.end_ms > 0.0 {
+        return s.end_ms - s.start_ms
+    }
+    return 0.0
+}
+
+fn span_to_dict(s: TraceSpan) -> any {
+    return {
+        "span_id": s.span_id, "parent_id": s.parent_id,
+        "operation": s.operation, "service": s.service,
+        "duration_ms": round(span_duration_ms(s), 2),
+        "status": s.status, "tags": s.tags, "events": s.events
+    }
+}
+
+/// ── Request Trace ──
+
+class RequestTrace {
+    fn init(self, request_id: string, modality: string) {
+        self.correlation_id = uuid.uuid4().hex.slice(0, 16)
+        self.request_id = request_id
+        self.modality = modality
+        self.created_at_ms = time.time() * 1000.0
+        self.spans = []
+        self.source_provenance = {}
+        self.evidence_chain = []
+        self.nrsi_provenance = []
+    }
+
+    fn new_span(self, operation: string, service: string,
+                parent_id: string) -> TraceSpan {
+        let pid = parent_id
+        if pid == "" {
+            if self.spans.len() > 0 {
+                pid = self.spans[self.spans.len() - 1].span_id
+            }
+        }
+        let span = make_trace_span(operation, service, pid)
+        self.spans.append(span)
+        return span
+    }
+
+    fn close_span(self, span: TraceSpan, status: string) {
+        span.end_ms = time.time() * 1000.0
+        span.status = status
+    }
+
+    fn add_evidence(self, source: string, evidence_type: string, data: any) {
+        self.evidence_chain.append({
+            "source": source, "type": evidence_type,
+            "data": data, "ts_ms": to_int(time.time() * 1000.0)
+        })
+    }
+
+    fn record_nrsi_trust(self, nrsi_data: NRSIData) {
+        self.nrsi_provenance.append({
+            "trust_level": nrsi_data.trust_level().name,
+            "confidence": nrsi_data.confidence(),
+            "provenance_len": nrsi_data.provenance().len(),
+            "ts_ms": to_int(time.time() * 1000.0)
+        })
+    }
+
+    fn total_duration_ms(self) -> float {
+        if self.spans.len() == 0 {
+            return 0.0
+        }
+        return time.time() * 1000.0 - self.created_at_ms
+    }
+
+    fn to_dict(self) -> any {
+        let span_dicts = []
+        for s in self.spans {
+            span_dicts.append(span_to_dict(s))
+        }
+        return {
+            "correlation_id": self.correlation_id,
+            "request_id": self.request_id,
+            "modality": self.modality,
+            "total_duration_ms": round(self.total_duration_ms(), 2),
+            "span_count": self.spans.len(),
+            "spans": span_dicts,
+            "source_provenance": self.source_provenance,
+            "evidence_chain": self.evidence_chain,
+            "nrsi_provenance": self.nrsi_provenance
+        }
+    }
+}
+
+/// ── Latency Budget ──
+
+class LatencyBudget {
+    fn init(self, total_ms: float) {
+        self.total_ms = total_ms
+        self.stages = {}
+        self._start = time.monotonic() * 1000.0
+    }
+
+    fn remaining_ms(self) -> float {
+        let elapsed = time.monotonic() * 1000.0 - self._start
+        let r = self.total_ms - elapsed
+        if r < 0.0 {
+            return 0.0
+        }
+        return r
+    }
+
+    fn elapsed_ms(self) -> float {
+        return time.monotonic() * 1000.0 - self._start
+    }
+
+    fn exhausted(self) -> bool {
+        return self.remaining_ms() <= 0.0
+    }
+
+    fn allocate(self, stage: string, fraction: float) -> float {
+        let allocation = self.remaining_ms() * fraction
+        self.stages[stage] = allocation
+        return allocation
+    }
+
+    fn record(self, stage: string, actual_ms: float) {
+        self.stages[stage + "_actual"] = actual_ms
+    }
+}
+
+/// ── Circuit Breaker ──
+
+enum CircuitState {
+    CLOSED = "closed",
+    OPEN = "open",
+    HALF_OPEN = "half_open"
+}
+
+class CircuitBreaker {
+    fn init(self, name: string, failure_threshold: int,
+            recovery_window_s: float, half_open_max: int) {
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_window_s = recovery_window_s
+        self.half_open_max = half_open_max
+        self._failure_count = 0
+        self._success_count = 0
+        self._state = CircuitState.CLOSED
+        self._last_failure_at = 0.0
+        self._half_open_attempts = 0
+    }
+
+    fn state(self) -> CircuitState {
+        if self._state == CircuitState.OPEN {
+            if time.time() - self._last_failure_at > self.recovery_window_s {
+                self._state = CircuitState.HALF_OPEN
+                self._half_open_attempts = 0
+            }
+        }
+        return self._state
+    }
+
+    fn record_success(self) {
+        if self._state == CircuitState.HALF_OPEN {
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+        }
+        self._success_count += 1
+    }
+
+    fn record_failure(self) {
+        self._failure_count += 1
+        self._last_failure_at = time.time()
+        if self._failure_count >= self.failure_threshold {
+            self._state = CircuitState.OPEN
+            log.warn("Circuit " + self.name + " OPEN after " +
+                     to_string(self._failure_count) + " failures")
+        }
+    }
+
+    fn allow_request(self) -> bool {
+        let s = self.state()
+        if s == CircuitState.CLOSED {
+            return true
+        }
+        if s == CircuitState.HALF_OPEN {
+            if self._half_open_attempts < self.half_open_max {
+                self._half_open_attempts += 1
+                return true
+            }
+            return false
+        }
+        return false
+    }
+
+    fn to_dict(self) -> any {
+        return {
+            "name": self.name, "state": self.state().value,
+            "failures": self._failure_count,
+            "successes": self._success_count
+        }
+    }
+}
+
+/// ── Retry Policy ──
+
+class RetryPolicy {
+    fn init(self, max_retries: int, base_delay_s: float,
+            max_delay_s: float, jitter: float) {
+        self.max_retries = max_retries
+        self.base_delay_s = base_delay_s
+        self.max_delay_s = max_delay_s
+        self.jitter = jitter
+    }
+
+    fn execute(self, fn_call: any, args: List[any]) -> any {
+        let last_exc = nil
+        for attempt in range(0, self.max_retries + 1) {
+            try {
+                return fn_call(args)
+            } catch(exc) {
+                last_exc = exc
+                if attempt < self.max_retries {
+                    let delay = self.base_delay_s * pow(2.0, to_float(attempt))
+                    if delay > self.max_delay_s {
+                        delay = self.max_delay_s
+                    }
+                    log.debug("Retry " + to_string(attempt + 1) + "/" +
+                              to_string(self.max_retries) + " after " +
+                              to_string(delay) + "s: " + to_string(exc))
+                    sleep(delay)
+                }
+            }
+        }
+        raise last_exc
+    }
+}
+
+/// ── Route Result ──
+
+type RouteResult {
+    modality: Modality,
+    answer: string,
+    confidence: float,
+    trust_level: string,
+    artifacts: List[Map[string, any]],
+    metadata: Map[string, any],
+    provenance: List[Map[string, string]],
+    trace: Optional[RequestTrace],
+    status: RouteStatus,
+    error: string
+}
+
+fn route_result_to_dict(r: RouteResult) -> any {
+    let trace_dict = nil
+    if r.trace != nil {
+        trace_dict = r.trace.to_dict()
+    }
+    return {
+        "modality": r.modality.value,
+        "answer": r.answer,
+        "confidence": r.confidence,
+        "trust_level": r.trust_level,
+        "provenance": r.provenance,
+        "artifacts": r.artifacts,
+        "status": r.status.value,
+        "error": r.error,
+        "trace": trace_dict
+    }
+}
+
+/// ── SSRF Guard ──
+
+class SSRFGuard {
+    fn init(self) {
+        self.BLOCKED_PREFIXES = [
+            "http://localhost", "http://127.", "http://0.", "http://10.",
+            "http://172.16.", "http://172.17.", "http://172.18.", "http://172.19.",
+            "http://172.20.", "http://172.21.", "http://172.22.", "http://172.23.",
+            "http://172.24.", "http://172.25.", "http://172.26.", "http://172.27.",
+            "http://172.28.", "http://172.29.", "http://172.30.", "http://172.31.",
+            "http://192.168.", "http://169.254.",
+            "https://localhost", "https://127.", "https://0.",
+            "http://[::1]", "https://[::1]",
+            "http://metadata.google", "http://169.254.169.254"
+        ]
+        self.BLOCKED_HOSTS = {
+            "localhost", "metadata.google.internal", "metadata.google"
+        }
+    }
+
+    fn is_safe_url(self, url: string) -> bool {
+        let url_lower = url.lower().strip()
+        for p in self.BLOCKED_PREFIXES {
+            if url_lower.starts_with(p) {
+                return false
+            }
+        }
+        let hostname = url_parse_hostname(url_lower)
+        if self.BLOCKED_HOSTS.contains(hostname) {
+            return false
+        }
+        return true
+    }
+}
+
+/// ── Source Reputation ──
+
+type SourceReputation {
+    domain: string,
+    success_count: int,
+    failure_count: int,
+    last_success_ms: float,
+    last_failure_ms: float,
+    blocked: bool
+}
+
+fn reputation_score(r: SourceReputation) -> float {
+    let total = r.success_count + r.failure_count
+    if total == 0 {
+        return 0.5
+    }
+    return to_float(r.success_count) / to_float(total)
+}
+
+fn reputation_is_trusted(r: SourceReputation) -> bool {
+    return !r.blocked && reputation_score(r) > 0.3
+}
+
+class ReputationTracker {
+    fn init(self) {
+        self._sources = {}
+    }
+
+    fn _ensure(self, domain: string) -> SourceReputation {
+        let rep = self._sources.get(domain, nil)
+        if rep == nil {
+            rep = SourceReputation {
+                domain: domain, success_count: 0, failure_count: 0,
+                last_success_ms: 0.0, last_failure_ms: 0.0, blocked: false
+            }
+            self._sources[domain] = rep
+        }
+        return rep
+    }
+
+    fn record_success(self, domain: string) {
+        let rep = self._ensure(domain)
+        rep.success_count += 1
+        rep.last_success_ms = time.time() * 1000.0
+    }
+
+    fn record_failure(self, domain: string) {
+        let rep = self._ensure(domain)
+        rep.failure_count += 1
+        rep.last_failure_ms = time.time() * 1000.0
+    }
+
+    fn is_trusted(self, domain: string) -> bool {
+        let rep = self._sources.get(domain, nil)
+        if rep == nil {
+            return true
+        }
+        return reputation_is_trusted(rep)
+    }
+
+    fn block(self, domain: string) {
+        let rep = self._ensure(domain)
+        rep.blocked = true
+    }
+
+    fn stats(self) -> any {
+        let result = {}
+        for d in self._sources.keys() {
+            let r = self._sources[d]
+            result[d] = {
+                "score": reputation_score(r),
+                "blocked": r.blocked
+            }
+        }
+        return result
+    }
+}
+
+/// ── Input Validation ──
+
+fn _validate_input_not_empty(data: any) -> bool {
+    if data == nil {
+        return false
+    }
+    if is_string(data) {
+        if data.strip().len() == 0 {
+            return false
+        }
+    }
+    if is_map(data) {
+        if data.len() == 0 {
+            return false
+        }
+    }
+    return true
+}
+
+fn _validate_input_safe(data: any) -> bool {
+    if is_string(data) {
+        let lower = data.lower()
+        if lower.contains("<script") { return false }
+        if lower.contains("javascript:") { return false }
+        if lower.contains("eval(") { return false }
+        if lower.contains("exec(") { return false }
+    }
+    return true
+}
+
+fn _validate_output_has_content(data: any) -> bool {
+    if is_map(data) {
+        if data.get("answer", nil) != nil { return true }
+        if data.get("result", nil) != nil { return true }
+        if data.get("stdout", nil) != nil { return true }
+        if data.get("files", nil) != nil { return true }
+        if data.get("code", nil) != nil { return true }
+        return false
+    }
+    if is_string(data) {
+        return data.strip().len() > 0
+    }
+    return data != nil
+}
+
+/// ── Orchestrator ──
+
+class Orchestrator {
+    fn init(self, default_budget_ms: float) {
+        self.default_budget_ms = default_budget_ms
+        self.circuits = {}
+        self.retry_policy = RetryPolicy()
+        self.retry_policy.init(3, 0.1, 2.0, 0.1)
+        self.ssrf_guard = SSRFGuard()
+        self.ssrf_guard.init()
+        self.reputation = ReputationTracker()
+        self.reputation.init()
+        self._route_handlers = {}
+        self._request_count = 0
+        self._error_count = 0
+        self._cognitive = nil
+
+        let services = [
+            "text_model", "vision_model", "audio_model", "video_model",
+            "code_agent", "image_gen", "audio_gen", "video_gen", "web_retrieval"
+        ]
+        for svc in services {
+            let cb = CircuitBreaker()
+            cb.init(svc, 5, 30.0, 1)
+            self.circuits[svc] = cb
+        }
+    }
+
+    fn set_cognitive(self, cognitive_layer: any) {
+        self._cognitive = cognitive_layer
+        log.info("Cognitive integration wired into orchestrator")
+    }
+
+    fn register_route(self, modality: Modality, handler: any) {
+        self._route_handlers[modality.value] = handler
+    }
+
+    fn route(self, modality: Modality, payload: Map[string, any],
+             source: string, session_id: string) -> RouteResult {
+        self._request_count += 1
+        let trace = RequestTrace()
+        let req_id = hashlib.sha256(source + ":" + to_string(self._request_count) +
+                                ":" + to_string(time.time())).hexdigest().slice(0, 16)
+        trace.init(req_id, modality.value)
+        trace.source_provenance = {
+            "source": source, "session_id": session_id
+        }
+        let budget = LatencyBudget()
+        budget.init(self.default_budget_ms)
+
+        let raw_span = trace.new_span("nrsi_input_gate", "orchestrator", "")
+        let raw_data = nrsi_raw(payload, {
+            "modality": modality.value, "source": source, "session_id": session_id
+        })
+        trace.record_nrsi_trust(raw_data)
+
+        if !_validate_input_not_empty(payload) {
+            trace.close_span(raw_span, "validation_failed")
+            self._error_count += 1
+            return RouteResult {
+                modality: modality, answer: "", confidence: 0.0,
+                trust_level: TrustLevel.RAW.name,
+                artifacts: [],
+                metadata: {},
+                provenance: [],
+                trace: trace, status: RouteStatus.ERROR,
+                error: "Input validation failed: empty input"
+            }
+        }
+        if !_validate_input_safe(payload) {
+            trace.close_span(raw_span, "validation_failed")
+            self._error_count += 1
+            return RouteResult {
+                modality: modality, answer: "", confidence: 0.0,
+                trust_level: TrustLevel.RAW.name,
+                artifacts: [],
+                metadata: {},
+                provenance: [],
+                trace: trace, status: RouteStatus.ERROR,
+                error: "Input validation failed: unsafe input"
+            }
+        }
+        trace.close_span(raw_span, "ok")
+
+        let circuit_name = self._modality_to_circuit(modality)
+        let circuit = self.circuits.get(circuit_name, nil)
+        if circuit != nil {
+            if !circuit.allow_request() {
+                self._error_count += 1
+                return RouteResult {
+                    modality: modality, answer: "", confidence: 0.0,
+                    trust_level: TrustLevel.VALIDATED.name,
+                    artifacts: [],
+                    metadata: {},
+                    provenance: [],
+                    trace: trace, status: RouteStatus.CIRCUIT_OPEN,
+                    error: "Circuit " + circuit_name + " is open"
+                }
+            }
+        }
+
+        let handler = self._route_handlers.get(modality.value, nil)
+        if handler == nil {
+            return RouteResult {
+                modality: modality, answer: "", confidence: 0.0,
+                trust_level: TrustLevel.VALIDATED.name,
+                artifacts: [],
+                metadata: {},
+                provenance: [],
+                trace: trace, status: RouteStatus.ERROR,
+                error: "No handler registered for " + modality.value
+            }
+        }
+
+        let svc_span = trace.new_span("service_" + modality.value, circuit_name, "")
+        let service_result = nil
+        try {
+            service_result = handler(payload, trace, budget)
+            if circuit != nil {
+                circuit.record_success()
+            }
+            trace.close_span(svc_span, "ok")
+        } catch(exc) {
+            if circuit != nil {
+                circuit.record_failure()
+            }
+            trace.close_span(svc_span, "error")
+            self._error_count += 1
+            log.warn("Route " + modality.value + " failed: " + to_string(exc))
+            return RouteResult {
+                modality: modality, answer: "", confidence: 0.0,
+                trust_level: TrustLevel.VALIDATED.name,
+                artifacts: [],
+                metadata: {},
+                provenance: [],
+                trace: trace, status: RouteStatus.ERROR,
+                error: to_string(exc)
+            }
+        }
+
+        let response_payload = {}
+        if is_map(service_result) {
+            response_payload = service_result
+        } else {
+            response_payload = { "answer": to_string(service_result), "confidence": 0.5 }
+        }
+
+        let out_span = trace.new_span("nrsi_output_gate", "orchestrator", "")
+        let has_content = _validate_output_has_content(response_payload)
+        if has_content {
+            trace.close_span(out_span, "ok")
+        } else {
+            trace.close_span(out_span, "degraded")
+        }
+
+        let answer = to_string(response_payload.get("answer", ""))
+        if answer == "" {
+            if response_payload.get("stdout", nil) != nil {
+                answer = to_string(response_payload["stdout"])
+            } else if response_payload.get("code", nil) != nil {
+                answer = to_string(response_payload["code"])
+            }
+        }
+        let conf = response_payload.get("confidence", 0.0)
+        if conf > 1.0 { conf = 1.0 }
+        if conf == 0.0 {
+            if response_payload.get("exit_code", nil) == 0 {
+                conf = 0.85
+            }
+        }
+
+        let trust = TrustLevel.VALIDATED.name
+        if has_content {
+            trust = TrustLevel.TRUSTED.name
+        }
+
+        return RouteResult {
+            modality: modality, answer: answer, confidence: conf,
+            trust_level: trust,
+            artifacts: [],
+            metadata: response_payload,
+            provenance: [],
+            trace: trace, status: RouteStatus.SUCCESS, error: ""
+        }
+    }
+
+    fn _modality_to_circuit(self, modality: Modality) -> string {
+        if modality == Modality.TEXT { return "text_model" }
+        if modality == Modality.IMAGE { return "vision_model" }
+        if modality == Modality.AUDIO { return "audio_model" }
+        if modality == Modality.VIDEO { return "video_model" }
+        if modality == Modality.CODE { return "code_agent" }
+        if modality == Modality.IMAGE_GEN { return "image_gen" }
+        if modality == Modality.AUDIO_GEN { return "audio_gen" }
+        if modality == Modality.VIDEO_GEN { return "video_gen" }
+        return "text_model"
+    }
+
+    fn stats(self) -> any {
+        let circuit_stats = {}
+        for k in self.circuits.keys() {
+            circuit_stats[k] = self.circuits[k].to_dict()
+        }
+        return {
+            "total_requests": self._request_count,
+            "total_errors": self._error_count,
+            "circuits": circuit_stats,
+            "reputation": self.reputation.stats()
+        }
+    }
+}
+
+export Modality, RouteStatus
+export TraceSpan, make_trace_span, span_duration_ms, span_to_dict
+export RequestTrace, LatencyBudget
+export CircuitState, CircuitBreaker, RetryPolicy
+export RouteResult, route_result_to_dict
+export SSRFGuard, SourceReputation, reputation_score, reputation_is_trusted
+export ReputationTracker
+export Orchestrator

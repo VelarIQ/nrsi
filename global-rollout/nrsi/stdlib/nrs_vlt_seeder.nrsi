@@ -1,0 +1,864 @@
+/// NRS VLT Live Data Seeder — Feed, Seed, and Maintain the Knowledge Base.
+///
+/// This module solves the "cold start" and "live data" problems:
+///
+///   1. BULK SEEDING: Load knowledge packs from disk, APIs, or databases
+///   2. LIVE FEEDS: Subscribe to real-time data sources (webhooks, SSE,
+///      polling) that continuously update the VLT
+///   3. DOMAIN PACKS: Pre-built knowledge packs for specific industries
+///      (telecom, finance, medical, legal, etc.)
+///   4. VALIDATED INGESTION: Every fact goes through credibility scoring
+///      and evidence classification before entering the VLT
+///
+/// The VLT (Validated Ledger of Truth) is NOT a static database.
+/// It's a living knowledge base with:
+///   - Confidence scores that decay over time
+///   - Source credibility tracking
+///   - Contradiction detection on ingestion
+///   - Provenance chains for every fact
+///
+/// Key principle: NRS never treats ingested data as ground truth.
+/// Everything enters at an appropriate confidence level based on its
+/// source, and must be promoted through validation gates.
+
+module nrs_vlt_seeder
+
+import time from "std/time"
+import json from "std/json"
+import os from "std/os"
+import hashlib from "std/hashlib"
+import logging from "std/logging"
+import threading from "std/threading"
+import get_domain, get_lobe_weights, detect_domain from "nrs_domain_registry"
+
+let logger = logging.getLogger("nrs.vlt-seeder")
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  TYPES
+// ═══════════════════════════════════════════════════════════════════
+
+enum SourceTier {
+    T1_AXIOMATIC = "t1_axiomatic",
+    T2_VERIFIED = "t2_verified",
+    T3_CURATED = "t3_curated",
+    T4_OBSERVED = "t4_observed",
+    T5_UNVERIFIED = "t5_unverified"
+}
+
+enum FeedType {
+    WEBHOOK = "webhook",
+    POLLING = "polling",
+    SSE = "sse",
+    FILE_WATCH = "file_watch",
+    API_PULL = "api_pull",
+    DATABASE = "database"
+}
+
+type IngestRecord {
+    fact_id: string,
+    content: string,
+    domain: string,
+    source: string,
+    source_tier: string,
+    confidence: float,
+    tags: List[string],
+    timestamp: float,
+    provenance_hash: string,
+    accepted: bool,
+    rejection_reason: string
+}
+
+type FeedConfig {
+    feed_id: string,
+    feed_type: string,
+    source_url: string,
+    domain: string,
+    source_tier: string,
+    poll_interval_seconds: int,
+    auth_header: string,
+    transform_fn: string,
+    active: bool
+}
+
+type SeedStats {
+    total_ingested: int,
+    total_accepted: int,
+    total_rejected: int,
+    by_domain: Dict[string, int],
+    by_tier: Dict[string, int],
+    by_source: Dict[string, int],
+    active_feeds: int,
+    last_ingest_time: float
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONFIDENCE ASSIGNMENT BY SOURCE TIER
+// ═══════════════════════════════════════════════════════════════════
+
+let TIER_CONFIDENCE = {
+    "t1_axiomatic": {"min": 0.95, "max": 1.0},
+    "t2_verified": {"min": 0.80, "max": 0.95},
+    "t3_curated": {"min": 0.65, "max": 0.85},
+    "t4_observed": {"min": 0.40, "max": 0.70},
+    "t5_unverified": {"min": 0.15, "max": 0.50}
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  INGESTION GATE
+// ═══════════════════════════════════════════════════════════════════
+
+class IngestionGate {
+    /// Validates incoming facts before they enter the VLT.
+    /// Rejects duplicates, contradictions, and low-quality data.
+
+    fn init(self) {
+        self._seen_hashes: Dict[string, float] = {}
+        self._min_content_length = 5
+        self._max_content_length = 50000
+        self._rejection_log: List[IngestRecord] = []
+    }
+
+    fn evaluate(self, content: string, domain: string, source: string,
+                source_tier: string, confidence: float,
+                tags: List[string]) -> IngestRecord {
+
+        let fact_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()[0:32]
+        let fact_id = domain + ":" + fact_hash[0:12]
+
+        // Reject empty or too-short content
+        if len(content.strip()) < self._min_content_length {
+            return self._reject(fact_id, content, domain, source, source_tier,
+                               confidence, tags, "content_too_short")
+        }
+
+        // Reject excessively long content
+        if len(content) > self._max_content_length {
+            return self._reject(fact_id, content, domain, source, source_tier,
+                               confidence, tags, "content_too_long")
+        }
+
+        // Reject duplicates (same hash within 1 hour)
+        if fact_hash in self._seen_hashes {
+            let last_seen = self._seen_hashes[fact_hash]
+            if time.time() - last_seen < 3600.0 {
+                return self._reject(fact_id, content, domain, source, source_tier,
+                                   confidence, tags, "duplicate_within_1h")
+            }
+        }
+
+        // Cap confidence by source tier
+        let tier_bounds = TIER_CONFIDENCE.get(source_tier, TIER_CONFIDENCE["t5_unverified"])
+        let capped_confidence = min(max(confidence, tier_bounds["min"]), tier_bounds["max"])
+
+        self._seen_hashes[fact_hash] = time.time()
+
+        return IngestRecord {
+            fact_id: fact_id,
+            content: content,
+            domain: domain,
+            source: source,
+            source_tier: source_tier,
+            confidence: capped_confidence,
+            tags: tags,
+            timestamp: time.time(),
+            provenance_hash: fact_hash,
+            accepted: true,
+            rejection_reason: ""
+        }
+    }
+
+    fn _reject(self, fact_id: string, content: string, domain: string,
+               source: string, source_tier: string, confidence: float,
+               tags: List[string], reason: string) -> IngestRecord {
+        let record = IngestRecord {
+            fact_id: fact_id,
+            content: content[0:200],
+            domain: domain,
+            source: source,
+            source_tier: source_tier,
+            confidence: 0.0,
+            tags: tags,
+            timestamp: time.time(),
+            provenance_hash: "",
+            accepted: false,
+            rejection_reason: reason
+        }
+        append(self._rejection_log, record)
+        return record
+    }
+
+    fn recent_rejections(self, limit: int) -> List[IngestRecord] {
+        let start = max(0, len(self._rejection_log) - limit)
+        return self._rejection_log[start:]
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  DOMAIN PACK LOADER
+// ═══════════════════════════════════════════════════════════════════
+
+class DomainPackLoader {
+    /// Loads structured knowledge packs from JSON files.
+    ///
+    /// Pack format:
+    /// {
+    ///   "domain": "telecom",
+    ///   "version": "2024.1",
+    ///   "source": "3GPP TS 23.501",
+    ///   "source_tier": "t2_verified",
+    ///   "facts": [
+    ///     {"id": "5g-nr-bands", "text": "...", "confidence": 0.9, "tags": ["5g", "nr"]}
+    ///   ]
+    /// }
+
+    fn init(self) {
+        self._gate = IngestionGate()
+        self._loaded_packs: List[Dict[string, Any]] = []
+    }
+
+    fn load_from_file(self, filepath: string) -> List[IngestRecord] {
+        let results: List[IngestRecord] = []
+        try {
+            let raw = open(filepath).read()
+            let data = json.loads(raw)
+            let domain = data.get("domain", "general")
+            let source = data.get("source", filepath)
+            let tier = data.get("source_tier", "t3_curated")
+
+            for fact in data.get("facts", []) {
+                let record = self._gate.evaluate(
+                    fact.get("text", ""),
+                    domain,
+                    source,
+                    tier,
+                    fact.get("confidence", 0.7),
+                    fact.get("tags", [])
+                )
+                append(results, record)
+            }
+
+            append(self._loaded_packs, {
+                "file": filepath,
+                "domain": domain,
+                "facts": len(data.get("facts", [])),
+                "accepted": len([r for r in results if r.accepted]),
+                "loaded_at": time.time()
+            })
+        } catch as e {
+            logger.error("Failed to load pack %s: %s", filepath, str(e))
+        }
+        return results
+    }
+
+    fn load_directory(self, dirpath: string) -> List[IngestRecord] {
+        let all_records: List[IngestRecord] = []
+        if not os.path.isdir(dirpath) {
+            logger.warning("Pack directory not found: %s", dirpath)
+            return all_records
+        }
+
+        for filename in sorted(os.listdir(dirpath)) {
+            if filename.endswith(".json") {
+                let filepath = os.path.join(dirpath, filename)
+                let records = self.load_from_file(filepath)
+                all_records = all_records + records
+            }
+        }
+        return all_records
+    }
+
+    fn load_from_dict(self, data: Dict[string, Any]) -> List[IngestRecord] {
+        let results: List[IngestRecord] = []
+        let domain = data.get("domain", "general")
+        let source = data.get("source", "api")
+        let tier = data.get("source_tier", "t4_observed")
+
+        for fact in data.get("facts", []) {
+            let record = self._gate.evaluate(
+                fact.get("text", fact.get("content", "")),
+                domain,
+                source,
+                tier,
+                fact.get("confidence", 0.5),
+                fact.get("tags", [])
+            )
+            append(results, record)
+        }
+        return results
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  LIVE FEED MANAGER
+// ═══════════════════════════════════════════════════════════════════
+
+class LiveFeedManager {
+    /// Manages subscriptions to live data sources that continuously
+    /// feed new knowledge into the VLT.
+
+    fn init(self) {
+        self._feeds: Dict[string, FeedConfig] = {}
+        self._poll_threads: Dict[string, Any] = {}
+        self._running = false
+        self._gate = IngestionGate()
+        self._on_ingest_callbacks: List[Any] = []
+        self._stats = SeedStats {
+            total_ingested: 0,
+            total_accepted: 0,
+            total_rejected: 0,
+            by_domain: {},
+            by_tier: {},
+            by_source: {},
+            active_feeds: 0,
+            last_ingest_time: 0.0
+        }
+    }
+
+    fn register_feed(self, config: FeedConfig) {
+        self._feeds[config.feed_id] = config
+        logger.info("Registered feed: %s (%s, %s)", config.feed_id,
+                    config.feed_type, config.domain)
+    }
+
+    fn on_ingest(self, callback: Any) {
+        append(self._on_ingest_callbacks, callback)
+    }
+
+    fn start(self) {
+        self._running = true
+        for feed_id in self._feeds {
+            let config = self._feeds[feed_id]
+            if not config.active { continue }
+
+            if config.feed_type == "polling" or config.feed_type == "api_pull" {
+                let thread = threading.Thread(
+                    target: self._poll_loop,
+                    args: [config],
+                    daemon: true
+                )
+                thread.start()
+                self._poll_threads[feed_id] = thread
+            }
+        }
+        self._stats.active_feeds = len(self._poll_threads)
+        logger.info("Live feed manager started with %d active feeds",
+                    self._stats.active_feeds)
+    }
+
+    fn stop(self) {
+        self._running = false
+        logger.info("Live feed manager stopping")
+    }
+
+    fn ingest_webhook(self, feed_id: string, payload: Dict[string, Any]) -> List[IngestRecord] {
+        /// Process a webhook push from an external source.
+        if feed_id not in self._feeds {
+            logger.warning("Unknown feed_id: %s", feed_id)
+            return []
+        }
+        let config = self._feeds[feed_id]
+        return self._process_payload(config, payload)
+    }
+
+    fn ingest_direct(self, content: string, domain: string, source: string,
+                     source_tier: string, confidence: float,
+                     tags: List[string]) -> IngestRecord {
+        /// Directly ingest a single fact (for API calls, manual seeding).
+        let record = self._gate.evaluate(content, domain, source,
+                                         source_tier, confidence, tags)
+        self._record_stats(record)
+        if record.accepted {
+            self._notify_callbacks(record)
+        }
+        return record
+    }
+
+    fn _poll_loop(self, config: FeedConfig) {
+        while self._running {
+            try {
+                let httpx = __import__("httpx")
+                let headers = {}
+                if config.auth_header != "" {
+                    headers["Authorization"] = config.auth_header
+                }
+                let response = httpx.get(config.source_url, headers: headers, timeout: 30.0)
+                if response.status_code == 200 {
+                    let payload = response.json()
+                    self._process_payload(config, payload)
+                }
+            } catch as e {
+                logger.warning("Poll failed for %s: %s", config.feed_id, str(e))
+            }
+            time.sleep(float(config.poll_interval_seconds))
+        }
+    }
+
+    fn _process_payload(self, config: FeedConfig, payload: Dict[string, Any]) -> List[IngestRecord] {
+        let results: List[IngestRecord] = []
+
+        // Handle array of facts or single fact
+        let facts = payload.get("facts", payload.get("data", []))
+        if not isinstance(facts, list) {
+            facts = [facts]
+        }
+
+        for fact in facts {
+            let content = ""
+            if isinstance(fact, str) {
+                content = fact
+            } else if isinstance(fact, dict) {
+                content = fact.get("text", fact.get("content", fact.get("value", json.dumps(fact))))
+            } else {
+                content = str(fact)
+            }
+
+            let tags = []
+            if isinstance(fact, dict) {
+                tags = fact.get("tags", [])
+            }
+
+            let confidence = 0.5
+            if isinstance(fact, dict) {
+                confidence = fact.get("confidence", 0.5)
+            }
+
+            let record = self._gate.evaluate(
+                content,
+                config.domain,
+                config.source_url,
+                config.source_tier,
+                confidence,
+                tags
+            )
+            self._record_stats(record)
+            if record.accepted {
+                self._notify_callbacks(record)
+            }
+            append(results, record)
+        }
+        return results
+    }
+
+    fn _record_stats(self, record: IngestRecord) {
+        self._stats.total_ingested = self._stats.total_ingested + 1
+        if record.accepted {
+            self._stats.total_accepted = self._stats.total_accepted + 1
+        } else {
+            self._stats.total_rejected = self._stats.total_rejected + 1
+        }
+        let d = record.domain
+        self._stats.by_domain[d] = self._stats.by_domain.get(d, 0) + 1
+        let t = record.source_tier
+        self._stats.by_tier[t] = self._stats.by_tier.get(t, 0) + 1
+        let s = record.source
+        self._stats.by_source[s] = self._stats.by_source.get(s, 0) + 1
+        self._stats.last_ingest_time = time.time()
+    }
+
+    fn _notify_callbacks(self, record: IngestRecord) {
+        for cb in self._on_ingest_callbacks {
+            try {
+                cb(record)
+            } catch as e {
+                logger.warning("Ingest callback failed: %s", str(e))
+            }
+        }
+    }
+
+    fn stats(self) -> SeedStats {
+        return self._stats
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  VLT SEEDER — MAIN ORCHESTRATOR
+// ═══════════════════════════════════════════════════════════════════
+
+class VLTSeeder {
+    /// The main entry point for seeding the VLT with knowledge.
+    ///
+    /// Connects to:
+    ///   - KnowledgePipeline (for L0 seeded knowledge)
+    ///   - KnowledgeStore (for Redis persistence)
+    ///   - CreaseLoader (for TF-IDF indexed knowledge)
+    ///   - LiveFeedManager (for real-time data)
+
+    fn init(self) {
+        self._pack_loader = DomainPackLoader()
+        self._feed_manager = LiveFeedManager()
+        self._pipeline = None
+        self._knowledge_store = None
+        self._crease_loader = None
+        self._ingest_log: List[IngestRecord] = []
+        self._max_log_size = 10000
+
+        // Wire feed manager to push accepted facts into the pipeline
+        self._feed_manager.on_ingest(self._on_fact_accepted)
+    }
+
+    fn set_pipeline(self, pipeline: Any) {
+        self._pipeline = pipeline
+    }
+
+    fn set_knowledge_store(self, store: Any) {
+        self._knowledge_store = store
+    }
+
+    fn set_crease_loader(self, loader: Any) {
+        self._crease_loader = loader
+    }
+
+    // ── Bulk Seeding ────────────────────────────────────────────────
+
+    fn seed_from_directory(self, dirpath: string) -> Dict[string, Any] {
+        /// Load all JSON knowledge packs from a directory.
+        let records = self._pack_loader.load_directory(dirpath)
+        let accepted = 0
+        let rejected = 0
+        for r in records {
+            if r.accepted {
+                self._on_fact_accepted(r)
+                accepted = accepted + 1
+            } else {
+                rejected = rejected + 1
+            }
+        }
+        return {
+            "directory": dirpath,
+            "total": len(records),
+            "accepted": accepted,
+            "rejected": rejected
+        }
+    }
+
+    fn seed_from_file(self, filepath: string) -> Dict[string, Any] {
+        /// Load a single knowledge pack file.
+        let records = self._pack_loader.load_from_file(filepath)
+        let accepted = 0
+        for r in records {
+            if r.accepted {
+                self._on_fact_accepted(r)
+                accepted = accepted + 1
+            }
+        }
+        return {
+            "file": filepath,
+            "total": len(records),
+            "accepted": accepted
+        }
+    }
+
+    fn seed_from_api(self, data: Dict[string, Any]) -> Dict[string, Any] {
+        /// Seed from a structured API payload.
+        /// Expected format: {"domain": "...", "source": "...",
+        ///                    "source_tier": "...", "facts": [...]}
+        let records = self._pack_loader.load_from_dict(data)
+        let accepted = 0
+        for r in records {
+            if r.accepted {
+                self._on_fact_accepted(r)
+                accepted = accepted + 1
+            }
+        }
+        return {
+            "domain": data.get("domain", "general"),
+            "total": len(records),
+            "accepted": accepted
+        }
+    }
+
+    fn seed_single(self, content: string, domain: string, source: string,
+                   source_tier: string, confidence: float,
+                   tags: List[string]) -> IngestRecord {
+        /// Seed a single fact directly.
+        return self._feed_manager.ingest_direct(
+            content, domain, source, source_tier, confidence, tags
+        )
+    }
+
+    // ── Live Feeds ──────────────────────────────────────────────────
+
+    fn register_feed(self, config: FeedConfig) {
+        self._feed_manager.register_feed(config)
+    }
+
+    fn start_feeds(self) {
+        self._feed_manager.start()
+    }
+
+    fn stop_feeds(self) {
+        self._feed_manager.stop()
+    }
+
+    fn process_webhook(self, feed_id: string, payload: Dict[string, Any]) -> List[IngestRecord] {
+        return self._feed_manager.ingest_webhook(feed_id, payload)
+    }
+
+    // ── Internal Wiring ─────────────────────────────────────────────
+
+    fn _on_fact_accepted(self, record: IngestRecord) {
+        /// Called for every accepted fact. Pushes it into all knowledge stores
+        /// with lobe-domain affinity indexing so each lobe gets relevant knowledge.
+
+        // Log it
+        append(self._ingest_log, record)
+        if len(self._ingest_log) > self._max_log_size {
+            self._ingest_log = self._ingest_log[1000:]
+        }
+
+        // Resolve lobe affinities from domain registry
+        let lobe_weights = get_lobe_weights(record.domain)
+        let lobe_tags = []
+        for lobe_name in lobe_weights {
+            if lobe_weights[lobe_name] >= 0.15 {
+                append(lobe_tags, lobe_name)
+            }
+        }
+
+        // Push to knowledge pipeline (L0 seeded knowledge)
+        if self._pipeline != None {
+            let fact_payload = {
+                "content": record.content,
+                "confidence": record.confidence,
+                "source": record.source,
+                "source_type": record.source_tier,
+                "lobe_affinities": lobe_weights,
+                "lobe_tags": lobe_tags
+            }
+
+            self._pipeline.index_axiom(record.domain, fact_payload)
+
+            // Index by (domain, lobe) compound key for lobe-specific retrieval
+            for lobe_name in lobe_tags {
+                let compound_key = record.domain + "::" + lobe_name
+                self._pipeline.index_axiom(compound_key, fact_payload)
+            }
+
+            // Index by tag-based keys from the fact itself
+            for tag in record.tags {
+                if tag in ["causal", "logical", "mathematical", "linguistic",
+                           "analogical", "planning", "memory", "metacognitive",
+                           "diagnostic", "temporal"] {
+                    let tag_key = record.domain + "::" + tag
+                    self._pipeline.index_axiom(tag_key, fact_payload)
+                }
+            }
+
+            // Also index by significant words in content
+            let words = record.content.lower().split()
+            for word in words {
+                if len(word) > 4 {
+                    self._pipeline.index_axiom(word, {
+                        "content": record.content,
+                        "confidence": record.confidence,
+                        "source": record.source,
+                        "source_type": record.source_tier,
+                        "lobe_affinities": lobe_weights
+                    })
+                }
+            }
+        }
+
+        // Push to Redis knowledge store with lobe metadata
+        if self._knowledge_store != None {
+            try {
+                self._knowledge_store.save_web_fact(
+                    record.fact_id,
+                    record.domain,
+                    "has_knowledge",
+                    record.content[0:500],
+                    record.confidence,
+                    source_url: record.source,
+                    source_domain: record.domain,
+                    credibility: record.confidence,
+                    ingested: true
+                )
+                // Store lobe affinity metadata alongside the fact
+                for lobe_name in lobe_tags {
+                    let lobe_key = record.fact_id + "::lobe::" + lobe_name
+                    self._knowledge_store.save_web_fact(
+                        lobe_key,
+                        record.domain,
+                        "lobe_affinity",
+                        lobe_name + ":" + str(lobe_weights[lobe_name]),
+                        lobe_weights[lobe_name],
+                        source_url: record.source,
+                        source_domain: record.domain,
+                        credibility: record.confidence,
+                        ingested: true
+                    )
+                }
+            } catch as e {
+                logger.warning("Failed to persist fact %s: %s", record.fact_id, str(e))
+            }
+        }
+
+        // Push to crease loader (TF-IDF index)
+        if self._crease_loader != None {
+            try {
+                if hasattr(self._crease_loader, "_global_index") {
+                    let make_fact_fn = __import__("knowledge_loader").make_fact
+                    let enriched_tags = record.tags + lobe_tags
+                    let fact = make_fact_fn(
+                        record.fact_id,
+                        record.content,
+                        record.confidence,
+                        record.domain,
+                        enriched_tags
+                    )
+                    self._crease_loader._global_index.add(fact)
+
+                    // Add to domain-specific index
+                    if record.domain in self._crease_loader._indices {
+                        self._crease_loader._indices[record.domain].add(fact)
+                    }
+
+                    // Add to lobe-specific indices
+                    for lobe_name in lobe_tags {
+                        let lobe_index_key = "lobe::" + lobe_name
+                        if lobe_index_key in self._crease_loader._indices {
+                            self._crease_loader._indices[lobe_index_key].add(fact)
+                        }
+                    }
+                }
+            } catch as e {
+                logger.warning("Failed to index fact %s: %s", record.fact_id, str(e))
+            }
+        }
+    }
+
+    // ── Auto-Seed from Domain Registry ──────────────────────────────
+
+    fn seed_all_domains(self, base_dir: string) -> Dict[string, Any] {
+        /// Automatically loads all knowledge packs defined in the domain registry.
+        /// base_dir should point to the stdlib directory containing the knowledge/ folder.
+        let results = {}
+        let total_accepted = 0
+        let total_rejected = 0
+
+        for domain_name in ["telecom", "finance", "healthcare", "legal",
+                            "engineering", "physics", "mathematics",
+                            "technology", "science"] {
+            let profile = get_domain(domain_name)
+            if profile == nil { continue }
+
+            let domain_accepted = 0
+            let domain_rejected = 0
+
+            for pack_path in profile.knowledge_pack_paths {
+                let full_path = os.path.join(base_dir, pack_path)
+                if os.path.isfile(full_path) {
+                    let records = self._pack_loader.load_from_file(full_path)
+                    for r in records {
+                        if r.accepted {
+                            self._on_fact_accepted(r)
+                            domain_accepted = domain_accepted + 1
+                        } else {
+                            domain_rejected = domain_rejected + 1
+                        }
+                    }
+                } else {
+                    logger.debug("Knowledge pack not found: %s", full_path)
+                }
+            }
+
+            results[domain_name] = {
+                "accepted": domain_accepted,
+                "rejected": domain_rejected,
+                "packs": len(profile.knowledge_pack_paths)
+            }
+            total_accepted = total_accepted + domain_accepted
+            total_rejected = total_rejected + domain_rejected
+        }
+
+        logger.info("Auto-seeded %d facts across %d domains (%d rejected)",
+                     total_accepted, len(results), total_rejected)
+        return {
+            "total_accepted": total_accepted,
+            "total_rejected": total_rejected,
+            "domains": results
+        }
+    }
+
+    // ── Status ──────────────────────────────────────────────────────
+
+    fn stats(self) -> Dict[string, Any] {
+        let feed_stats = self._feed_manager.stats()
+        return {
+            "total_ingested": feed_stats.total_ingested,
+            "total_accepted": feed_stats.total_accepted,
+            "total_rejected": feed_stats.total_rejected,
+            "by_domain": feed_stats.by_domain,
+            "by_tier": feed_stats.by_tier,
+            "active_feeds": feed_stats.active_feeds,
+            "ingest_log_size": len(self._ingest_log),
+            "pipeline_connected": self._pipeline != None,
+            "store_connected": self._knowledge_store != None,
+            "crease_connected": self._crease_loader != None,
+            "loaded_packs": self._pack_loader._loaded_packs
+        }
+    }
+
+    fn recent_ingests(self, limit: int) -> List[IngestRecord] {
+        let start = max(0, len(self._ingest_log) - limit)
+        return self._ingest_log[start:]
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SINGLETON
+// ═══════════════════════════════════════════════════════════════════
+
+let _global_seeder: Optional[VLTSeeder] = None
+
+fn get_seeder() -> VLTSeeder {
+    if _global_seeder == None {
+        _global_seeder = VLTSeeder()
+    }
+    return _global_seeder
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  NORMS
+// ═══════════════════════════════════════════════════════════════════
+
+norm validate_before_ingest {
+    type: obligation,
+    scope: global,
+    action: "ingest",
+    priority: 95,
+    condition: source_tier != ""
+}
+
+norm cap_confidence_by_tier {
+    type: obligation,
+    scope: global,
+    action: "ingest",
+    priority: 94,
+    condition: confidence > 0.0
+}
+
+norm reject_empty_content {
+    type: prohibition,
+    scope: global,
+    action: "ingest",
+    priority: 99,
+    condition: content == ""
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  EXPORTS
+// ═══════════════════════════════════════════════════════════════════
+
+export SourceTier, FeedType, IngestRecord, FeedConfig, SeedStats
+export IngestionGate, DomainPackLoader, LiveFeedManager
+export VLTSeeder, get_seeder

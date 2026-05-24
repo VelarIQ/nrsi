@@ -1,0 +1,711 @@
+/// NRSI Reasoning — Causal Knowledge Graph.
+///
+/// Directed graph where nodes are concepts and edges are typed relations.
+/// Replaces flat fact retrieval with structured relational knowledge that
+/// supports multi-hop inference, analogical transfer, and compositional
+/// concept formation.
+///
+/// All transformer-free.  No external ML dependencies.
+
+module reasoning_graph
+
+
+import time from "std/time"
+/// ── Stop Words ──────────────────────────────────────────────────────
+
+let _STOP: Set[string] = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "has",
+    "have", "had", "do", "does", "did", "will", "can", "may", "in",
+    "of", "to", "for", "on", "with", "at", "by", "from", "as", "or",
+    "and", "but", "not", "it", "its", "this", "that", "so", "if",
+    "they", "them", "their", "these", "those", "there", "here",
+    "which", "what", "when", "where", "who", "how", "also", "very",
+    "each", "both", "many", "such", "some", "other", "than"
+}
+
+/// ── Relation Types ─────────────────────────────────────────────────
+
+enum RelationType {
+    CAUSES = "causes",
+    PREVENTS = "prevents",
+    REQUIRES = "requires",
+    ENABLES = "enables",
+    PRODUCES = "produces",
+    INHIBITS = "inhibits",
+    PART_OF = "part_of",
+    IS_A = "is_a",
+    HAS_PROPERTY = "has_property",
+    USED_FOR = "used_for",
+    LOCATED_IN = "located_in",
+    PRECEDES = "precedes",
+    CONTRADICTS = "contradicts",
+    CORRELATES = "correlates"
+}
+
+/// ── Graph Primitives ───────────────────────────────────────────────
+
+class GraphNode {
+    fn __init__(self, concept: string, domain: string,
+                properties: Optional[Dict[string, Any]],
+                inputs: Optional[List[string]],
+                outputs: Optional[List[string]],
+                constraints: Optional[List[string]],
+                fact_ids: Optional[List[string]]) {
+        self.concept = concept
+        self.domain = domain
+        if domain == None {
+            self.domain = ""
+        }
+        self.properties = properties
+        if self.properties == None {
+            self.properties = {}
+        }
+        self.inputs = inputs
+        if self.inputs == None {
+            self.inputs = []
+        }
+        self.outputs = outputs
+        if self.outputs == None {
+            self.outputs = []
+        }
+        self.constraints = constraints
+        if self.constraints == None {
+            self.constraints = []
+        }
+        self.fact_ids = fact_ids
+        if self.fact_ids == None {
+            self.fact_ids = []
+        }
+        self.created_at = time.time()
+    }
+
+    fn node_id(self) -> string {
+        return self.concept.lower().strip()
+    }
+
+    fn to_dict(self) -> Dict[string, Any] {
+        return {
+            "concept": self.concept,
+            "domain": self.domain,
+            "properties": self.properties,
+            "inputs": self.inputs,
+            "outputs": self.outputs,
+            "constraints": self.constraints,
+            "fact_ids": self.fact_ids
+        }
+    }
+}
+
+class GraphEdge {
+    fn __init__(self, source: string, target: string,
+                relation: RelationType,
+                confidence: float, domain: string,
+                evidence: string, fact_id: string,
+                derived: bool,
+                provenance: Optional[List[string]]) {
+        self.source = source
+        self.target = target
+        self.relation = relation
+        self.confidence = confidence
+        if confidence == None {
+            self.confidence = 0.5
+        }
+        self.domain = domain
+        if domain == None {
+            self.domain = ""
+        }
+        self.evidence = evidence
+        if evidence == None {
+            self.evidence = ""
+        }
+        self.fact_id = fact_id
+        if fact_id == None {
+            self.fact_id = ""
+        }
+        self.derived = derived
+        if derived == None {
+            self.derived = false
+        }
+        self.provenance = provenance
+        if self.provenance == None {
+            self.provenance = []
+        }
+        self.created_at = time.time()
+        self.last_accessed = time.time()
+        self.access_count = 0
+    }
+
+    fn edge_id(self) -> string {
+        let rel = ""
+        if hasattr(self.relation, "value") {
+            rel = self.relation.value
+        } else {
+            rel = to_string(self.relation)
+        }
+        return self.source + "|" + rel + "|" + self.target
+    }
+
+    fn touch(self) {
+        self.last_accessed = time.time()
+        self.access_count += 1
+    }
+
+    fn age_seconds(self) -> float {
+        return time.time() - self.created_at
+    }
+
+    fn to_dict(self) -> Dict[string, Any] {
+        let rel = ""
+        if hasattr(self.relation, "value") {
+            rel = self.relation.value
+        } else {
+            rel = to_string(self.relation)
+        }
+        return {
+            "source": self.source,
+            "target": self.target,
+            "relation": rel,
+            "confidence": self.confidence,
+            "domain": self.domain,
+            "evidence": self.evidence[:200],
+            "fact_id": self.fact_id,
+            "derived": self.derived,
+            "provenance": self.provenance,
+            "created_at": self.created_at,
+            "last_accessed": self.last_accessed,
+            "access_count": self.access_count
+        }
+    }
+}
+
+/// ── Causal Graph ───────────────────────────────────────────────────
+
+class CausalGraph {
+    fn __init__(self) {
+        self._nodes: Dict[string, GraphNode] = {}
+        self._edges: Dict[string, GraphEdge] = {}
+        self._outgoing: Dict[string, List[string]] = {}
+        self._incoming: Dict[string, List[string]] = {}
+    }
+
+    fn node_count(self) -> int {
+        return len(self._nodes)
+    }
+
+    fn edge_count(self) -> int {
+        return len(self._edges)
+    }
+
+    /// ── Node operations ────────────────────────────────────────────
+
+    fn add_node(self, concept: string, domain: string = "",
+                properties: Optional[Dict[string, Any]] = None,
+                inputs: Optional[List[string]] = None,
+                outputs: Optional[List[string]] = None,
+                fact_id: string = "") -> GraphNode {
+        if domain == None {
+            domain = ""
+        }
+        if fact_id == None {
+            fact_id = ""
+        }
+        let nid = concept.lower().strip()
+        if nid in self._nodes {
+            let node = self._nodes[nid]
+            if fact_id != "" and fact_id not in node.fact_ids {
+                node.fact_ids.append(fact_id)
+            }
+            if properties != None {
+                for k in properties {
+                    node.properties[k] = properties[k]
+                }
+            }
+            if inputs != None {
+                let input_set: Set[string] = set()
+                for i in node.inputs {
+                    input_set.add(i)
+                }
+                for i in inputs {
+                    input_set.add(i)
+                }
+                node.inputs = list(input_set)
+            }
+            if outputs != None {
+                let output_set: Set[string] = set()
+                for o in node.outputs {
+                    output_set.add(o)
+                }
+                for o in outputs {
+                    output_set.add(o)
+                }
+                node.outputs = list(output_set)
+            }
+            if domain != "" and node.domain == "" {
+                node.domain = domain
+            }
+            return node
+        }
+        let fids: List[string] = []
+        if fact_id != "" {
+            fids = [fact_id]
+        }
+        let node = GraphNode(concept, domain, properties, inputs, outputs, None, fids)
+        self._nodes[nid] = node
+        return node
+    }
+
+    fn get_node(self, concept: string) -> Optional[GraphNode] {
+        return self._nodes.get(concept.lower().strip())
+    }
+
+    fn has_node(self, concept: string) -> bool {
+        return concept.lower().strip() in self._nodes
+    }
+
+    /// ── Edge operations ────────────────────────────────────────────
+
+    fn add_edge(self, source: string, target: string,
+                relation: RelationType,
+                confidence: float = 0.5, domain: string = "",
+                evidence: string = "", fact_id: string = "",
+                derived: bool = false,
+                provenance: Optional[List[string]] = None) -> GraphEdge {
+        if confidence == None {
+            confidence = 0.5
+        }
+        if domain == None {
+            domain = ""
+        }
+        if evidence == None {
+            evidence = ""
+        }
+        if fact_id == None {
+            fact_id = ""
+        }
+        if derived == None {
+            derived = false
+        }
+        self.add_node(source, domain, None, None, None, fact_id)
+        self.add_node(target, domain, None, None, None, fact_id)
+
+        let edge = GraphEdge(
+            source.lower().strip(), target.lower().strip(),
+            relation, confidence, domain, evidence,
+            fact_id, derived, provenance)
+
+        let eid = edge.edge_id()
+        let existing = self._edges.get(eid)
+        if existing != None {
+            if confidence > existing.confidence {
+                existing.confidence = confidence
+                existing.evidence = evidence
+            }
+            return existing
+        }
+
+        self._edges[eid] = edge
+        if edge.source not in self._outgoing {
+            self._outgoing[edge.source] = []
+        }
+        self._outgoing[edge.source].append(eid)
+        if edge.target not in self._incoming {
+            self._incoming[edge.target] = []
+        }
+        self._incoming[edge.target].append(eid)
+        return edge
+    }
+
+    fn get_edge(self, source: string, relation: RelationType,
+                target: string) -> Optional[GraphEdge] {
+        let eid = source.lower().strip() + "|" + relation.value + "|" + target.lower().strip()
+        return self._edges.get(eid)
+    }
+
+    fn has_edge(self, source: string, target: string,
+                relation: Optional[RelationType] = None) -> bool {
+        if relation != None {
+            let eid = source.lower().strip() + "|" + relation.value + "|" + target.lower().strip()
+            return eid in self._edges
+        }
+        let src = source.lower().strip()
+        let tgt = target.lower().strip()
+        let eids = self._outgoing.get(src, [])
+        for eid in eids {
+            let e = self._edges.get(eid)
+            if e != None and e.target == tgt {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// ── Query operations ───────────────────────────────────────────
+
+    fn outgoing(self, concept: string,
+                relation: Optional[RelationType] = None) -> List[any] {
+        let nid = concept.lower().strip()
+        let eids = self._outgoing.get(nid, [])
+        let edges: List[GraphEdge] = []
+        for eid in eids {
+            if eid in self._edges {
+                edges.append(self._edges[eid])
+            }
+        }
+        if relation != None {
+            let filtered: List[GraphEdge] = []
+            for e in edges {
+                if e.relation == relation {
+                    filtered.append(e)
+                }
+            }
+            return filtered
+        }
+        return edges
+    }
+
+    fn incoming(self, concept: string,
+                relation: Optional[RelationType] = None) -> List[any] {
+        let nid = concept.lower().strip()
+        let eids = self._incoming.get(nid, [])
+        let edges: List[GraphEdge] = []
+        for eid in eids {
+            if eid in self._edges {
+                edges.append(self._edges[eid])
+            }
+        }
+        if relation != None {
+            let filtered: List[GraphEdge] = []
+            for e in edges {
+                if e.relation == relation {
+                    filtered.append(e)
+                }
+            }
+            return filtered
+        }
+        return edges
+    }
+
+    fn neighbors(self, concept: string) -> any {
+        let nid = concept.lower().strip()
+        let result: Set[string] = set()
+        for eid in self._outgoing.get(nid, []) {
+            let e = self._edges.get(eid)
+            if e != None {
+                result.add(e.target)
+            }
+        }
+        for eid in self._incoming.get(nid, []) {
+            let e = self._edges.get(eid)
+            if e != None {
+                result.add(e.source)
+            }
+        }
+        return result
+    }
+
+    fn domain_subgraph(self, domain: string) -> CausalGraph {
+        let sub = CausalGraph()
+        for nid in self._nodes {
+            let node = self._nodes[nid]
+            if node.domain == domain {
+                sub._nodes[nid] = node
+            }
+        }
+        for eid in self._edges {
+            let edge = self._edges[eid]
+            if edge.domain == domain {
+                sub._edges[eid] = edge
+                if edge.source not in sub._outgoing {
+                    sub._outgoing[edge.source] = []
+                }
+                sub._outgoing[edge.source].append(eid)
+                if edge.target not in sub._incoming {
+                    sub._incoming[edge.target] = []
+                }
+                sub._incoming[edge.target].append(eid)
+            }
+        }
+        return sub
+    }
+
+    fn all_nodes(self) -> List[any] {
+        let result: List[GraphNode] = []
+        for nid in self._nodes {
+            result.append(self._nodes[nid])
+        }
+        return result
+    }
+
+    fn all_edges(self) -> List[any] {
+        let result: List[GraphEdge] = []
+        for eid in self._edges {
+            result.append(self._edges[eid])
+        }
+        return result
+    }
+
+    fn isolated_nodes(self) -> List[any] {
+        let result: List[GraphNode] = []
+        for n in self._nodes.values() {
+            let nid = n.node_id()
+            if len(self._outgoing.get(nid, [])) == 0 and len(self._incoming.get(nid, [])) == 0 {
+                result.append(n)
+            }
+        }
+        return result
+    }
+
+    /// ── Serialisation ──────────────────────────────────────────────
+
+    fn to_dict(self) -> Dict[string, Any] {
+        let node_dicts: Dict[string, Any] = {}
+        for nid in self._nodes {
+            node_dicts[nid] = self._nodes[nid].to_dict()
+        }
+        let edge_dicts: Dict[string, Any] = {}
+        for eid in self._edges {
+            edge_dicts[eid] = self._edges[eid].to_dict()
+        }
+        return { "nodes": node_dicts, "edges": edge_dicts }
+    }
+
+    fn from_dict(d: Dict[string, Any]) -> CausalGraph {
+        let g = CausalGraph()
+        let nodes_d = d.get("nodes", {})
+        for nid in nodes_d {
+            let nd = nodes_d[nid]
+            g._nodes[nid] = GraphNode(
+                nd["concept"], nd.get("domain", ""),
+                nd.get("properties", {}),
+                nd.get("inputs", []), nd.get("outputs", []),
+                nd.get("constraints", []),
+                nd.get("fact_ids", []))
+        }
+        let edges_d = d.get("edges", {})
+        for eid in edges_d {
+            let ed = edges_d[eid]
+            let edge = GraphEdge(
+                ed["source"], ed["target"],
+                RelationType(ed["relation"]),
+                ed.get("confidence", 0.5),
+                ed.get("domain", ""),
+                ed.get("evidence", ""),
+                ed.get("fact_id", ""),
+                ed.get("derived", false),
+                ed.get("provenance", []))
+            edge.created_at = ed.get("created_at", time.time())
+            edge.last_accessed = ed.get("last_accessed", time.time())
+            edge.access_count = ed.get("access_count", 0)
+            g._edges[eid] = edge
+            if edge.source not in g._outgoing {
+                g._outgoing[edge.source] = []
+            }
+            g._outgoing[edge.source].append(eid)
+            if edge.target not in g._incoming {
+                g._incoming[edge.target] = []
+            }
+            g._incoming[edge.target].append(eid)
+        }
+        return g
+    }
+}
+
+/// ── Fact Extractor ─────────────────────────────────────────────────
+
+let _RELATION_PATTERNS: List[Tuple[string, RelationType]] = [
+    ("(.+?)\\s+causes?\\s+(.+)", RelationType.CAUSES),
+    ("(.+?)\\s+leads?\\s+to\\s+(.+)", RelationType.CAUSES),
+    ("(.+?)\\s+results?\\s+in\\s+(.+)", RelationType.CAUSES),
+    ("(.+?)\\s+produces?\\s+(.+)", RelationType.PRODUCES),
+    ("(.+?)\\s+generates?\\s+(.+)", RelationType.PRODUCES),
+    ("(.+?)\\s+prevents?\\s+(.+)", RelationType.PREVENTS),
+    ("(.+?)\\s+blocks?\\s+(.+)", RelationType.PREVENTS),
+    ("(.+?)\\s+inhibits?\\s+(.+)", RelationType.INHIBITS),
+    ("(.+?)\\s+suppresses?\\s+(.+)", RelationType.INHIBITS),
+    ("(.+?)\\s+requires?\\s+(.+)", RelationType.REQUIRES),
+    ("(.+?)\\s+needs?\\s+(.+)", RelationType.REQUIRES),
+    ("(.+?)\\s+depends?\\s+on\\s+(.+)", RelationType.REQUIRES),
+    ("(.+?)\\s+enables?\\s+(.+)", RelationType.ENABLES),
+    ("(.+?)\\s+allows?\\s+(.+)", RelationType.ENABLES),
+    ("(.+?)\\s+is\\s+(?:a|an)\\s+(?:type|kind|form)\\s+of\\s+(.+)", RelationType.IS_A),
+    ("(.+?)\\s+is\\s+(?:a|an)\\s+(.+)", RelationType.IS_A),
+    ("(.+?)\\s+is\\s+part\\s+of\\s+(.+)", RelationType.PART_OF),
+    ("(.+?)\\s+contains?\\s+(.+)", RelationType.PART_OF),
+    ("(.+?)\\s+is\\s+used\\s+(?:for|in|to)\\s+(.+)", RelationType.USED_FOR),
+    ("(.+?)\\s+is\\s+located\\s+in\\s+(.+)", RelationType.LOCATED_IN),
+    ("(.+?)\\s+(?:comes?|occurs?)\\s+before\\s+(.+)", RelationType.PRECEDES),
+    ("(.+?)\\s+has\\s+(?:the\\s+)?property\\s+(?:of\\s+)?(.+)", RelationType.HAS_PROPERTY),
+    ("(.+?)\\s+(?:is|are)\\s+characterized\\s+by\\s+(.+)", RelationType.HAS_PROPERTY),
+    ("(.+?)\\s+correlates?\\s+with\\s+(.+)", RelationType.CORRELATES),
+    ("(.+?)\\s+is\\s+associated\\s+with\\s+(.+)", RelationType.CORRELATES)
+]
+
+let _CAUSAL_KEYWORDS: Dict[string, RelationType] = {
+    "because": RelationType.CAUSES,
+    "therefore": RelationType.CAUSES,
+    "thus": RelationType.CAUSES,
+    "consequently": RelationType.CAUSES,
+    "so that": RelationType.ENABLES,
+    "in order to": RelationType.USED_FOR,
+    "which causes": RelationType.CAUSES,
+    "which prevents": RelationType.PREVENTS,
+    "which enables": RelationType.ENABLES,
+    "which requires": RelationType.REQUIRES,
+    "which produces": RelationType.PRODUCES,
+    "which inhibits": RelationType.INHIBITS,
+    "leading to": RelationType.CAUSES,
+    "resulting in": RelationType.CAUSES
+}
+
+fn _clean_concept(text: string) -> string {
+    text = text.strip().strip(".,;:!?\"'()[]")
+    text = regex_sub("\\s+", " ", text)
+    if "," in text {
+        text = text.split(",")[0].strip()
+    }
+    if " such as " in text.lower() {
+        text = text.lower().split(" such as ")[0].strip()
+    }
+    if " including " in text.lower() {
+        text = text.lower().split(" including ")[0].strip()
+    }
+    let words = text.split()
+    let cleaned: List[string] = []
+    for w in words {
+        if w.lower() not in _STOP and len(w) > 1 {
+            cleaned.append(w)
+        }
+    }
+    if len(cleaned) == 0 {
+        return ""
+    }
+    let limited: List[string] = []
+    for i in range(min(4, len(cleaned))) {
+        limited.append(cleaned[i])
+    }
+    return " ".join(limited)
+}
+
+type ExtractedTriple {
+    subject: string,
+    relation: RelationType,
+    obj: string,
+    confidence: float,
+    evidence: string,
+    fact_id: string,
+    domain: string
+}
+
+class FactExtractor {
+    fn extract_from_text(self, text: string, confidence: float,
+                         fact_id: string, domain: string) -> List[any] {
+        if confidence == None {
+            confidence = 0.5
+        }
+        if fact_id == None {
+            fact_id = ""
+        }
+        if domain == None {
+            domain = ""
+        }
+        let triples: List[ExtractedTriple] = []
+        let sentences = regex_split("[.;]\\s+", text)
+
+        for sent in sentences {
+            sent = sent.strip()
+            if len(sent) < 10 {
+                continue
+            }
+
+            for kw in _CAUSAL_KEYWORDS {
+                let rel = _CAUSAL_KEYWORDS[kw]
+                if kw in sent.lower() {
+                    let parts = regex_split(regex_escape(kw), sent, "IGNORECASE", 1)
+                    if len(parts) == 2 {
+                        let subj = _clean_concept(parts[0])
+                        let obj = _clean_concept(parts[1])
+                        if subj != "" and obj != "" and subj != obj {
+                            triples.append(ExtractedTriple {
+                                subject: subj, relation: rel, obj: obj,
+                                confidence: confidence * 0.85,
+                                evidence: sent, fact_id: fact_id, domain: domain
+                            })
+                        }
+                    }
+                }
+            }
+
+            for entry in _RELATION_PATTERNS {
+                let pattern = entry[0]
+                let rel = entry[1]
+                let m = regex_search(pattern, sent, "IGNORECASE")
+                if m != None {
+                    let subj = _clean_concept(m.group(1))
+                    let obj = _clean_concept(m.group(2))
+                    if subj != "" and obj != "" and len(subj) > 2 and len(obj) > 2 and subj != obj {
+                        let already = false
+                        for t in triples {
+                            if t.subject == subj and t.obj == obj and t.relation == rel {
+                                already = true
+                                break
+                            }
+                        }
+                        if not already {
+                            triples.append(ExtractedTriple {
+                                subject: subj, relation: rel, obj: obj,
+                                confidence: confidence * 0.80,
+                                evidence: sent, fact_id: fact_id, domain: domain
+                            })
+                        }
+                    }
+                }
+            }
+        }
+        return triples
+    }
+
+    fn extract_from_facts(self, facts: List[Dict[string, Any]],
+                          domain: string) -> List[any] {
+        if domain == None {
+            domain = ""
+        }
+        let all_triples: List[ExtractedTriple] = []
+        for fact in facts {
+            let text = fact.get("text", "")
+            let conf = fact.get("confidence", 0.5)
+            let fid = fact.get("id", "")
+            let d = domain
+            if d == "" {
+                d = fact.get("domain", "")
+            }
+            let triples = self.extract_from_text(text, conf, fid, d)
+            for t in triples {
+                all_triples.append(t)
+            }
+        }
+        return all_triples
+    }
+
+    fn populate_graph(self, graph: CausalGraph,
+                      facts: List[Dict[string, Any]],
+                      domain: string) -> int {
+        if domain == None {
+            domain = ""
+        }
+        let triples = self.extract_from_facts(facts, domain)
+        for t in triples {
+            graph.add_edge(
+                t.subject, t.obj, t.relation,
+                t.confidence, t.domain,
+                t.evidence, t.fact_id,
+                false, None)
+        }
+        return len(triples)
+    }
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export RelationType, GraphNode, GraphEdge, CausalGraph
+export ExtractedTriple, FactExtractor
+export _STOP, _clean_concept

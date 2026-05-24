@@ -1,0 +1,267 @@
+/// Validation gates for NRSI data — trust elevation through validator banks.
+///
+/// Full implementation of `nrsip/nrs_validation.py`.
+/// Validates data, enforces confidence thresholds, and elevates trust levels.
+
+module nrs_validation
+
+
+import time from "std/time"
+import Confidence, NRSIData, TrustLevel, ProvenanceEntry, raw from "types"
+
+/// ---------- Data records ----------
+
+type ValidationResult {
+    passed: bool,
+    confidence: float,
+    validator_name: string,
+    details: Optional[string],
+    timestamp: float
+}
+
+type GateResult {
+    gate_name: string,
+    passed: bool,
+    confidence: float,
+    results: List[ValidationResult],
+    elapsed_ms: float,
+    input_data: Any
+}
+
+fn gate_result_failed_validators(gr: GateResult) -> List[any] {
+    let failed = []
+    for r in gr.results {
+        if !r.passed {
+            append(failed, r.validator_name)
+        }
+    }
+    return failed
+}
+
+fn gate_result_summary(gr: GateResult) -> string {
+    let total = len(gr.results)
+    let passed_count = 0
+    for r in gr.results {
+        if r.passed {
+            passed_count += 1
+        }
+    }
+    let status = "FAILED"
+    if gr.passed {
+        status = "PASSED"
+    }
+    let msg = ("Gate[" + gr.gate_name + "] " + status + ": "
+        + str(passed_count) + "/" + str(total) + " validators passed, "
+        + "confidence=" + format_float(gr.confidence, 4) + ", "
+        + "elapsed=" + format_float(gr.elapsed_ms, 2) + "ms")
+    let failed = gate_result_failed_validators(gr)
+    if len(failed) > 0 {
+        msg += ", failed=[" + join(failed, ", ") + "]"
+    }
+    return msg
+}
+
+/// ---------- Validator (abstract) ----------
+
+class Validator {
+    fn validate(self, data: Any, context: Optional[Dict[string, Any]]) -> ValidationResult {
+        raise NotImplementedError("abstract method")
+    }
+}
+
+/// ---------- FunctionValidator ----------
+
+class FunctionValidator(Validator) {
+    fn new(self, func: Callable, name: Optional[string]) {
+        self._fn = func
+        if name != None {
+            self._name = name
+        } else {
+            self._name = "function_validator"
+        }
+    }
+
+    fn validate(self, data: Any, context: Optional[Dict[string, Any]]) -> ValidationResult {
+        let passed = false
+        let confidence = 0.0
+        let details = ""
+        try {
+            let result = self._fn(data, context)
+            passed = result[0]
+            confidence = result[1]
+            details = result[2]
+        } catch e {
+            let result = self._fn(data)
+            passed = result[0]
+            confidence = result[1]
+            details = result[2]
+        }
+        return ValidationResult {
+            passed: passed,
+            confidence: Confidence.validate(confidence),
+            validator_name: self._name,
+            details: details,
+            timestamp: time.time()
+        }
+    }
+}
+
+/// ---------- ValidationGate ----------
+
+class ValidationGate {
+    fn new(self, name: Optional[string], confidence_threshold: float,
+           validators: Optional[List[Validator]], target_trust: TrustLevel,
+           require_all: bool, audit: bool) {
+        if name != None {
+            self._name = name
+        } else {
+            self._name = "gate_" + hex_id(self)
+        }
+        self._confidence_threshold = confidence_threshold
+        if validators != None {
+            self._validators = list_copy(validators)
+        } else {
+            self._validators = []
+        }
+        self._target_trust = target_trust
+        self._require_all = require_all
+        self._audit = audit
+        self._total_processed = 0
+        self._passed = 0
+        self._failed = 0
+        self._confidence_sum = 0.0
+        self._last_gate_result = None
+    }
+
+    fn process(self, data: Any, context: Optional[Dict[string, Any]]) -> NRSIData {
+        let start = monotonic_now()
+        self._total_processed += 1
+
+        let results = []
+        for validator in self._validators {
+            append(results, validator.validate(data, context))
+        }
+
+        let all_passed = true
+        if self._require_all {
+            if len(results) > 0 {
+                for r in results {
+                    if !r.passed {
+                        all_passed = false
+                        break
+                    }
+                }
+            }
+        } else {
+            if len(results) > 0 {
+                all_passed = false
+                for r in results {
+                    if r.passed {
+                        all_passed = true
+                        break
+                    }
+                }
+            }
+        }
+
+        let avg_confidence = 1.0
+        if len(results) > 0 {
+            let conf_sum = 0.0
+            for r in results {
+                conf_sum += r.confidence
+            }
+            avg_confidence = conf_sum / len(results)
+        }
+
+        let elapsed_ms = (monotonic_now() - start) * 1000
+
+        let audit_data = None
+        if self._audit {
+            audit_data = data
+        }
+        let gate_result = GateResult {
+            gate_name: self._name,
+            passed: all_passed,
+            confidence: avg_confidence,
+            results: results,
+            elapsed_ms: elapsed_ms,
+            input_data: audit_data
+        }
+        self._last_gate_result = gate_result
+
+        if !all_passed {
+            self._failed += 1
+            let failed_names = gate_result_failed_validators(gate_result)
+            raise ValidationError(
+                self._name,
+                "Validation failed: " + str(failed_names),
+                avg_confidence,
+                self._confidence_threshold,
+                "Ensure data passes all required validators."
+            )
+        }
+
+        if avg_confidence < self._confidence_threshold {
+            self._failed += 1
+            raise ConfidenceError(
+                avg_confidence,
+                self._confidence_threshold,
+                "gate=" + self._name,
+                ("Confidence " + format_float(avg_confidence, 4) + " is below "
+                    + "threshold " + format_float(self._confidence_threshold, 4))
+            )
+        }
+
+        self._passed += 1
+        self._confidence_sum += avg_confidence
+
+        if is_nrsi_data(data) {
+            if data.trust_level < self._target_trust {
+                return data.elevate(
+                    self._target_trust,
+                    avg_confidence,
+                    self._name,
+                    gate_result_summary(gate_result)
+                )
+            }
+            return data
+        }
+
+        let nrsi_data = raw(data)
+        if self._target_trust > TrustLevel.RAW {
+            return nrsi_data.elevate(
+                self._target_trust,
+                avg_confidence,
+                self._name,
+                gate_result_summary(gate_result)
+            )
+        }
+        return nrsi_data
+    }
+
+    fn stats(self) -> Dict[string, Any] {
+        return {
+            "total_processed": self._total_processed,
+            "passed": self._passed,
+            "failed": self._failed,
+            "pass_rate": self._passed / max(self._total_processed, 1),
+            "avg_confidence": self._confidence_sum / max(self._passed, 1)
+        }
+    }
+}
+
+/// ---------- Convenience constructor ----------
+
+fn gate(name: Optional[string], confidence_threshold: float,
+        validators: Optional[List[Validator]], target_trust: TrustLevel,
+        require_all: bool, audit: bool) -> ValidationGate {
+    return ValidationGate.new(
+        name, confidence_threshold, validators,
+        target_trust, require_all, audit
+    )
+}
+
+export ValidationResult, GateResult
+export gate_result_failed_validators, gate_result_summary
+export Validator, FunctionValidator, ValidationGate
+export gate

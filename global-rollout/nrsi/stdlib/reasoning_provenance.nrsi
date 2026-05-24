@@ -1,0 +1,391 @@
+/// NRSI — Knowledge Provenance Chain.
+///
+/// Every claim the system makes has source, derivation path, confidence,
+/// staleness indicator, alternative viewpoints, and evidence count.
+/// Full epistemic accountability.
+/// All transformer-free.
+
+module reasoning_provenance
+
+
+import time from "std/time"
+from "reasoning_graph" import CausalGraph, GraphEdge, RelationType
+from "reasoning_bayesian" import GraphConfidenceManager, BayesianUpdater
+
+/// ---------- Types ----------
+
+type ProvenanceRecord {
+    claim: string,
+    edge_id: string,
+    source_type: string,
+    source_detail: string,
+    derivation_path: List[string],
+    confidence: float,
+    confidence_label: string,
+    created_at: float,
+    last_accessed: float,
+    age_days: float,
+    is_stale: bool,
+    evidence_for: int,
+    evidence_against: int,
+    alternatives: List[Dict[string, Any]],
+    domain: string
+}
+
+fn provenance_summary(r: ProvenanceRecord) -> string {
+    let parts: List[string] = []
+    parts.append("Claim: " + r.claim)
+    parts.append("Source: " + r.source_type + " (" + r.source_detail + ")")
+    let stale_marker = ""
+    if r.is_stale {
+        stale_marker = " [STALE]"
+    }
+    parts.append("Confidence: " + str(round(r.confidence * 100, 0)) + "% (" + r.confidence_label + ")")
+    parts.append("Age: " + str(round(r.age_days, 0)) + " days" + stale_marker)
+    parts.append("Evidence: " + str(r.evidence_for) + " for, " + str(r.evidence_against) + " against")
+    if len(r.derivation_path) > 0 {
+        parts.append("Derived via: " + " → ".join(r.derivation_path))
+    }
+    if len(r.alternatives) > 0 {
+        let alt_strs: List[string] = []
+        for i in range(min(3, len(r.alternatives))) {
+            let a = r.alternatives[i]
+            alt_strs.append(a["claim"] + " (" + str(round(a["confidence"] * 100, 0)) + "%)")
+        }
+        parts.append("Alternatives: " + "; ".join(alt_strs))
+    }
+    return "\n".join(parts)
+}
+
+type ClaimAuditTrail {
+    claims: List[ProvenanceRecord],
+    total_claims: int,
+    grounded_claims: int,
+    speculative_claims: int,
+    stale_claims: int,
+    avg_confidence: float,
+    avg_age_days: float,
+    strongest_claim: Optional[ProvenanceRecord],
+    weakest_claim: Optional[ProvenanceRecord]
+}
+
+fn audit_trail_summary(t: ClaimAuditTrail) -> string {
+    let parts: List[string] = []
+    parts.append("Claims: " + str(t.total_claims) + " total, " + str(t.grounded_claims) + " grounded, " + str(t.speculative_claims) + " speculative, " + str(t.stale_claims) + " stale")
+    parts.append("Avg confidence: " + str(round(t.avg_confidence * 100, 0)) + "%")
+    parts.append("Avg age: " + str(round(t.avg_age_days, 0)) + " days")
+    if t.strongest_claim != None {
+        parts.append("Strongest: " + t.strongest_claim.claim + " (" + str(round(t.strongest_claim.confidence * 100, 0)) + "%)")
+    }
+    if t.weakest_claim != None {
+        parts.append("Weakest: " + t.weakest_claim.claim + " (" + str(round(t.weakest_claim.confidence * 100, 0)) + "%)")
+    }
+    return "\n".join(parts)
+}
+
+/// ---------- Staleness thresholds (seconds) ----------
+
+let _STALENESS_THRESHOLDS: Dict[string, float] = {
+    "knowledge_pack": 365.0 * 86400.0,
+    "conversation": 1.0 * 86400.0,
+    "derivation": 30.0 * 86400.0,
+    "curiosity": 7.0 * 86400.0,
+    "common_sense": 3650.0 * 86400.0,
+    "user_correction": 90.0 * 86400.0
+}
+
+let _CONFIDENCE_LABELS: List[Tuple[float, string]] = [
+    (0.8, "established"),
+    (0.6, "likely"),
+    (0.4, "tentative"),
+    (0.2, "uncertain"),
+    (0.0, "speculative")
+]
+
+fn _confidence_label(conf: float) -> string {
+    for item in _CONFIDENCE_LABELS {
+        if conf >= item[0] {
+            return item[1]
+        }
+    }
+    return "speculative"
+}
+
+/// ---------- Provenance Tracker ----------
+
+class ProvenanceTracker {
+    fn __init__(self, graph: CausalGraph, confidence_mgr: Optional[GraphConfidenceManager]) {
+        self._graph = graph
+        if confidence_mgr != None {
+            self._confidence = confidence_mgr
+        } else {
+            self._confidence = GraphConfidenceManager(graph)
+        }
+    }
+
+    fn trace(self, subject: string, relation: RelationType, target: string) -> Optional[ProvenanceRecord] {
+        let subject_norm = subject.lower().strip()
+        let target_norm = target.lower().strip()
+
+        let edge = self._graph.get_edge(subject_norm, relation, target_norm)
+        if edge == None {
+            return None
+        }
+
+        let now = time.time()
+        let age_seconds = now - edge.created_at
+        let age_days = age_seconds / 86400.0
+
+        let source_type = self._classify_source(edge)
+        let staleness_threshold = 365.0 * 86400.0
+        if source_type in _STALENESS_THRESHOLDS {
+            staleness_threshold = _STALENESS_THRESHOLDS[source_type]
+        }
+        let is_stale = age_seconds > staleness_threshold
+
+        let derivation: List[string] = []
+        if edge.provenance != None {
+            for p in edge.provenance {
+                derivation.append(p)
+            }
+        }
+        if edge.derived {
+            derivation.insert(0, "derived")
+        }
+
+        let alternatives = self._find_alternatives(subject_norm, relation, target_norm)
+
+        let belief = self._confidence.get_belief(edge.edge_id)
+        let evidence_for = 0
+        let evidence_against = 0
+        let conf = edge.confidence
+        if belief != None {
+            evidence_for = belief.supporting_evidence
+            evidence_against = belief.contradicting_evidence
+            if belief.evidence_count > 0 {
+                conf = belief.posterior
+            }
+        }
+
+        let source_detail = "no detail"
+        if edge.evidence != None and edge.evidence != "" {
+            let detail = edge.evidence
+            if len(detail) > 100 {
+                detail = detail[:100]
+            }
+            source_detail = detail
+        }
+
+        return ProvenanceRecord {
+            claim: subject_norm + " " + relation.value + " " + target_norm,
+            edge_id: edge.edge_id,
+            source_type: source_type,
+            source_detail: source_detail,
+            derivation_path: derivation,
+            confidence: conf,
+            confidence_label: _confidence_label(conf),
+            created_at: edge.created_at,
+            last_accessed: edge.last_accessed,
+            age_days: age_days,
+            is_stale: is_stale,
+            evidence_for: evidence_for,
+            evidence_against: evidence_against,
+            alternatives: alternatives,
+            domain: edge.domain
+        }
+    }
+
+    fn trace_concept(self, concept: string) -> List[any] {
+        let concept_norm = concept.lower().strip()
+        let records: List[ProvenanceRecord] = []
+
+        for edge in self._graph.outgoing(concept_norm) {
+            let record = self.trace(edge.source, edge.relation, edge.target)
+            if record != None {
+                records.append(record)
+            }
+        }
+        for edge in self._graph.incoming(concept_norm) {
+            let record = self.trace(edge.source, edge.relation, edge.target)
+            if record != None {
+                records.append(record)
+            }
+        }
+
+        let sorted_records: List[ProvenanceRecord] = []
+        let remaining = list(records)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i].confidence > remaining[best_idx].confidence {
+                    best_idx = i
+                }
+            }
+            sorted_records.append(remaining.pop(best_idx))
+        }
+        return sorted_records
+    }
+
+    fn audit_response(self, claims: List[Tuple[string, string, string]]) -> ClaimAuditTrail {
+        let records: List[ProvenanceRecord] = []
+        for claim in claims {
+            let subj = claim[0]
+            let rel_str = claim[1]
+            let obj = claim[2]
+            try {
+                let rel = RelationType(rel_str)
+                let record = self.trace(subj, rel, obj)
+                if record != None {
+                    records.append(record)
+                }
+            } catch e {
+                continue
+            }
+        }
+
+        let grounded = 0
+        let speculative = 0
+        let stale = 0
+        for r in records {
+            if r.confidence >= 0.5 {
+                grounded += 1
+            }
+            if r.confidence < 0.3 {
+                speculative += 1
+            }
+            if r.is_stale {
+                stale += 1
+            }
+        }
+
+        let confs: List[float] = []
+        let ages: List[float] = []
+        if len(records) > 0 {
+            for r in records {
+                confs.append(r.confidence)
+                ages.append(r.age_days)
+            }
+        } else {
+            confs.append(0.0)
+            ages.append(0.0)
+        }
+
+        let sum_confs = 0.0
+        for c in confs {
+            sum_confs += c
+        }
+        let sum_ages = 0.0
+        for a in ages {
+            sum_ages += a
+        }
+
+        let strongest: Optional[ProvenanceRecord] = None
+        let weakest: Optional[ProvenanceRecord] = None
+        if len(records) > 0 {
+            strongest = records[0]
+            weakest = records[0]
+            for r in records {
+                if r.confidence > strongest.confidence {
+                    strongest = r
+                }
+                if r.confidence < weakest.confidence {
+                    weakest = r
+                }
+            }
+        }
+
+        return ClaimAuditTrail {
+            claims: records,
+            total_claims: len(claims),
+            grounded_claims: grounded,
+            speculative_claims: speculative,
+            stale_claims: stale,
+            avg_confidence: sum_confs / len(confs),
+            avg_age_days: sum_ages / len(ages),
+            strongest_claim: strongest,
+            weakest_claim: weakest
+        }
+    }
+
+    fn _classify_source(self, edge: GraphEdge) -> string {
+        if edge.derived {
+            return "derivation"
+        }
+        let evidence = ""
+        if edge.evidence != None {
+            evidence = edge.evidence.lower()
+        }
+        if "template" in evidence or edge.domain == "common_sense" {
+            return "common_sense"
+        }
+        if "conv-" in edge.fact_id {
+            return "conversation"
+        }
+        if "curiosity" in evidence {
+            return "curiosity"
+        }
+        if edge.domain != None and edge.domain != "" {
+            return "knowledge_pack"
+        }
+        return "unknown"
+    }
+
+    fn _find_alternatives(self, subject: string, relation: RelationType,
+                           target: string) -> List[any] {
+        let alternatives: List[Dict[string, Any]] = []
+
+        for edge in self._graph.incoming(target, relation) {
+            if edge.source != subject {
+                alternatives.append({
+                    "claim": edge.source + " " + relation.value + " " + target,
+                    "confidence": edge.confidence,
+                    "source": self._classify_source(edge)
+                })
+            }
+        }
+
+        if relation == RelationType.CAUSES {
+            for edge in self._graph.incoming(target, RelationType.CORRELATES) {
+                alternatives.append({
+                    "claim": edge.source + " correlates with " + target,
+                    "confidence": edge.confidence,
+                    "source": self._classify_source(edge),
+                    "note": "correlation, not causation"
+                })
+            }
+        }
+
+        let sorted_alts: List[Dict[string, Any]] = []
+        let remaining = list(alternatives)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i]["confidence"] > remaining[best_idx]["confidence"] {
+                    best_idx = i
+                }
+            }
+            sorted_alts.append(remaining.pop(best_idx))
+        }
+
+        let limited: List[Dict[string, Any]] = []
+        for i in range(min(5, len(sorted_alts))) {
+            limited.append(sorted_alts[i])
+        }
+        return limited
+    }
+}
+
+/// ---------- Gate ----------
+
+gate provenance_gate(data: raw[ProvenanceRecord]) -> validated[ProvenanceRecord] {
+    require confidence >= 0.3
+    validate source_check
+    validate staleness_check
+}
+
+/// ---------- Exports ----------
+
+export ProvenanceRecord, ClaimAuditTrail
+export provenance_summary, audit_trail_summary
+export ProvenanceTracker
+export provenance_gate

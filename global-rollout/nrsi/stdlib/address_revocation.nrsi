@@ -1,0 +1,200 @@
+/// NRSIP Address Revocation — Network-Wide Signed Announcements.
+///
+/// When an entity is compromised, its NRSIP address is revoked via signed
+/// announcements that propagate to all connected instances.
+///
+/// Patent-covered: Address revocation, signed announcements, network-wide propagation.
+///
+/// Ported from nrsip/address_revocation.py.
+
+module address_revocation
+
+
+import time from "std/time"
+import hashlib from "std/hashlib"
+/// ── Revocation Reason ──
+
+enum RevocationReason {
+    BEHAVIORAL_ATTESTATION_FAILURE = "behavioral_attestation_failure",
+    SECURITY_INCIDENT = "security_incident",
+    CREDIT_SCORE_BAN = "credit_score_ban",
+    ADMIN_ACTION = "admin_action",
+    KEY_COMPROMISE = "key_compromise",
+    POLICY_VIOLATION = "policy_violation"
+}
+
+/// ── Revocation Announcement ──
+
+class RevocationAnnouncement {
+    fn init(self, revocation_id: string, address: string,
+            entity_id: string, reason: RevocationReason,
+            issued_by: string, issued_at_ms: int,
+            ttl_hops: int, evidence: Optional[Map[string, any]]) {
+        self.revocation_id = revocation_id
+        self.address = address
+        self.entity_id = entity_id
+        self.reason = reason
+        self.issued_by = issued_by
+        self.issued_at_ms = issued_at_ms
+        self.ttl_hops = ttl_hops
+        self.signature = ""
+        self.signature_algorithm = "CRYSTALS-Dilithium3"
+        if evidence != nil {
+            self.evidence = evidence
+        } else {
+            self.evidence = {}
+        }
+    }
+
+    fn payload_hash(self) -> string {
+        let data = self.revocation_id + ":" + self.address + ":" +
+                   self.entity_id + ":" + self.reason.value + ":" +
+                   self.issued_by + ":" + to_string(self.issued_at_ms)
+        return hashlib.sha256(data).hexdigest()
+    }
+
+    fn sign(self, signing_fn: Optional[any]) {
+        let payload = self.payload_hash()
+        if signing_fn != nil {
+            self.signature = signing_fn(payload.to_bytes())
+        } else {
+            self.signature = hashlib.sha256("dilithium-revoke:" + payload).hexdigest()
+        }
+    }
+
+    fn verify(self, verify_fn: Optional[any]) -> bool {
+        if self.signature == "" {
+            return false
+        }
+        let payload = self.payload_hash()
+        if verify_fn != nil {
+            return verify_fn(payload.to_bytes(), self.signature)
+        }
+        let expected = hashlib.sha256("dilithium-revoke:" + payload).hexdigest()
+        return self.signature == expected
+    }
+}
+
+/// ── Revocation Store ──
+
+class RevocationStore {
+    fn init(self) {
+        self._revoked = {}
+        self._seen_ids = set()
+    }
+
+    fn is_revoked(self, address: string) -> bool {
+        return self._revoked.get(address, nil) != nil
+    }
+
+    fn is_entity_revoked(self, entity_id: string) -> bool {
+        for a in self._revoked.values() {
+            if a.entity_id == entity_id {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn apply(self, announcement: RevocationAnnouncement) -> bool {
+        if self._seen_ids.contains(announcement.revocation_id) {
+            return false
+        }
+        if !announcement.verify(nil) {
+            return false
+        }
+        self._revoked[announcement.address] = announcement
+        self._seen_ids.add(announcement.revocation_id)
+        return true
+    }
+
+    fn get(self, address: string) -> Optional[RevocationAnnouncement] {
+        return self._revoked.get(address, nil)
+    }
+
+    fn count(self) -> int {
+        return self._revoked.len()
+    }
+
+    fn list_all(self) -> List[any] {
+        return self._revoked.values()
+    }
+}
+
+/// ── Revocation Service ──
+
+class RevocationService {
+    fn init(self, issuer_id: string, signing_fn: Optional[any]) {
+        self._issuer = issuer_id
+        self._signing_fn = signing_fn
+        self._store = RevocationStore()
+        self._store.init()
+        self._peers = []
+    }
+
+    fn register_peer(self, propagate_fn: any) {
+        self._peers.append(propagate_fn)
+    }
+
+    fn revoke(self, address: string, entity_id: string,
+              reason: RevocationReason, evidence: Optional[Map[string, any]],
+              ttl_hops: int) -> RevocationAnnouncement {
+        let revocation_id = hashlib.sha256(
+            "revoke:" + address + ":" + entity_id + ":" + to_string(time.time())
+        ).hexdigest().slice(0, 16)
+
+        let ev = evidence
+        if ev == nil {
+            ev = {}
+        }
+
+        let announcement = RevocationAnnouncement()
+        announcement.init(revocation_id, address, entity_id, reason,
+                          self._issuer, to_int(time.time() * 1000.0),
+                          ttl_hops, ev)
+        announcement.sign(self._signing_fn)
+        self._store.apply(announcement)
+
+        for peer_fn in self._peers {
+            try {
+                peer_fn(announcement)
+            } catch(e) {
+                pass
+            }
+        }
+
+        return announcement
+    }
+
+    fn receive(self, announcement: RevocationAnnouncement) -> bool {
+        if announcement.ttl_hops <= 0 {
+            return false
+        }
+        if !self._store.apply(announcement) {
+            return false
+        }
+
+        let forwarded = RevocationAnnouncement()
+        forwarded.init(announcement.revocation_id, announcement.address,
+                       announcement.entity_id, announcement.reason,
+                       announcement.issued_by, announcement.issued_at_ms,
+                       announcement.ttl_hops - 1, announcement.evidence)
+        forwarded.signature = announcement.signature
+
+        for peer_fn in self._peers {
+            try {
+                peer_fn(forwarded)
+            } catch(e) {
+                pass
+            }
+        }
+        return true
+    }
+
+    fn store(self) -> RevocationStore {
+        return self._store
+    }
+}
+
+export RevocationReason, RevocationAnnouncement
+export RevocationStore, RevocationService

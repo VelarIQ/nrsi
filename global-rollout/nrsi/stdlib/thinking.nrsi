@@ -1,0 +1,162 @@
+/// NRSI Adaptive Thinking — Phase-Aware Reasoning Budget Control
+///
+/// Controls reasoning depth per phase based on query complexity (T0Router tier)
+/// and the 7-dimension ModeVector.  Each phase emits SSE events for live
+/// thinking visibility in the client UI.
+///
+/// Unlike opaque single-phase thinking, NRS explicitly allocates budget
+/// across five named phases and adjusts in real-time via mode vector.
+
+module thinking
+
+import TrustLevel, NRSIData, EpistemicType, Confidence from "types"
+import factual_verify from "gates"
+
+/// ---------- Thinking Phase Enum ----------
+
+enum ThinkingPhase {
+    ANALYZE,
+    PLAN,
+    EXECUTE,
+    VALIDATE,
+    SYNTHESIZE
+}
+
+/// ---------- Thinking Config ----------
+
+enum ThinkingType {
+    ADAPTIVE,
+    FIXED,
+    DISABLED
+}
+
+type ThinkingConfig {
+    mode: ThinkingType,
+    budget_tokens: int,
+    tier: string
+}
+
+/// ---------- Phase Budget ----------
+
+type PhaseBudget {
+    phase: ThinkingPhase,
+    tokens: int,
+    used: int,
+    started_at: float,
+    finished_at: float
+}
+
+/// ---------- Tier Budgets ----------
+/// T0 = 256, T1 = 1024, T2 = 4096, T3 = 16384, T4 = 65536
+
+fn tier_budget(tier: string) -> int {
+    let budgets = {
+        "T0": 256,
+        "T1": 1024,
+        "T2": 4096,
+        "T3": 16384,
+        "T4": 65536
+    }
+    let budget = budgets.get(tier, 4096)
+    return budget
+}
+
+/// ---------- Phase Weight Defaults ----------
+/// analyze: 0.15, plan: 0.20, execute: 0.30, validate: 0.25, synthesize: 0.10
+
+fn phase_weight(phase: ThinkingPhase) -> float {
+    let weights = {
+        ThinkingPhase.ANALYZE: 0.15,
+        ThinkingPhase.PLAN: 0.20,
+        ThinkingPhase.EXECUTE: 0.30,
+        ThinkingPhase.VALIDATE: 0.25,
+        ThinkingPhase.SYNTHESIZE: 0.10
+    }
+    let weight = weights.get(phase, 0.20)
+    return weight
+}
+
+/// ---------- Adaptive Thinking Gate ----------
+/// Validates that a thinking phase completed within budget
+
+gate thinking_phase_verify(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.30
+    require data.domain != "unknown"
+    validate budget_compliance
+    validate phase_completeness
+}
+
+/// ---------- Phase Entry Functions ----------
+
+fn enter_analyze(query: string, tier: string) -> raw[NRSIData] {
+    let budget = tier_budget(tier)
+    let query_tokens = query.split(" ").len()
+    let complexity = "simple"
+    if query_tokens > 20 {
+        complexity = "complex"
+    } else if query_tokens > 10 {
+        complexity = "moderate"
+    }
+    let analysis = {
+        "query": query,
+        "tier": tier,
+        "budget": budget,
+        "complexity": complexity,
+        "token_estimate": query_tokens * 4,
+        "phase": "ANALYZE"
+    }
+    return raw(to_string(analysis), "metacognition")
+}
+
+fn enter_plan(query: string, domain: string) -> raw[NRSIData] {
+    let plan = decompose(query)
+    let plan_weight = phase_weight(ThinkingPhase.PLAN)
+    let plan_data = {
+        "plan": plan,
+        "domain": domain,
+        "weight": plan_weight,
+        "phase": "PLAN"
+    }
+    return raw(to_string(plan_data), domain)
+}
+
+fn enter_execute(query: string, domain: string) -> raw[NRSIData] {
+    let exec_weight = phase_weight(ThinkingPhase.EXECUTE)
+    let exec_data = {
+        "query": query,
+        "domain": domain,
+        "weight": exec_weight,
+        "phase": "EXECUTE"
+    }
+    return raw(to_string(exec_data), domain)
+}
+
+fn enter_validate(answer: string, query: string) -> validated[NRSIData] {
+    let validate_weight = phase_weight(ThinkingPhase.VALIDATE)
+    let validation_data = {
+        "answer": answer,
+        "query": query,
+        "weight": validate_weight,
+        "phase": "VALIDATE",
+        "checks": ["coherence", "factual_accuracy", "completeness"]
+    }
+    let result = raw(to_string(validation_data), "validation")
+    return thinking_phase_verify(result)
+}
+
+fn enter_synthesize(answer: string, domain: string) -> validated[NRSIData] {
+    let synth_weight = phase_weight(ThinkingPhase.SYNTHESIZE)
+    let synth_data = {
+        "answer": answer,
+        "domain": domain,
+        "weight": synth_weight,
+        "phase": "SYNTHESIZE"
+    }
+    let result = raw(to_string(synth_data), domain)
+    return factual_verify(result)
+}
+
+export ThinkingPhase, ThinkingType, ThinkingConfig, PhaseBudget
+export tier_budget, phase_weight
+export thinking_phase_verify
+export enter_analyze, enter_plan, enter_execute, enter_validate, enter_synthesize

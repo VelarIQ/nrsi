@@ -1,0 +1,3333 @@
+module generative_engine
+
+import hashlib
+import re
+import random
+from "nrsip/semantic_engine" import SemanticEngine
+from "nrsip/logic_engine" import LogicEngine
+from "nrsi/lang/cognitive_primitives" import nrsi_compose, CompositionResult
+
+let _shared_semantic: Optional[SemanticEngine] = None
+let _shared_logic: Optional[LogicEngine] = None
+let _shared_causal = None
+let _shared_analogy = None
+let _shared_planner = None
+
+fn set_agi_engines(semantic, logic, causal, analogy, planner) {
+    if semantic != None {
+        _shared_semantic = semantic
+    }
+    if logic != None {
+        _shared_logic = logic
+    }
+    if causal != None {
+        _shared_causal = causal
+    }
+    if analogy != None {
+        _shared_analogy = analogy
+    }
+    if planner != None {
+        _shared_planner = planner
+    }
+}
+
+enum GenerationMode {
+    INTERPOLATION,
+    SYNTHESIS,
+    STYLE_TRANSFER,
+    ANALOGICAL,
+    COMBINATORIAL
+}
+
+type PatternStyle {
+    tone: str,
+    length: str,
+    structure: str,
+    creativity: float,
+    emotional_valence: float
+}
+
+class PatternInterpolator {
+    fn __init__(self) {
+        self.interpolation_cache: Dict[str, Dict[str, Any]] = {}
+    }
+
+    fn interpolate_linear(self, pattern_a: Dict[str, Any], pattern_b: Dict[str, Any], alpha: float) -> Dict[str, Any] {
+        if alpha == None {
+            alpha = 0.5
+        }
+        let subject_a = self._extract_subject(pattern_a.get("text", ""))
+        let subject_b = self._extract_subject(pattern_b.get("text", ""))
+        let action_a = self._extract_action(pattern_a.get("text", ""))
+        let action_b = self._extract_action(pattern_b.get("text", ""))
+        let location_a = self._extract_location(pattern_a.get("text", ""))
+        let location_b = self._extract_location(pattern_b.get("text", ""))
+
+        let subject = subject_a
+        if alpha >= 0.5 {
+            subject = subject_b
+        }
+        let action = action_a
+        if alpha > 0.3 {
+            action = action_b
+        }
+        let location = location_a
+        if alpha >= 0.7 {
+            location = location_b
+        }
+
+        let interpolated_text = subject + " " + action + " " + location
+        let conf_a = pattern_a.get("confidence", 0.5)
+        let conf_b = pattern_b.get("confidence", 0.5)
+
+        return {
+            "text": interpolated_text,
+            "confidence": min(conf_a, conf_b) * 0.9,
+            "source": "interpolation",
+            "alpha": alpha,
+            "patterns_used": [pattern_a.get("id", "a"), pattern_b.get("id", "b")]
+        }
+    }
+
+    fn interpolate_spherical(self, patterns: List[Dict[str, Any]], target_style: PatternStyle) -> Dict[str, Any] {
+        let weights = []
+        for pattern in patterns {
+            let pattern_style = self._extract_style(pattern)
+            let similarity = self._style_similarity(pattern_style, target_style)
+            weights.append(similarity)
+        }
+
+        let total = sum(weights)
+        if total == 0 {
+            total = 1.0
+        }
+        let normalized = []
+        for w in weights {
+            normalized.append(w / total)
+        }
+        weights = normalized
+
+        let blended_components = self._blend_with_weights(patterns, weights)
+
+        let avg_conf = 0.0
+        for p in patterns {
+            avg_conf += p.get("confidence", 0.5)
+        }
+        if len(patterns) > 0 {
+            avg_conf = (avg_conf / len(patterns)) * 0.85
+        } else {
+            avg_conf = 0.0
+        }
+
+        let pattern_ids = []
+        for p in patterns {
+            pattern_ids.append(p.get("id", ""))
+        }
+
+        return {
+            "text": self._assemble_components(blended_components),
+            "confidence": avg_conf,
+            "source": "spherical_interpolation",
+            "patterns_used": pattern_ids
+        }
+    }
+
+    fn _extract_subject(self, text: str) -> str {
+        let words = text.split()
+        for word in words[:3] {
+            if word[0:1].isupper() or word == "the" or word == "a" or word == "an" {
+                continue
+            }
+            return word
+        }
+        if len(words) > 0 {
+            return words[0]
+        }
+        return "Something"
+    }
+
+    fn _extract_action(self, text: str) -> str {
+        for word in text.split() {
+            if word.endswith("ed") or word.endswith("ing") or word.endswith("s") or word == "is" or word == "are" or word == "was" {
+                return word
+            }
+        }
+        let words = text.split()
+        if len(words) > 1 {
+            return words[1]
+        }
+        return ""
+    }
+
+    fn _extract_location(self, text: str) -> str {
+        let words = text.split()
+        if len(words) > 3 {
+            return " ".join(words[-3:])
+        }
+        return " ".join(words)
+    }
+
+    fn _extract_style(self, pattern: Dict[str, Any]) -> PatternStyle {
+        let text = pattern.get("text", "")
+        let tone = "formal"
+        if "!" in text or "?" in text {
+            tone = "casual"
+        }
+        let length = "moderate"
+        if len(text) < 50 {
+            length = "brief"
+        } else {
+            if len(text) > 150 {
+                length = "detailed"
+            }
+        }
+
+        let creativity_markers = ["like", "as if", "imagine", "perhaps", "might"]
+        let creativity_count = 0
+        for m in creativity_markers {
+            if m in text.lower() {
+                creativity_count += 1
+            }
+        }
+        let creativity = creativity_count / len(creativity_markers)
+
+        let positive = ["good", "great", "excellent", "happy", "love"]
+        let negative = ["bad", "terrible", "sad", "hate", "awful"]
+        let pos_count = 0
+        for w in positive {
+            if w in text.lower() {
+                pos_count += 1
+            }
+        }
+        let neg_count = 0
+        for w in negative {
+            if w in text.lower() {
+                neg_count += 1
+            }
+        }
+        let emotional_valence = (pos_count - neg_count) / max(pos_count + neg_count, 1)
+
+        return PatternStyle {
+            tone: tone,
+            length: length,
+            structure: "narrative",
+            creativity: creativity,
+            emotional_valence: emotional_valence
+        }
+    }
+
+    fn _style_similarity(self, a: PatternStyle, b: PatternStyle) -> float {
+        let tone_match = 0.5
+        if a.tone == b.tone {
+            tone_match = 1.0
+        }
+        let length_match = 0.7
+        if a.length == b.length {
+            length_match = 1.0
+        }
+        let creativity_diff = abs(a.creativity - b.creativity)
+        let emotion_diff = abs(a.emotional_valence - b.emotional_valence)
+        return (tone_match + length_match + (1 - creativity_diff) + (1 - emotion_diff)) / 4
+    }
+
+    fn _blend_with_weights(self, patterns: List[Dict[str, Any]], weights: List[float]) -> Dict[str, List[str]] {
+        let components: Dict[str, List[str]] = {
+            "subjects": [],
+            "actions": [],
+            "locations": [],
+            "modifiers": []
+        }
+        let idx = 0
+        for pattern in patterns {
+            let weight = weights[idx]
+            if weight > 0.2 {
+                let text = pattern.get("text", "")
+                components["subjects"].append(self._extract_subject(text))
+                components["actions"].append(self._extract_action(text))
+                components["locations"].append(self._extract_location(text))
+            }
+            idx += 1
+        }
+        return components
+    }
+
+    fn _assemble_components(self, components: Dict[str, List[str]]) -> str {
+        let subject = "Something"
+        if len(components["subjects"]) > 0 {
+            subject = components["subjects"][0]
+        }
+        let action = "exists"
+        if len(components["actions"]) > 0 {
+            action = components["actions"][0]
+        }
+        let location = "here"
+        if len(components["locations"]) > 0 {
+            location = components["locations"][0]
+        }
+        return subject + " " + action + " " + location
+    }
+}
+
+class CompositionSynthesizer {
+    fn __init__(self) {
+        self.composition_rules = self._load_composition_rules()
+    }
+
+    fn synthesize_creative(self, topic: str, style: PatternStyle, length: int) -> str {
+        if length == None {
+            length = 100
+        }
+        let intro = topic.capitalize() + " represents an important concept"
+        let detail = "spanning multiple domains of knowledge"
+        let fragments = []
+        if style.creativity > 0.7 {
+            let metaphor = topic + " is like a bridge connecting ideas"
+            fragments = [intro, metaphor, detail]
+        } else {
+            fragments = [intro, detail]
+        }
+        return self._merge_fragments(fragments, style, length)
+    }
+
+    fn synthesize_conversational(self, query: str, conversation_history: List[Dict[str, str]], personality: Dict[str, float], lobe_facts: Optional[List[str]], knowledge_facts: Optional[List[str]]) -> str {
+        let q = query.lower().strip().rstrip("?!., ")
+
+        if q == "hi" or q == "hello" or q == "hey" or q == "greetings" or q == "yo" or q == "sup" {
+            return "Hello! I'm PRISM NRS, VelarIQ's neural reasoning system. I can help you reason through questions, analyze information, do math, explore history, geography, science, technology -- or just chat. What's on your mind?"
+        }
+
+        if "who are you" in q or "what are you" in q {
+            return "I'm PRISM NRS -- a Neuromorphic Reasoning System built by VelarIQ. Unlike large language models, I don't predict the next token in a sequence. Instead, I route your query through six specialized reasoning lobes -- linguistic, logical, mathematical, spatial, temporal, and creative -- each of which processes the question from a different cognitive angle.\n\nMy answers are assembled from verified knowledge packs and validated through a symbiotic mesh that cross-checks facts for consistency. Every response carries a provenance chain so you can trace how I arrived at the answer. Transport between NRS nodes is secured with post-quantum cryptography (ML-KEM-1024 + Dilithium3) via the NRSIP protocol.\n\nWhat would you like to know?"
+        }
+
+        if "how are you" in q {
+            return "All systems nominal -- six reasoning lobes online, PVS-4 pattern cache warm, VLT memory hierarchy active, and post-quantum transport secured. What can I help you with?"
+        }
+
+        if q == "help" or q == "what can you do" or q == "what do you do" {
+            return "Here's what I can help with:\n\n**Factual questions** -- I'll pull from my knowledge packs across science, history, geography, technology, math, and programming, then compose a verified answer.\n\n**Reasoning and analysis** -- logical deduction, cause-and-effect chains, comparisons, and multi-step problem solving through my logical and mathematical lobes.\n\n**Creative tasks** -- brainstorming, writing, idea generation through pattern interpolation and compositional synthesis.\n\n**Technical deep-dives** -- networking, cryptography, security, software architecture.\n\nJust ask naturally -- I'll figure out which lobes to activate."
+        }
+
+        if "joke" in q or "funny" in q {
+            return "Why do programmers prefer dark mode?\n\nBecause light attracts bugs.\n\n(My creative lobe generated that. It's better at reasoning than comedy.)"
+        }
+
+        if "thank" in q {
+            return "You're welcome! Let me know if there's anything else I can help with."
+        }
+
+        let all_facts = self._gather_facts(knowledge_facts, lobe_facts)
+        let context = self._build_conversation_context(query, conversation_history)
+
+        if _shared_semantic != None and context.get("has_history") {
+            try {
+                let prior = context.get("prior_topic", "")
+                if prior {
+                    let topic_shift = 1.0 - _shared_semantic.similarity(query, prior)
+                    context["topic_shift_magnitude"] = topic_shift
+                }
+            } catch(e) {
+                pass
+            }
+        }
+
+        if _shared_causal != None {
+            try {
+                if knowledge_facts != None {
+                    for fact in knowledge_facts {
+                        _shared_causal.ingest(fact, source: "knowledge")
+                    }
+                }
+                for msg in conversation_history {
+                    if msg.get("content") {
+                        _shared_causal.ingest(msg["content"], source: "conversation")
+                    }
+                }
+            } catch(e) {
+                pass
+            }
+        }
+
+        let domain = self._detect_domain(query)
+        let topic = self._extract_topic(query)
+        let intent = self._classify_intent(query)
+
+        all_facts = self._filter_relevant_facts(all_facts, query, topic, context)
+
+        let _creative_intents = {"write", "compose", "create", "tell", "generate", "make"}
+        let _creative_forms = {"poem", "story", "tale", "song", "haiku", "limerick", "narrative", "fiction", "verse", "ballad", "sonnet"}
+        let _ql_words = set(query.lower().split())
+        if len(_ql_words & _creative_intents) > 0 and len(_ql_words & _creative_forms) > 0 {
+            return self._compose_creative(query, topic, domain, personality)
+        }
+
+        if intent == "opinion" {
+            return self._compose_opinion(query, topic, domain, self._inference_chain(query, topic, domain, context), personality)
+        }
+
+        if all_facts {
+            return self._compose_rich_response(query, topic, domain, intent, all_facts, context, personality)
+        }
+
+        return self._compose_reasoned_response(query, topic, domain, intent, context, personality)
+    }
+
+    let _FILLER_WORDS = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "has",
+        "have", "had", "do", "does", "did", "will", "can", "may", "in",
+        "of", "to", "for", "on", "with", "at", "by", "from", "as", "or",
+        "and", "but", "not", "it", "its", "this", "that", "these", "those",
+        "so", "if", "all", "no", "any", "up", "out", "new", "one", "two",
+        "also", "used", "uses", "using", "many", "such", "more", "most",
+        "often", "well", "between", "across", "within", "while", "based",
+        "white", "large", "small", "key", "high", "low", "long",
+        "real", "modern", "major", "common", "other", "first", "world"
+    }
+
+    let _DOMAIN_SIGNALS: Dict[str, List[str]] = {
+        "science": ["atom", "molecule", "cell", "energy", "physics", "chemistry", "biology", "quantum", "electron", "gravity", "species", "evolution", "dna", "photon", "force", "mass", "wave", "particle", "reaction", "entropy", "thermodynamic", "magnetic", "electric", "genome", "protein", "nucleus", "black hole", "relativity", "neutron", "proton", "supernova", "telescope", "galaxy", "orbit", "vaccine", "virus", "bacteria", "neuron", "synapse", "plasma", "isotope", "radioactive", "organism", "ecosystem"],
+        "technology": ["computer", "software", "hardware", "internet", "network", "protocol", "algorithm", "database", "server", "api", "encryption", "cpu", "gpu", "cloud", "machine learning", "neural network", "tcp", "http", "blockchain", "operating system", "bandwidth", "latency", "router", "kubernetes", "docker", "microservice", "ssl", "tls", "firewall", "vpn", "dns", "load balancer", "cache", "redis", "sql", "artificial intelligence", "deep learning", "reinforcement learning"],
+        "history": ["war", "century", "empire", "revolution", "ancient", "medieval", "dynasty", "civilization", "era", "founded", "invented", "discovered", "treaty", "kingdom", "colonial", "independence", "president", "monarch", "world war", "cold war", "renaissance", "ottoman", "roman empire", "pharaoh", "crusade", "industrial revolution"],
+        "mathematics": ["equation", "theorem", "proof", "calculate", "integral", "derivative", "matrix", "algebra", "geometry", "probability", "formula", "prime", "factorial", "logarithm", "polynomial", "sequence", "pythagorean", "calculus", "trigonometry", "topology", "combinatorics", "eigenvalue", "determinant", "congruence"],
+        "geography": ["country", "capital", "continent", "ocean", "mountain", "river", "population", "latitude", "longitude", "border", "island", "desert", "region", "territory", "peninsula", "hemisphere", "equator", "tectonic"],
+        "programming": ["code", "variable", "class", "loop", "array", "python", "javascript", "compile", "debug", "git", "framework", "module", "syntax", "recursion", "async", "rust", "golang", "typescript", "react", "node.js", "asyncio", "decorator", "generator", "coroutine", "threading"],
+        "philosophy": ["ethics", "morality", "epistemology", "metaphysics", "ontology", "existentialism", "stoicism", "utilitarianism", "deontology", "philosopher", "socrates", "plato", "aristotle", "kant", "nietzsche", "free will", "determinism", "consciousness", "phenomenology", "categorical imperative", "virtue ethics", "pragmatism"],
+        "psychology": ["cognition", "cognitive", "behavioral", "mental health", "therapy", "depression", "anxiety", "personality", "intelligence", "perception", "memory", "emotion", "motivation", "conditioning", "psychoanalysis", "freud", "piaget", "attachment", "bias", "heuristic", "neuroscience"],
+        "economics": ["gdp", "inflation", "unemployment", "fiscal policy", "monetary policy", "supply and demand", "market", "trade", "tariff", "microeconomics", "macroeconomics", "interest rate", "central bank", "recession", "keynesian", "capitalism", "socialism", "exchange rate", "deficit"],
+        "medicine": ["diagnosis", "treatment", "symptom", "disease", "surgery", "patient", "doctor", "hospital", "drug", "medication", "antibiotic", "cancer", "diabetes", "heart disease", "stroke", "immune", "organ", "anatomy", "pharmacology", "public health", "epidemic", "pandemic"],
+        "law": ["legal", "court", "judge", "jury", "constitution", "rights", "criminal", "civil", "lawsuit", "contract", "tort", "patent", "copyright", "trademark", "regulation", "statute", "precedent", "jurisdiction", "amendment", "supreme court", "legislation", "liability"],
+        "business": ["startup", "entrepreneur", "marketing", "management", "strategy", "revenue", "profit", "investor", "venture capital", "ipo", "corporate", "ceo", "brand", "customer", "supply chain", "saas", "b2b", "valuation", "acquisition", "merger"],
+        "art": ["painting", "sculpture", "artist", "gallery", "museum", "canvas", "impressionism", "cubism", "renaissance art", "abstract", "picasso", "monet", "van gogh", "warhol", "fresco", "portrait"],
+        "music": ["melody", "harmony", "rhythm", "chord", "song", "instrument", "orchestra", "composer", "symphony", "jazz", "rock", "hip hop", "piano", "guitar", "beatles", "beethoven", "mozart", "concert", "genre", "album", "vocalist", "tempo"],
+        "literature": ["novel", "poem", "author", "fiction", "narrative", "character", "shakespeare", "tolstoy", "hemingway", "kafka", "dickens", "literary", "prose", "verse", "metaphor", "irony", "genre", "epic", "tragedy", "satire", "publisher"],
+        "sports": ["athlete", "olympic", "championship", "tournament", "soccer", "football", "basketball", "tennis", "cricket", "baseball", "swimming", "marathon", "medal", "coach", "stadium", "world cup", "nba", "nfl", "fifa", "referee"],
+        "religion": ["god", "worship", "prayer", "scripture", "church", "mosque", "temple", "buddhism", "christianity", "islam", "hinduism", "judaism", "bible", "quran", "torah", "meditation", "spiritual", "faith", "salvation", "karma", "dharma", "sin"],
+        "engineering": ["bridge", "structural", "mechanical", "electrical", "civil engineering", "aerospace", "thermodynamics", "circuit", "turbine", "motor", "construction", "materials science", "robotics", "manufacturing"],
+        "environment": ["climate change", "greenhouse", "carbon", "pollution", "renewable energy", "solar", "wind energy", "deforestation", "biodiversity", "conservation", "sustainability", "recycling", "ecosystem", "extinction", "coral reef", "ozone"],
+        "languages": ["grammar", "syntax", "phonology", "morphology", "dialect", "bilingual", "writing system", "alphabet", "language family", "indo-european", "linguistics", "translation", "vowel", "consonant", "creole", "pidgin", "sign language"],
+        "food": ["cuisine", "recipe", "ingredient", "cooking", "chef", "restaurant", "fermentation", "baking", "spice", "flavor", "nutrition", "organic", "agriculture", "crop", "harvest", "culinary", "vegetarian", "vegan", "wine", "coffee", "tea"]
+    }
+
+    let _PHYSICS_COSMOLOGY_SIGNALS = {
+        "relativity", "einstein", "spacetime", "spacelike", "timelike", "lorentz",
+        "black hole", "black holes", "schwarzschild", "event horizon", "singularity",
+        "gravitational", "graviton", "hawking", "cosmology", "cosmological", "redshift",
+        "big bang", "neutron star", "white dwarf", "accretion", "photon sphere"
+    }
+
+    let _BIOLOGY_STRONG_SIGNALS = {
+        "endosymbiotic", "endosymbiosis", "symbiosis", "symbiotic", "mitochondria",
+        "mitochondrion", "chloroplast", "chloroplasts", "ribosome", "photosynthesis",
+        "cytoplasm", "cytoskeleton", "meiosis", "mitosis", "organelle", "lysosome"
+    }
+
+    let _MATH_TOPOLOGY_STRONG_SIGNALS = {
+        "homotopy", "homotopic", "homeomorphism", "cohomology", "homology",
+        "fundamental group", "algebraic topology", "topological space", "fiber bundle"
+    }
+
+    fn _domain_keyword_scores(self, text: str) -> Dict[str, int] {
+        let tl = text.lower()
+        let tl_words_raw = tl.split()
+        let tl_words = set()
+        for w in tl_words_raw {
+            tl_words.add(w.strip(".,;:!?\"'()-"))
+        }
+        let scores: Dict[str, int] = {}
+        for dom in self._DOMAIN_SIGNALS.keys() {
+            let kws = self._DOMAIN_SIGNALS[dom]
+            let c = 0
+            for kw in kws {
+                if self._kw_in_text(kw, tl, tl_words) {
+                    c += 1
+                }
+            }
+            if c > 0 {
+                scores[dom] = c
+            }
+        }
+        return scores
+    }
+
+    fn _foreign_domain_dominates_fact(self, fact: str, detected_domain: str) -> bool {
+        if detected_domain == "general" {
+            return false
+        }
+        let scores = self._domain_keyword_scores(fact)
+        if not scores {
+            return false
+        }
+        let here = scores.get(detected_domain, 0)
+        let others = []
+        for d in scores.keys() {
+            if d != detected_domain {
+                others.append(scores[d])
+            }
+        }
+        let max_other = 0
+        if len(others) > 0 {
+            max_other = max(others)
+        }
+        if max_other > here {
+            return true
+        }
+        if max_other == here and here > 0 {
+            let best = None
+            let best_score = -1
+            for d in scores.keys() {
+                let tie_break = 0
+                if d == detected_domain {
+                    tie_break = 1
+                }
+                if scores[d] > best_score or (scores[d] == best_score and tie_break > 0) {
+                    best_score = scores[d]
+                    best = d
+                }
+            }
+            if best != detected_domain {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn _cross_field_query_fact_clash(self, query: str, fact: str) -> bool {
+        let ql = query.lower()
+        let fl = fact.lower()
+        let q_phys = false
+        for s in self._PHYSICS_COSMOLOGY_SIGNALS {
+            if s in ql {
+                q_phys = true
+                break
+            }
+        }
+        let q_bio = false
+        for s in self._BIOLOGY_STRONG_SIGNALS {
+            if s in ql {
+                q_bio = true
+                break
+            }
+        }
+        let q_math_topo = false
+        for s in self._MATH_TOPOLOGY_STRONG_SIGNALS {
+            if s in ql {
+                q_math_topo = true
+                break
+            }
+        }
+        let f_phys = false
+        for s in self._PHYSICS_COSMOLOGY_SIGNALS {
+            if s in fl {
+                f_phys = true
+                break
+            }
+        }
+        let f_bio = false
+        for s in self._BIOLOGY_STRONG_SIGNALS {
+            if s in fl {
+                f_bio = true
+                break
+            }
+        }
+        let f_math_topo = false
+        for s in self._MATH_TOPOLOGY_STRONG_SIGNALS {
+            if s in fl {
+                f_math_topo = true
+                break
+            }
+        }
+        if q_phys and f_bio and not q_bio {
+            return true
+        }
+        if q_bio and f_phys and not q_phys {
+            return true
+        }
+        if q_phys and f_math_topo and not q_math_topo and not f_phys {
+            return true
+        }
+        if q_math_topo and f_phys and not q_phys and not f_math_topo {
+            return true
+        }
+        return false
+    }
+
+    let _TEMPORAL_MODIFIERS = {
+        "tonight", "today", "tomorrow", "yesterday", "now", "soon",
+        "later", "morning", "evening", "afternoon", "week", "month",
+        "year", "daily", "weekly", "always", "sometimes", "often",
+        "never", "recently", "currently", "lately"
+    }
+
+    fn _fact_has_topic_anchor(self, fact: str, topic: str) -> bool {
+        if not topic or len(topic.strip()) < 3 {
+            return true
+        }
+        let all_tw = set()
+        for w in topic.lower().split() {
+            if len(w) > 3 and w not in self._FILLER_WORDS {
+                all_tw.add(w)
+            }
+        }
+        if not all_tw {
+            return true
+        }
+        let substantive = all_tw - self._TEMPORAL_MODIFIERS
+        let check_words = substantive
+        if not substantive {
+            check_words = all_tw
+        }
+        let fl = fact.lower()
+        for w in check_words {
+            if w in fl {
+                return true
+            }
+        }
+        return false
+    }
+
+    let _METADATA_NOISE_RE = re.compile(
+        "^[\\w\\s]{2,40}\\s*[-\\u2013\\u2014]\\s*wikipedia|^\\d{4}-\\d{2}-\\d{2}|^(search results|results for|related topics|see also|external links|jump to|from wikipedia|category:|template:|portal:|file:|talk:)",
+        re.IGNORECASE
+    )
+
+    let _ENTERTAINMENT_SIGNALS = {
+        "film", "movie", "television", "tv series", "episode",
+        "directed by", "starring", "released on", "aired on",
+        "box office", "imdb", "rotten tomatoes", "album",
+        "single by", "song by", "band", "soundtrack",
+        "novel by", "book by", "written by",
+        "season", "apple tv", "netflix", "hbo", "hulu"
+    }
+
+    fn _is_metadata_fact(self, text: str) -> bool {
+        let t = text.strip()
+        if self._METADATA_NOISE_RE.match(t) {
+            return true
+        }
+        if len(t) < 30 and " - " in t {
+            return true
+        }
+        if t.startswith("[") and "]" in t[:20] {
+            return true
+        }
+        return false
+    }
+
+    fn _is_entertainment_noise(self, fact: str, detected_domain: str) -> bool {
+        if detected_domain == "art" or detected_domain == "music" or detected_domain == "entertainment" {
+            return false
+        }
+        let fl = fact.lower()
+        let hits = 0
+        for s in self._ENTERTAINMENT_SIGNALS {
+            if s in fl {
+                hits += 1
+            }
+        }
+        return hits >= 2
+    }
+
+    fn _finalize_facts_for_response(self, facts: List[str], query: str, topic: str, domain: str, max_facts: int) -> List[any] {
+        let ranked = self._filter_relevant_facts(facts, query, topic)
+        let out: List[str] = []
+        for f in ranked {
+            if len(out) >= max_facts {
+                break
+            }
+            if self._is_metadata_fact(f) {
+                continue
+            }
+            if self._is_entertainment_noise(f, domain) {
+                continue
+            }
+            if self._foreign_domain_dominates_fact(f, domain) {
+                continue
+            }
+            if self._cross_field_query_fact_clash(query, f) {
+                continue
+            }
+            if not self._fact_has_topic_anchor(f, topic) {
+                continue
+            }
+            out.append(f)
+        }
+        return out
+    }
+
+    fn _filter_relevant_facts(self, facts: List[str], query: str, topic: str, context: Optional[Dict[str, Any]]) -> List[any] {
+        if not facts {
+            return facts
+        }
+
+        if _shared_semantic != None {
+            try {
+                let scored = []
+                for fact in facts {
+                    let sim = _shared_semantic.similarity(query, fact)
+                    let topic_sim = 0.0
+                    if topic {
+                        topic_sim = _shared_semantic.similarity(topic, fact)
+                    }
+                    let combined = max(sim, topic_sim * 0.8)
+                    scored.append([fact, combined])
+                }
+                scored.sort(key: fn(x) -> float { return x[1] }, reverse: true)
+                let semantic_filtered = []
+                for pair in scored {
+                    if pair[1] > 0.08 {
+                        semantic_filtered.append(pair[0])
+                    }
+                }
+                if semantic_filtered {
+                    return semantic_filtered[:12]
+                }
+            } catch(e) {
+                pass
+            }
+        }
+
+        let q_words = set(query.lower().split()) - self._FILLER_WORDS
+        let t_words = set(topic.lower().split()) - self._FILLER_WORDS
+        let key_words = q_words | t_words
+        let filtered_kw = set()
+        for w in key_words {
+            if len(w) > 2 {
+                filtered_kw.add(w)
+            }
+        }
+        key_words = filtered_kw
+        let substantive_topic = t_words - self._TEMPORAL_MODIFIERS
+
+        let thread_words: set = set()
+        if context and context.get("has_history") {
+            for theme in context.get("running_themes", []) {
+                if len(theme) > 3 {
+                    thread_words.add(theme)
+                }
+            }
+            let prior = context.get("prior_topic", "")
+            if prior {
+                for pw in prior.lower().split() {
+                    let pw_clean = pw.strip(".,!?;:\"'()-")
+                    if len(pw_clean) > 3 and pw_clean not in self._FILLER_WORDS {
+                        thread_words.add(pw_clean)
+                    }
+                }
+            }
+            for claim in context.get("established_claims", []) {
+                for cw in claim.lower().split() {
+                    let cw_clean = cw.strip(".,!?;:\"'()-")
+                    if len(cw_clean) > 6 and cw_clean not in self._FILLER_WORDS {
+                        thread_words.add(cw_clean)
+                    }
+                }
+            }
+            let directive = context.get("system_directive", "")
+            if directive {
+                for dw in directive.lower().split() {
+                    let dw_clean = dw.strip(".,!?;:\"'()-")
+                    if len(dw_clean) > 4 and dw_clean not in self._FILLER_WORDS {
+                        thread_words.add(dw_clean)
+                    }
+                }
+            }
+        }
+
+        let parts = query.lower().split()
+        let phrase_hits: List[str] = []
+        let i = 0
+        while i < len(parts) - 1 {
+            let a = parts[i]
+            let b = parts[i + 1]
+            if not (len(a) < 2 and len(b) < 2) {
+                phrase_hits.append(a + " " + b)
+            }
+            i += 1
+        }
+
+        if not key_words and not phrase_hits and not thread_words {
+            return facts
+        }
+
+        let detected_domain = self._detect_domain(query)
+        let min_kw_hits = 3
+
+        fn _phrase_in_fact(fl: str, ph: str) -> bool {
+            if ph in fl {
+                return true
+            }
+            if ph.endswith("s") and len(ph) > 4 and ph[:-1] in fl {
+                return true
+            }
+            return false
+        }
+
+        let topic_lower = topic.lower().strip()
+
+        fn _keyword_score(fact: str) -> int {
+            let fl = fact.lower()
+            let hits = 0
+            for kw in key_words {
+                if kw not in fl {
+                    continue
+                }
+                if kw in substantive_topic {
+                    if len(kw) >= 6 {
+                        hits += 4
+                    } else {
+                        hits += 3
+                    }
+                } else {
+                    if kw in t_words {
+                        hits += 2
+                    } else {
+                        if len(kw) >= 8 {
+                            hits += 2
+                        } else {
+                            hits += 1
+                        }
+                    }
+                }
+            }
+            for ph in phrase_hits {
+                if not _phrase_in_fact(fl, ph) {
+                    continue
+                }
+                if ph in topic_lower {
+                    hits += 3
+                } else {
+                    hits += 1
+                }
+            }
+            for tw in thread_words {
+                if tw in fl {
+                    hits += 1
+                }
+            }
+            return hits
+        }
+
+        let scored: List = []
+        for fact in facts {
+            let ks = _keyword_score(fact)
+            if ks < min_kw_hits {
+                continue
+            }
+            if self._foreign_domain_dominates_fact(fact, detected_domain) {
+                continue
+            }
+            if self._cross_field_query_fact_clash(query, fact) {
+                continue
+            }
+            scored.append([ks, fact])
+        }
+
+        scored.sort(key: fn(x) { return x[0] }, reverse: true)
+        if not scored {
+            return []
+        }
+        let result = []
+        for pair in scored {
+            result.append(pair[1])
+        }
+        return result
+    }
+
+    fn _gather_facts(self, knowledge_facts: Optional[List[str]], lobe_facts: Optional[List[str]], mode: str, domain: Optional[str]) -> List[any] {
+        if mode == None {
+            mode = ""
+        }
+        let collected: List[str] = []
+        let seen_hashes: set = set()
+        let noise_prefixes = [
+            "Linguistic:", "Logical:", "Spatial:", "Temporal:",
+            "Mathematical:", "Creative synthesis:", "Direct logical",
+            "Conditional logic", "No strong", "Processing query through",
+            "Analysis of", "Regarding ", "While this query",
+            "this subject falls within",
+            "Architects reference", "architects reference",
+            "Survey articles often", "survey articles"
+        ]
+        let template_markers = [
+            "several interconnected concepts",
+            "the key aspects to consider",
+            "broader field",
+            "involves several",
+            "touches on the",
+            "standard references and",
+            "standard references and survey articles",
+            "survey articles",
+            "introductory courses and",
+            "established references and",
+            "foundational treatments and",
+            "architects reference these facts",
+            "architects reference these",
+            "reference these facts"
+        ]
+
+        fn _add(text: str) {
+            if not text or len(text) < 20 {
+                return
+            }
+            let sig = text[:60].lower()
+            if sig in seen_hashes {
+                return
+            }
+            seen_hashes.add(sig)
+            collected.append(text)
+        }
+
+        if knowledge_facts {
+            for f in knowledge_facts {
+                _add(f)
+            }
+        }
+        if lobe_facts {
+            for f in lobe_facts {
+                if not f {
+                    continue
+                }
+                let cleaned = f
+                for prefix in noise_prefixes {
+                    if cleaned.startswith(prefix) {
+                        cleaned = cleaned[len(prefix):].strip(": ")
+                        break
+                    }
+                }
+                let skip = false
+                for t in template_markers {
+                    if t in cleaned.lower() {
+                        skip = true
+                        break
+                    }
+                }
+                if skip {
+                    continue
+                }
+                _add(cleaned)
+            }
+        }
+
+        if nrsi_compose != None and collected {
+            let strategy = "narrative"
+            if mode == "DETERMINISTIC" {
+                strategy = "synthesis"
+            }
+            let d = "general"
+            if domain != None {
+                d = domain
+            }
+            let composed = nrsi_compose(collected, strategy: strategy, domain: d)
+            if composed.confidence > 0.3 {
+                return [composed.text]
+            }
+        }
+
+        return collected
+    }
+
+    let _STOP_WORDS = {
+        "the", "a", "an", "is", "are", "was", "were", "of", "in", "to", "for",
+        "and", "or", "what", "how", "why", "can", "do", "does", "it", "that",
+        "this", "its", "but", "not", "so", "if", "be", "been", "has", "have",
+        "had", "will", "would", "could", "should", "about", "just", "like",
+        "you", "your", "my", "me", "we", "our", "they", "them", "i", "im",
+        "there", "here", "when", "than", "then", "also", "very", "really",
+        "think", "know", "say", "said", "well", "yeah", "yes", "no", "ok",
+        "right", "get", "got", "make", "more", "some", "any", "all"
+    }
+
+    fn _build_conversation_context(self, query: str, history: List[Dict[str, str]]) -> Dict[str, Any] {
+        let ctx: Dict[str, Any] = {
+            "has_history": false,
+            "continuation": false,
+            "prior_topic": "",
+            "turn_count": len(history) / 2,
+            "running_themes": [],
+            "last_user_said": "",
+            "last_assistant_said": "",
+            "argument_thread": [],
+            "emotional_arc": "neutral",
+            "established_claims": [],
+            "conversation_summary": "",
+            "system_directive": ""
+        }
+
+        let system_msgs = []
+        for t in history {
+            if t.get("role") == "system" and t.get("content") {
+                system_msgs.append(t["content"])
+            }
+        }
+        if system_msgs {
+            ctx["system_directive"] = system_msgs[0]
+            ctx["has_history"] = true
+            if "about:" in system_msgs[0].lower() {
+                ctx["prior_topic"] = system_msgs[0].lower().split("about:")[-1].split(".")[0].strip()
+            }
+        }
+
+        let non_system = []
+        for t in history {
+            if t.get("role") != "system" {
+                non_system.append(t)
+            }
+        }
+        if len(non_system) < 2 and not system_msgs {
+            return ctx
+        }
+        ctx["has_history"] = true
+
+        let user_turns = []
+        for t in non_system {
+            if t.get("role") == "user" and t.get("content") {
+                user_turns.append(t["content"])
+            }
+        }
+        let asst_turns = []
+        for t in non_system {
+            if t.get("role") == "assistant" and t.get("content") {
+                asst_turns.append(t["content"])
+            }
+        }
+
+        if user_turns {
+            ctx["last_user_said"] = user_turns[-1]
+            ctx["prior_topic"] = self._extract_topic(user_turns[-1])
+        }
+        if asst_turns {
+            ctx["last_assistant_said"] = asst_turns[-1]
+        }
+
+        let all_content_words: Dict[str, int] = {}
+        for turn in history {
+            let content = turn.get("content", "").lower()
+            for w in content.split() {
+                let wc = w.strip(".,!?;:\"'()-")
+                if len(wc) > 3 and wc not in self._STOP_WORDS {
+                    all_content_words[wc] = all_content_words.get(wc, 0) + 1
+                }
+            }
+        }
+        let theme_candidates = []
+        for w in all_content_words.keys() {
+            if all_content_words[w] >= 2 {
+                theme_candidates.append(w)
+            }
+        }
+        theme_candidates.sort(key: fn(w) { return all_content_words[w] }, reverse: true)
+        ctx["running_themes"] = theme_candidates[:10]
+
+        let q_words = set()
+        for w in query.lower().split() {
+            let wc = w.strip(".,!?;:\"'()-")
+            if len(wc) > 3 {
+                q_words.add(wc)
+            }
+        }
+        q_words = q_words - self._STOP_WORDS
+        let recent_turns = user_turns[-3:]
+        let ri = len(recent_turns) - 1
+        while ri >= 0 {
+            let recent = recent_turns[ri]
+            let r_words = set()
+            for w in recent.lower().split() {
+                let wc = w.strip(".,!?;:\"'()-")
+                if len(wc) > 3 {
+                    r_words.add(wc)
+                }
+            }
+            r_words = r_words - self._STOP_WORDS
+            if len(q_words & r_words) >= 2 {
+                ctx["continuation"] = true
+                break
+            }
+            let theme_match = false
+            for t in ctx["running_themes"][:5] {
+                if t in query.lower() {
+                    theme_match = true
+                    break
+                }
+            }
+            if theme_match {
+                ctx["continuation"] = true
+                break
+            }
+            ri -= 1
+        }
+
+        let assertion_patterns = ["is ", "are ", "means ", "requires ", "involves ", "suggests ", "implies ", "shows ", "demonstrates ", "indicates "]
+        for asst in asst_turns[-4:] {
+            for sent in asst.split(". ") {
+                let s = sent.strip()
+                if len(s) > 30 {
+                    let has_pattern = false
+                    for p in assertion_patterns {
+                        if p in s.lower() {
+                            has_pattern = true
+                            break
+                        }
+                    }
+                    if has_pattern {
+                        ctx["established_claims"].append(s[:200])
+                    }
+                }
+            }
+        }
+        ctx["established_claims"] = ctx["established_claims"][-6:]
+
+        let thread_parts = []
+        for ut in user_turns[-3:] {
+            let t = self._extract_topic(ut)
+            thread_parts.append(t)
+        }
+        ctx["argument_thread"] = thread_parts
+
+        let emotion_signals = {
+            "love": 1, "hate": -1, "agree": 1, "disagree": -1,
+            "interesting": 1, "fascinating": 1, "worried": -0.5,
+            "excited": 1, "confused": -0.3, "curious": 0.7,
+            "exactly": 1, "wrong": -0.8, "right": 0.5, "but": -0.2
+        }
+        let arc_score = 0.0
+        for ut in user_turns[-3:] {
+            for word in emotion_signals.keys() {
+                if word in ut.lower() {
+                    arc_score += emotion_signals[word]
+                }
+            }
+        }
+        if arc_score > 1 {
+            ctx["emotional_arc"] = "engaged"
+        } else {
+            if arc_score > 0.3 {
+                ctx["emotional_arc"] = "curious"
+            } else {
+                if arc_score < -0.5 {
+                    ctx["emotional_arc"] = "challenging"
+                } else {
+                    ctx["emotional_arc"] = "exploratory"
+                }
+            }
+        }
+
+        if ctx["running_themes"] {
+            ctx["conversation_summary"] = "We've been discussing " + ", ".join(ctx["running_themes"][:4]) + ". The thread has moved through " + " -> ".join(ctx["argument_thread"]) + "."
+        }
+        return ctx
+    }
+
+    let _CODE_INTENT_SIGNALS = {
+        "function", "class", "method", "script", "program", "code",
+        "implement", "algorithm", "api", "endpoint", "module",
+        "python", "javascript", "typescript", "rust", "golang", "java",
+        "swift", "kotlin", "c++", "ruby", "sql", "html", "css",
+        "regex", "refactor", "debug", "unittest", "test case"
+    }
+
+    fn _classify_intent(self, query: str) -> str {
+        let q = query.lower()
+
+        let opinion_patterns = ["what do you think", "what are your thoughts", "what's your opinion", "what is your take", "how do you feel about", "your view on", "your perspective on", "thoughts on", "opinion on", "do you think"]
+        for p in opinion_patterns {
+            if p in q {
+                return "opinion"
+            }
+        }
+
+        let suggest_patterns = ["what should i ", "what should we ", "suggest", "recommend", "ideas for", "give me ideas", "any suggestions"]
+        for p in suggest_patterns {
+            if p in q {
+                return "suggest"
+            }
+        }
+
+        let define_words = ["what is", "what are", "what's", "define", "tell me about"]
+        for w in define_words {
+            if w in q {
+                return "define"
+            }
+        }
+
+        let mechanism_words = ["how do", "how does", "how to", "how can", "how is"]
+        for w in mechanism_words {
+            if w in q {
+                return "explain_mechanism"
+            }
+        }
+
+        let cause_words = ["why is", "why do", "why does", "why are", "explain why"]
+        for w in cause_words {
+            if w in q {
+                return "explain_cause"
+            }
+        }
+
+        let compare_words = ["compare", "versus", "vs", "difference between"]
+        for w in compare_words {
+            if w in q {
+                return "compare"
+            }
+        }
+
+        let _qw = set(q.split())
+        if len(_qw & self._CODE_INTENT_SIGNALS) > 0 {
+            let code_action_words = ["write", "create", "implement", "build", "make", "fix", "refactor", "debug", "optimize"]
+            let has_action = false
+            for w in code_action_words {
+                if w in q {
+                    has_action = true
+                    break
+                }
+            }
+            if has_action {
+                return "code"
+            }
+        }
+
+        let list_words = ["list", "name", "enumerate", "what are the", "give me"]
+        for w in list_words {
+            if w in q {
+                return "list"
+            }
+        }
+
+        let eval_words = ["can you", "is it", "does it", "will it", "should"]
+        for w in eval_words {
+            if w in q {
+                return "evaluate"
+            }
+        }
+
+        let compute_words = ["calculate", "compute", "solve", "what is the value"]
+        for w in compute_words {
+            if w in q {
+                return "compute"
+            }
+        }
+
+        return "general"
+    }
+
+    fn _kw_in_text(kw: str, text: str, text_words: set) -> bool {
+        if " " in kw {
+            return kw in text
+        }
+        return kw in text_words
+    }
+
+    fn _detect_domain(self, query: str) -> str {
+        let q = query.lower()
+        let q_words = set()
+        for w in q.split() {
+            q_words.add(w.strip(".,;:!?\"'()-"))
+        }
+        let best_domain = "general"
+        let best_count = 0
+        for domain in self._DOMAIN_SIGNALS.keys() {
+            let keywords = self._DOMAIN_SIGNALS[domain]
+            let count = 0
+            for kw in keywords {
+                if self._kw_in_text(kw, q, q_words) {
+                    count += 1
+                }
+            }
+            if count > best_count {
+                best_count = count
+                best_domain = domain
+            }
+        }
+        return best_domain
+    }
+
+    fn _extract_topic(self, query: str) -> str {
+        let q = query.lower().rstrip("?!. ")
+        let prefixes = [
+            "what is ", "what are ", "what's ", "define ", "explain ",
+            "how does ", "how do ", "how to ", "how can i ",
+            "why is ", "why do ", "why does ", "tell me about ",
+            "describe ", "compare ", "what do you know about ",
+            "can you explain ", "what do you think about ",
+            "what are your thoughts on ", "what's your opinion on ",
+            "what is your take on ", "how do you feel about ",
+            "what about ", "thoughts on "
+        ]
+        for prefix in prefixes {
+            if q.startswith(prefix) {
+                return q[len(prefix):].strip()
+            }
+        }
+
+        let filler_starts = [
+            "hey ", "hi ", "so ", "ok ", "okay ", "well ", "yeah ", "yes ",
+            "exactly ", "right ", "agreed ", "ha ", "haha ", "interesting ",
+            "that's ", "here's ", "honestly ", "honest answer ",
+            "i think ", "i believe ", "i'd argue ", "i'd say ", "i feel ",
+            "i've been ", "let me ", "my take ", "my view ", "from my ",
+            "and ", "but ", "also ", "actually ", "basically ", "essentially ",
+            "now ", "question ", "to be fair "
+        ]
+        let stripped = q
+        for filler in filler_starts {
+            if stripped.startswith(filler) {
+                stripped = stripped[len(filler):].lstrip("\u2014-:, ")
+            }
+        }
+
+        let stripped_words = set()
+        for w in stripped.split() {
+            stripped_words.add(w.strip(".,;:!?\"'()-"))
+        }
+        let domain_concepts: List[str] = []
+        for dom in self._DOMAIN_SIGNALS.keys() {
+            let keywords = self._DOMAIN_SIGNALS[dom]
+            for kw in keywords {
+                if len(kw) > 3 and self._kw_in_text(kw, stripped, stripped_words) {
+                    domain_concepts.append(kw)
+                }
+            }
+        }
+        if domain_concepts {
+            domain_concepts.sort(key: fn(x) { return len(x) }, reverse: true)
+            return domain_concepts[0]
+        }
+
+        let stop = {"the", "a", "an", "is", "are", "was", "were", "of", "in", "to", "for", "me", "you", "can", "do", "does", "about", "tell", "please", "it", "its", "that", "this", "just", "like", "really", "very", "think", "know", "get", "make", "something", "things", "both", "have", "has", "been", "would", "could", "should", "more", "some", "what", "when", "where", "which", "there", "here", "with", "but", "and", "not", "our", "your", "their", "than", "how", "why", "from", "they", "them", "we", "my", "i"}
+        let words = []
+        for w in stripped.split() {
+            let wc = w.strip(".,;:!?\"'()-")
+            if wc.lower() not in stop and len(wc) > 2 {
+                words.append(wc)
+            }
+        }
+
+        if len(words) >= 2 {
+            let bigrams = []
+            let limit = min(len(words) - 1, 8)
+            let i = 0
+            while i < limit {
+                bigrams.append(words[i] + " " + words[i + 1])
+                i += 1
+            }
+            let best = bigrams[0]
+            let best_len = 0
+            for b in bigrams {
+                let total = 0
+                for w in b.split() {
+                    total += len(w)
+                }
+                if total > best_len {
+                    best_len = total
+                    best = b
+                }
+            }
+            return best
+        } else {
+            if words {
+                return words[0]
+            }
+        }
+        return query[:40].rstrip()
+    }
+
+    fn _scrub_fact(text: str) -> str {
+        let t = text.strip()
+        t = re.sub("\\s*[-\\u2013\\u2014]\\s*Wikipedia\\s*$", "", t, flags: re.IGNORECASE)
+        t = re.sub("\\s*\\(Wikipedia\\)\\s*$", "", t, flags: re.IGNORECASE)
+        t = re.sub("\\s*\\[edit\\]\\s*$", "", t, flags: re.IGNORECASE)
+        t = re.sub("\\s*\\[\\d+\\]", "", t)
+        t = re.sub("\\s*Retrieved \\d{4}-\\d{2}-\\d{2}.*$", "", t, flags: re.IGNORECASE)
+        return t.strip()
+    }
+
+    fn _compose_rich_response(self, query: str, topic: str, domain: str, intent: str, facts: List[str], context: Dict[str, Any], personality: Dict[str, float]) -> str {
+        let paragraphs: List[str] = []
+        let max_facts = min(len(facts), 8)
+        let usable = self._finalize_facts_for_response(facts, query, topic, domain, max_facts)
+        let scrubbed = []
+        for f in usable {
+            let s = self._scrub_fact(f)
+            if s {
+                scrubbed.append(s)
+            }
+        }
+        usable = scrubbed
+        if not usable {
+            return self._compose_reasoned_response(query, topic, domain, intent, context, personality)
+        }
+
+        let primary = usable[0]
+        let opener = self._build_contextual_opener(context, query, topic)
+
+        if intent == "define" {
+            paragraphs.append(opener + primary)
+            if len(usable) > 1 {
+                paragraphs.append(self._bridge_fact(usable[1], "expand"))
+            }
+            for extra in usable[2:5] {
+                paragraphs.append(self._bridge_fact(extra, "connect"))
+            }
+        } else {
+            if intent == "explain_mechanism" {
+                paragraphs.append(opener + primary)
+                if len(usable) > 1 {
+                    paragraphs.append("Here's how it works: " + self._lc(usable[1]))
+                }
+                for extra in usable[2:5] {
+                    paragraphs.append(self._bridge_fact(extra, "detail"))
+                }
+            } else {
+                if intent == "explain_cause" {
+                    let _causal_used = false
+                    let _RAW_ENGINE_PATTERNS = ["directly caused", "occurred because:", "strength 0.", "-> "]
+                    if _shared_causal != None {
+                        try {
+                            _shared_causal.ingest(". ".join(usable[:5]), source: "facts")
+                            let _causal_result = _shared_causal.query(query)
+                            if _causal_result.answered and _causal_result.explanation {
+                                let _exp = _causal_result.explanation
+                                let _tw = set()
+                                for w in topic.lower().split() {
+                                    if len(w) > 3 and w not in self._FILLER_WORDS {
+                                        _tw.add(w)
+                                    }
+                                }
+                                let _exp_lower = _exp.lower()
+                                let _on_topic = true
+                                if _tw {
+                                    _on_topic = false
+                                    for w in _tw {
+                                        if w in _exp_lower {
+                                            _on_topic = true
+                                            break
+                                        }
+                                    }
+                                }
+                                let _is_raw = false
+                                for p in _RAW_ENGINE_PATTERNS {
+                                    if p in _exp {
+                                        _is_raw = true
+                                        break
+                                    }
+                                }
+                                if _on_topic and len(_exp) > 30 and not _is_raw {
+                                    paragraphs.append(opener + _exp)
+                                    for chain in _causal_result.chains[:2] {
+                                        let ce = getattr(chain, "explanation", "")
+                                        if ce {
+                                            let ce_on_topic = false
+                                            for w in _tw {
+                                                if w in ce.lower() {
+                                                    ce_on_topic = true
+                                                    break
+                                                }
+                                            }
+                                            let ce_is_raw = false
+                                            for p in _RAW_ENGINE_PATTERNS {
+                                                if p in ce {
+                                                    ce_is_raw = true
+                                                    break
+                                                }
+                                            }
+                                            if ce_on_topic and not ce_is_raw {
+                                                paragraphs.append(ce)
+                                            }
+                                        }
+                                    }
+                                    _causal_used = true
+                                }
+                            }
+                        } catch(e) {
+                            pass
+                        }
+                    }
+                    if not _causal_used {
+                        if opener {
+                            paragraphs.append(opener + primary)
+                        } else {
+                            paragraphs.append("The short answer: " + self._lc(primary))
+                        }
+                        if len(usable) > 1 {
+                            paragraphs.append("A key factor is that " + self._lc(usable[1]))
+                        }
+                    } else {
+                        paragraphs.append(opener + primary)
+                        if len(usable) > 1 {
+                            paragraphs.append("A key factor is that " + self._lc(usable[1]))
+                        }
+                    }
+                    if len(usable) > 2 {
+                        paragraphs.append(self._bridge_fact(usable[2], "consequence"))
+                    }
+                    for extra in usable[3:5] {
+                        paragraphs.append(self._bridge_fact(extra, "connect"))
+                    }
+                } else {
+                    if intent == "suggest" {
+                        let _definition_markers = ["refers to", "is defined as", "usually refers", "is the term for", "is a term", "is the practice of"]
+                        let _primary_is_definition = false
+                        for m in _definition_markers {
+                            if m in primary.lower() {
+                                _primary_is_definition = true
+                                break
+                            }
+                        }
+                        if _primary_is_definition {
+                            paragraphs.append(opener + "That's a broad question -- here's what I'd consider. For context, " + self._lc(primary[:200]))
+                            if len(usable) > 1 {
+                                paragraphs.append("Beyond the basics, " + self._lc(usable[1]))
+                            }
+                        } else {
+                            let starters = ["Here are a few ideas: ", "Some options to consider: ", "A few things come to mind: "]
+                            let char_sum = 0
+                            for c in query {
+                                char_sum += ord(c)
+                            }
+                            let idx = char_sum % len(starters)
+                            paragraphs.append(opener + starters[idx] + self._lc(primary))
+                            if len(usable) > 1 {
+                                let bullet_items = []
+                                for extra in usable[1:6] {
+                                    bullet_items.append("- " + extra)
+                                }
+                                paragraphs.append("\n".join(bullet_items))
+                            }
+                        }
+                    } else {
+                        if intent == "compare" {
+                            paragraphs.append(opener + primary)
+                            let alternators = ["On the other hand, ", "By contrast, ", "Meanwhile, ", "Another perspective: "]
+                            let i = 0
+                            for extra in usable[1:4] {
+                                let alt = alternators[i % len(alternators)]
+                                paragraphs.append(alt + self._lc(extra))
+                                i += 1
+                            }
+                        } else {
+                            if intent == "list" {
+                                paragraphs.append(opener + primary)
+                                let bullet_items = []
+                                for extra in usable[1:7] {
+                                    bullet_items.append("- " + extra)
+                                }
+                                if bullet_items {
+                                    paragraphs.append("\n".join(bullet_items))
+                                }
+                            } else {
+                                if intent == "code" {
+                                    let code_resp = self._compose_code_response(query, topic, usable, context)
+                                    if code_resp {
+                                        return code_resp
+                                    }
+                                } else {
+                                    paragraphs.append(opener + primary)
+                                    let bridge_cycle = ["expand", "connect", "detail", "consequence"]
+                                    let i = 0
+                                    for extra in usable[1:5] {
+                                        let btype = bridge_cycle[i % len(bridge_cycle)]
+                                        paragraphs.append(self._bridge_fact(extra, btype))
+                                        i += 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if _shared_analogy != None and (intent == "explain_mechanism" or intent == "define") {
+            try {
+                let _analogy_result = _shared_analogy.find_analogy(topic)
+                if _analogy_result and _analogy_result.confidence > 0.3 {
+                    paragraphs.append("To put it another way: " + _analogy_result.explanation)
+                }
+            } catch(e) {
+                pass
+            }
+        }
+
+        if context.get("established_claims") and (context.get("continuation") or context.get("system_directive")) {
+            let thread_link = self._thread_connection(context["established_claims"], topic, query)
+            if thread_link {
+                paragraphs.append(thread_link)
+            }
+        }
+
+        let filtered_paragraphs = []
+        for p in paragraphs {
+            if p {
+                filtered_paragraphs.append(p)
+            }
+        }
+        let response = "\n\n".join(filtered_paragraphs)
+
+        let _ql = query.lower().strip("?!. ")
+        let _first_para = ""
+        if response {
+            _first_para = response.split("\n\n")[0].lower().strip()
+        }
+        let _echo_detected = _first_para.startswith(_ql) or _first_para.rstrip(".,;:!? ") == _ql
+        if _echo_detected {
+            let _topic_clean = topic.strip().rstrip("?!.")
+            if _topic_clean.lower() == _ql or len(_topic_clean) > 40 {
+                _topic_clean = self._extract_topic(query)
+            }
+            let non_echo = []
+            for f in usable {
+                if f.lower().strip("?!. ")[:30] != _ql[:30] {
+                    non_echo.append(f)
+                }
+            }
+            response = ""
+            for f in non_echo[:4] {
+                response += f + "\n\n"
+            }
+            if not response.strip() {
+                response = "That's an interesting question about " + _topic_clean + ". Let me reason through it from what I know.\n\n"
+            }
+            response = response.rstrip() + "\n\nI'd be happy to explore specific aspects of " + _topic_clean + " further."
+        }
+
+        let followup = self._contextual_followup(query, intent, context)
+        if followup {
+            response += "\n\n" + followup
+        }
+
+        if len(usable) <= 2 and len(response) < 120 {
+            response += "\n\n*I'd recommend verifying specific details on this topic.*"
+        }
+
+        return response
+    }
+
+    fn _build_contextual_opener(self, context: Dict[str, Any], query: str, topic: str) -> str {
+        if not context.get("has_history") {
+            return ""
+        }
+
+        let arc = context.get("emotional_arc", "neutral")
+        let themes = context.get("running_themes", [])
+        let last_user = context.get("last_user_said", "")
+        let turn_count = context.get("turn_count", 0)
+
+        if context.get("continuation") {
+            let ql = query.lower()
+            let agree_words = ["exactly", "right", "agree", "yes", "good point"]
+            let has_agree = false
+            for w in agree_words {
+                if w in ql {
+                    has_agree = true
+                    break
+                }
+            }
+            if has_agree {
+                return "Right -- and building on that, "
+            }
+            let disagree_words = ["but", "however", "disagree", "wrong", "no"]
+            let has_disagree = false
+            for w in disagree_words {
+                if w in ql {
+                    has_disagree = true
+                    break
+                }
+            }
+            if has_disagree {
+                return "That's a fair pushback. Here's how I'd reframe it: "
+            }
+            let pivot_words = ["what about", "how about", "shift", "change", "different"]
+            let has_pivot = false
+            for w in pivot_words {
+                if w in ql {
+                    has_pivot = true
+                    break
+                }
+            }
+            if has_pivot {
+                return "Good pivot. "
+            }
+            let why_words = ["why", "how come", "explain"]
+            let has_why = false
+            for w in why_words {
+                if w in ql {
+                    has_why = true
+                    break
+                }
+            }
+            if has_why {
+                return "So the deeper question is why -- "
+            }
+            if turn_count > 2 and themes {
+                return "This threads into what we've been exploring about " + themes[0] + " -- "
+            }
+            return ""
+        } else {
+            if turn_count > 0 {
+                return ""
+            }
+        }
+        return ""
+    }
+
+    fn _thread_connection(self, claims: List[str], topic: str, query: str) -> str {
+        if not claims {
+            return ""
+        }
+        let relevant = []
+        let q_words = set()
+        for w in query.lower().split() {
+            let wc = w.strip(".,!?")
+            if len(wc) > 3 {
+                q_words.add(wc)
+            }
+        }
+        for claim in claims {
+            let c_words = set()
+            for w in claim.lower().split() {
+                let wc = w.strip(".,!?")
+                if len(wc) > 3 {
+                    c_words.add(wc)
+                }
+            }
+            if len(q_words & c_words) >= 1 {
+                relevant.append(claim)
+            }
+        }
+        if relevant {
+            let best = relevant[-1]
+            if len(best) > 120 {
+                best = best[:120].rsplit(" ", 1)[0] + "..."
+            }
+            return "This connects to something we established earlier: " + self._lc(best)
+        }
+        return ""
+    }
+
+    fn _contextual_followup(self, query: str, intent: str, context: Dict[str, Any]) -> str {
+        let arc = context.get("emotional_arc", "neutral")
+        let themes = context.get("running_themes", [])
+        let turn_count = context.get("turn_count", 0)
+
+        if arc == "engaged" and turn_count > 2 {
+            if themes {
+                return "We're building a real thread here around " + themes[0] + ". Where do you want to take it next?"
+            }
+            return "This is getting interesting. What angle do you want to dig into?"
+        } else {
+            if arc == "challenging" {
+                return "Push back on anything that doesn't hold up -- that's how we sharpen the reasoning."
+            } else {
+                if arc == "curious" and intent == "define" {
+                    return "Want me to go deeper into how it works, or its history?"
+                } else {
+                    if turn_count > 3 {
+                        return ""
+                    } else {
+                        let followups = {
+                            "define": "Want me to go deeper into how it works, or its history?",
+                            "explain_mechanism": "I can also explain the underlying principles if you'd like.",
+                            "explain_cause": "Want me to explore the broader implications?",
+                            "compare": "I can also look at specific use cases if that helps."
+                        }
+                        return followups.get(intent, "")
+                    }
+                }
+            }
+        }
+    }
+
+    let _FOLLOWUP_TEMPLATES: Dict[str, Dict[str, str]] = {
+        "define": {
+            "deeper": "How does {topic} actually work under the hood?",
+            "broader": "What are the main types or categories of {topic}?",
+            "practical": "What's a real-world example of {topic} in action?"
+        },
+        "explain_mechanism": {
+            "deeper": "What's the step-by-step process behind {topic}?",
+            "broader": "What other systems use a similar mechanism to {topic}?",
+            "practical": "How would I apply this understanding of {topic}?"
+        },
+        "explain_cause": {
+            "deeper": "What's the root cause behind {topic}?",
+            "broader": "What are the wider effects of {topic}?",
+            "practical": "How can this be prevented or encouraged?"
+        },
+        "compare": {
+            "deeper": "What are the key technical differences?",
+            "broader": "Are there other alternatives worth considering?",
+            "practical": "Which option is better for most use cases?"
+        },
+        "suggest": {
+            "deeper": "Can you explain why you recommend that?",
+            "broader": "What are some other options for {topic}?",
+            "practical": "What do I need to get started with that?"
+        },
+        "list": {
+            "deeper": "Can you go into more detail on the most important ones?",
+            "broader": "Are there any I might be missing?",
+            "practical": "Which of these should I focus on first?"
+        },
+        "code": {
+            "deeper": "Can you add error handling and tests for this?",
+            "broader": "What's an alternative approach to implementing this?",
+            "practical": "How would I integrate this into a real project?"
+        },
+        "compute": {
+            "deeper": "Can you walk me through the calculation step by step?",
+            "broader": "How does this change with different inputs?",
+            "practical": "Where would I typically need to compute this?"
+        },
+        "general": {
+            "deeper": "Can you go into more detail about {topic}?",
+            "broader": "What else is related to {topic}?",
+            "practical": "How does {topic} apply in practice?"
+        }
+    }
+
+    fn generate_followup_options(self, query: str, answer: str, intent: str, domain: str, context: Optional[Dict[str, Any]]) -> List[any] {
+        if not intent {
+            intent = self._classify_intent(query)
+        }
+        let topic = self._extract_topic(query)
+        if not topic {
+            topic = query.rstrip("?!. ")
+        }
+
+        let templates = self._FOLLOWUP_TEMPLATES.get(intent, self._FOLLOWUP_TEMPLATES["general"])
+
+        let results: List[str] = []
+        for _role in ["deeper", "broader", "practical"] {
+            let tmpl = templates.get(_role, "")
+            if tmpl and "{topic}" in tmpl {
+                results.append(tmpl.replace("{topic}", topic))
+            } else {
+                if tmpl {
+                    results.append(tmpl)
+                }
+            }
+        }
+
+        let ctx = context
+        if ctx == None {
+            ctx = {}
+        }
+        let themes = ctx.get("running_themes", [])
+        if themes and len(themes) > 0 {
+            let alt_topic = None
+            if themes[0].lower() != topic.lower() {
+                alt_topic = themes[0]
+            }
+            if alt_topic and len(results) >= 3 {
+                results[1] = "How does " + topic + " relate to " + alt_topic + "?"
+            }
+        }
+
+        return results[:3]
+    }
+
+    let _CODE_TEMPLATES: Dict[str, Dict[str, str]] = {
+        "reverse_string": {
+            "python": "def reverse_string(s: str) -> str:\n    \"\"\"Return the reversed version of *s*.\"\"\"\n    return s[::-1]",
+            "javascript": "function reverseString(s) {\n  return s.split('').reverse().join('');\n}"
+        },
+        "fibonacci": {
+            "python": "def fibonacci(n: int) -> list[int]:\n    \"\"\"Return the first *n* Fibonacci numbers.\"\"\"\n    if n <= 0:\n        return []\n    seq = [0, 1]\n    while len(seq) < n:\n        seq.append(seq[-1] + seq[-2])\n    return seq[:n]",
+            "javascript": "function fibonacci(n) {\n  if (n <= 0) return [];\n  const seq = [0, 1];\n  while (seq.length < n) seq.push(seq.at(-1) + seq.at(-2));\n  return seq.slice(0, n);\n}"
+        },
+        "sort": {
+            "python": "def sort_list(items: list, reverse: bool = False) -> list:\n    \"\"\"Return a sorted copy of *items*.\"\"\"\n    return sorted(items, reverse=reverse)",
+            "javascript": "function sortArray(arr, descending = false) {\n  return [...arr].sort((a, b) => descending ? b - a : a - b);\n}"
+        },
+        "factorial": {
+            "python": "def factorial(n: int) -> int:\n    \"\"\"Return n! (n factorial). Raises ValueError for negative input.\"\"\"\n    if n < 0:\n        raise ValueError('n must be non-negative')\n    result = 1\n    for i in range(2, n + 1):\n        result *= i\n    return result",
+            "javascript": "function factorial(n) {\n  if (n < 0) throw new Error('n must be non-negative');\n  let result = 1;\n  for (let i = 2; i <= n; i++) result *= i;\n  return result;\n}"
+        },
+        "palindrome": {
+            "python": "def is_palindrome(s: str) -> bool:\n    \"\"\"Check whether *s* reads the same forwards and backwards.\"\"\"\n    cleaned = ''.join(c.lower() for c in s if c.isalnum())\n    return cleaned == cleaned[::-1]",
+            "javascript": "function isPalindrome(s) {\n  const cleaned = s.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();\n  return cleaned === cleaned.split('').reverse().join('');\n}"
+        },
+        "binary_search": {
+            "python": "def binary_search(arr: list, target) -> int:\n    lo, hi = 0, len(arr) - 1\n    while lo <= hi:\n        mid = (lo + hi) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid - 1\n    return -1",
+            "javascript": "function binarySearch(arr, target) {\n  let lo = 0, hi = arr.length - 1;\n  while (lo <= hi) {\n    const mid = (lo + hi) >> 1;\n    if (arr[mid] === target) return mid;\n    else if (arr[mid] < target) lo = mid + 1;\n    else hi = mid - 1;\n  }\n  return -1;\n}"
+        },
+        "flatten": {
+            "python": "def flatten(nested: list) -> list:\n    result = []\n    for item in nested:\n        if isinstance(item, list):\n            result.extend(flatten(item))\n        else:\n            result.append(item)\n    return result",
+            "javascript": "function flatten(arr) {\n  return arr.reduce((acc, item) =>\n    Array.isArray(item) ? acc.concat(flatten(item)) : acc.concat(item), []);\n}"
+        },
+        "linked_list": {
+            "python": "class Node:\n    __slots__ = ('value', 'next')\n    def __init__(self, value, next_node=None):\n        self.value = value\n        self.next = next_node\n\nclass LinkedList:\n    def __init__(self):\n        self.head = None\n        self._size = 0\n    def prepend(self, value):\n        self.head = Node(value, self.head)\n        self._size += 1\n    def append(self, value):\n        new_node = Node(value)\n        if self.head is None:\n            self.head = new_node\n        else:\n            curr = self.head\n            while curr.next:\n                curr = curr.next\n            curr.next = new_node\n        self._size += 1"
+        },
+        "merge_sort": {
+            "python": "def merge_sort(arr):\n    if len(arr) <= 1:\n        return arr[:]\n    mid = len(arr) // 2\n    left = merge_sort(arr[:mid])\n    right = merge_sort(arr[mid:])\n    return _merge(left, right)\n\ndef _merge(left, right):\n    result = []\n    i = j = 0\n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            result.append(left[i])\n            i += 1\n        else:\n            result.append(right[j])\n            j += 1\n    result.extend(left[i:])\n    result.extend(right[j:])\n    return result"
+        },
+        "dijkstra": {
+            "python": "import heapq\ndef dijkstra(graph, start):\n    dist = {start: 0.0}\n    prev = {}\n    heap = [(0.0, start)]\n    while heap:\n        d, u = heapq.heappop(heap)\n        if d > dist.get(u, float('inf')):\n            continue\n        for v, w in graph.get(u, []):\n            alt = d + w\n            if alt < dist.get(v, float('inf')):\n                dist[v] = alt\n                prev[v] = u\n                heapq.heappush(heap, (alt, v))\n    return dist, prev"
+        }
+    }
+
+    let _TEMPLATE_KEYWORDS: Dict[str, List[str]] = {
+        "reverse_string": ["reverse", "string", "backwards", "reversed"],
+        "fibonacci": ["fibonacci", "fib", "sequence"],
+        "sort": ["sort", "sorted", "order", "arrange"],
+        "factorial": ["factorial", "n!"],
+        "palindrome": ["palindrome", "palindromes"],
+        "binary_search": ["binary search", "search", "find element", "sorted array"],
+        "flatten": ["flatten", "nested", "unnest"],
+        "linked_list": ["linked list", "linkedlist", "singly linked", "node list"],
+        "merge_sort": ["merge sort", "mergesort"],
+        "dijkstra": ["dijkstra", "shortest path", "weighted graph", "pathfinding"]
+    }
+
+    fn _compose_code_response(self, query: str, topic: str, facts: List[str], context: Dict[str, Any]) -> str {
+        let ql = query.lower()
+        let qw = set(ql.split())
+
+        let lang = "python"
+        let candidates = ["javascript", "typescript", "rust", "java", "swift", "kotlin", "golang", "go", "ruby", "c++", "sql"]
+        for candidate in candidates {
+            if candidate in qw {
+                if candidate == "golang" {
+                    lang = "go"
+                } else {
+                    lang = candidate
+                }
+                break
+            }
+        }
+
+        let best_template = None
+        let best_score = 0
+        for tpl_name in self._TEMPLATE_KEYWORDS.keys() {
+            let keywords = self._TEMPLATE_KEYWORDS[tpl_name]
+            let score = 0
+            for kw in keywords {
+                if kw in ql {
+                    score += len(kw.split())
+                }
+            }
+            if score > best_score {
+                best_score = score
+                best_template = tpl_name
+            }
+        }
+
+        let parts: List[str] = []
+
+        if best_template and best_template in self._CODE_TEMPLATES {
+            let tpl_map = self._CODE_TEMPLATES[best_template]
+            let code = tpl_map.get(lang, tpl_map.get("python", ""))
+            if code {
+                parts.append("Here's the implementation:\n\n```" + lang + "\n" + code + "\n```")
+                return "\n\n".join(parts)
+            }
+        }
+
+        let _desc = ql
+        let strip_words = ["write ", "create ", "make ", "implement ", "build ", "a ", "an ", "the ", "me ", "please ", "that ", "function ", "to ", "for ", "which ", "with ", "in python", "in javascript", "in typescript", "in rust", "in java", "in swift", "in kotlin", "in go", "in golang", "in ruby", "in c++", "using python", "using javascript", "class ", "method "]
+        for strip_word in strip_words {
+            _desc = _desc.replace(strip_word, " ")
+        }
+        _desc = " ".join(_desc.split()).strip()
+
+        let _name_words = []
+        for w in _desc.split() {
+            if len(w) > 1 and len(_name_words) < 4 {
+                _name_words.append(w)
+            }
+        }
+        let func_name = "solution"
+        if _name_words {
+            func_name = "_".join(_name_words)
+        }
+        let clean_name = ""
+        for c in func_name {
+            if c.isalnum() or c == "_" {
+                clean_name += c
+            } else {
+                clean_name += "_"
+            }
+        }
+        func_name = clean_name.strip("_")
+        if not func_name {
+            func_name = "solution"
+        }
+
+        let _is_class_request = "class" in ql
+        let _human_desc = " ".join(_name_words).strip()
+        if not _human_desc {
+            _human_desc = topic
+        }
+
+        let _structural_hints = self._infer_code_structure(ql, _human_desc, _is_class_request)
+
+        if _is_class_request {
+            let name_parts = func_name.replace("class", "").strip("_").split("_")
+            let _class_name = ""
+            for word in name_parts {
+                if word {
+                    _class_name += word.capitalize()
+                }
+            }
+            if not _class_name {
+                _class_name = "Solution"
+            }
+            let code = self._generate_class_scaffold(lang, _class_name, _human_desc, _structural_hints)
+            parts.append("Here's the implementation:\n\n```" + lang + "\n" + code + "\n```")
+        } else {
+            let code = self._generate_function_scaffold(lang, func_name, _human_desc, _structural_hints)
+            parts.append("Here's the implementation:\n\n```" + lang + "\n" + code + "\n```")
+        }
+        if _structural_hints.get("usage") {
+            parts.append("**Usage:**\n```" + lang + "\n" + _structural_hints["usage"] + "\n```")
+        }
+        if _structural_hints.get("explanation") {
+            parts.append("**How it works:** " + _structural_hints["explanation"])
+        }
+
+        return "\n\n".join(parts)
+    }
+
+    fn _bridge_fact(self, fact: str, bridge_type: str) -> str {
+        let bridges = {
+            "expand": ["To put that in context, ", "More specifically, ", "What that means in practice is that ", "Digging a bit deeper, ", "An important nuance: "],
+            "connect": ["This connects to a broader point: ", "Relatedly, ", "This ties into the fact that ", "Along the same lines, ", "Worth noting: "],
+            "detail": ["Looking more closely, ", "The important detail here is that ", "Drilling into this, "],
+            // Neutral additive only — see NRS-MODEL-002. Independently
+            // retrieved facts must not be glued together with causal
+            // connectives that imply one causes the other.
+            "consequence": ["Also relevant here: ", "Another related point: ", "Additionally, "]
+        }
+        let options = bridges.get(bridge_type, bridges["expand"])
+        let char_sum = 0
+        for c in fact {
+            char_sum += ord(c)
+        }
+        let idx = char_sum % len(options)
+        return options[idx] + self._lc(fact)
+    }
+
+    let _STRUCTURAL_PATTERNS: Dict[str, Dict[str, Any]] = {
+        "validator": {"params": [["data", "Any"]], "returns": "bool", "body_hint": "validation logic with error collection", "methods": ["validate", "add_rule", "get_errors"]},
+        "parser": {"params": [["text", "str"]], "returns": "Dict[str, Any]", "body_hint": "tokenize then build AST/structure", "methods": ["parse", "tokenize"]},
+        "handler": {"params": [["request", "Any"]], "returns": "Any", "body_hint": "extract data, process, return response", "methods": ["handle", "validate_request"]},
+        "processor": {"params": [["data", "Any"]], "returns": "Any", "body_hint": "transform input through pipeline stages", "methods": ["process", "add_stage"]},
+        "manager": {"params": [], "returns": "None", "body_hint": "lifecycle management with acquire/release", "methods": ["start", "stop", "add", "remove", "get"]},
+        "converter": {"params": [["source", "Any"]], "returns": "Any", "body_hint": "transform from source format to target", "methods": ["convert", "supports_format"]},
+        "scraper": {"params": [["url", "str"]], "returns": "Dict[str, Any]", "body_hint": "fetch page, extract structured data", "imports": ["httpx", "re"], "methods": ["scrape", "extract"]},
+        "scheduler": {"params": [["task", "Callable"], ["interval", "float"]], "returns": "None", "body_hint": "recurring task execution with start/stop", "imports": ["threading", "time"], "methods": ["schedule", "cancel", "run_pending"]},
+        "encoder": {"params": [["data", "Any"]], "returns": "str", "body_hint": "serialize data to target format", "methods": ["encode", "decode"]},
+        "middleware": {"params": [["handler", "Callable"]], "returns": "Callable", "body_hint": "wrap handler with pre/post processing", "methods": ["__call__"]}
+    }
+
+    fn _infer_code_structure(self, ql: str, description: str, is_class: bool) -> Dict[str, Any] {
+        let hints: Dict[str, Any] = {
+            "params": [],
+            "returns": "None",
+            "imports": [],
+            "methods": [],
+            "usage": "",
+            "explanation": ""
+        }
+
+        let _pattern_aliases = {
+            "validator": ["validat", "check", "verify"],
+            "parser": ["pars", "tokeniz"],
+            "handler": ["handler", "handle"],
+            "processor": ["process", "transform", "pipeline"],
+            "manager": ["manager", "manage", "lifecycle"],
+            "converter": ["convert", "transform", "translate"],
+            "scraper": ["scrap", "crawl", "extract"],
+            "scheduler": ["schedul", "cron", "recurring"],
+            "encoder": ["encod", "decod", "serial"],
+            "middleware": ["middleware"]
+        }
+        for pattern_name in self._STRUCTURAL_PATTERNS.keys() {
+            let pattern_info = self._STRUCTURAL_PATTERNS[pattern_name]
+            let aliases = _pattern_aliases.get(pattern_name, [pattern_name])
+            let matched = false
+            for alias in aliases {
+                if alias in ql {
+                    matched = true
+                    break
+                }
+            }
+            if matched {
+                hints["params"] = pattern_info.get("params", [])
+                hints["returns"] = pattern_info.get("returns", "None")
+                hints["methods"] = pattern_info.get("methods", [])
+                hints["imports"] = pattern_info.get("imports", [])
+                hints["explanation"] = pattern_info.get("body_hint", "")
+                break
+            }
+        }
+
+        let _io_signals = {
+            "file": [["path", "str"], "str", ["pathlib"]],
+            "url": [["url", "str"], "str", ["httpx"]],
+            "json": [["data", "Any"], "Dict[str, Any]", ["json"]],
+            "list": [["items", "list"], "list", []],
+            "string": [["text", "str"], "str", []],
+            "number": [["n", "int"], "int", []],
+            "database": [["query", "str"], "list", ["sqlite3"]],
+            "image": [["path", "str"], "Any", ["PIL"]],
+            "email": [["email", "str"], "bool", ["re"]],
+            "pdf": [["path", "str"], "bytes", []]
+        }
+        for signal in _io_signals.keys() {
+            if signal in ql {
+                let info = _io_signals[signal]
+                if not hints["params"] {
+                    hints["params"] = [info[0]]
+                }
+                hints["returns"] = info[1]
+                hints["imports"] = info[2]
+                break
+            }
+        }
+
+        return hints
+    }
+
+    fn _generate_class_scaffold(self, lang: str, class_name: str, description: str, hints: Dict[str, Any]) -> str {
+        let methods = hints.get("methods", [])
+        let imports = hints.get("imports", [])
+
+        if lang == "python" {
+            let lines = []
+            if imports {
+                for imp in imports {
+                    lines.append("import " + imp)
+                }
+                lines.append("")
+            }
+            lines.append("class " + class_name + ":")
+            lines.append("    \"\"\"" + description.capitalize() + ".\"\"\"")
+            lines.append("")
+            let init_params = hints.get("params", [])
+            if init_params {
+                let param_parts = []
+                for p in init_params {
+                    param_parts.append(p[0] + ": " + p[1])
+                }
+                lines.append("    def __init__(self, " + ", ".join(param_parts) + "):")
+                for p in init_params {
+                    lines.append("        self." + p[0] + " = " + p[0])
+                }
+            } else {
+                lines.append("    def __init__(self):")
+                lines.append("        self._data = {}")
+            }
+            lines.append("")
+            if not methods {
+                methods = ["process"]
+            }
+            for method in methods {
+                if method == "__call__" {
+                    lines.append("    def __call__(self, *args, **kwargs):")
+                } else {
+                    lines.append("    def " + method + "(self, *args, **kwargs):")
+                }
+                lines.append("        pass")
+                lines.append("")
+            }
+            lines.append("    def __repr__(self) -> str:")
+            lines.append("        return f'" + class_name + "({self.__dict__})'")
+            return "\n".join(lines)
+        } else {
+            if lang == "javascript" or lang == "typescript" {
+                let lines = ["class " + class_name + " {"]
+                let init_params = hints.get("params", [])
+                if init_params {
+                    let param_parts = []
+                    for p in init_params {
+                        param_parts.append(p[0])
+                    }
+                    lines.append("  constructor(" + ", ".join(param_parts) + ") {")
+                    for p in init_params {
+                        lines.append("    this." + p[0] + " = " + p[0] + ";")
+                    }
+                } else {
+                    lines.append("  constructor() {")
+                    lines.append("    this._data = {};")
+                }
+                lines.append("  }")
+                lines.append("")
+                let ms = methods
+                if not ms {
+                    ms = ["process"]
+                }
+                for method in ms {
+                    lines.append("  " + method + "() {")
+                    lines.append("  }")
+                    lines.append("")
+                }
+                lines.append("}")
+                return "\n".join(lines)
+            }
+        }
+        return "// " + class_name + ": " + description
+    }
+
+    fn _generate_function_scaffold(self, lang: str, func_name: str, description: str, hints: Dict[str, Any]) -> str {
+        let params = hints.get("params", [])
+        let returns = hints.get("returns", "None")
+        let imports = hints.get("imports", [])
+
+        if lang == "python" {
+            let lines = []
+            if imports {
+                for imp in imports {
+                    lines.append("import " + imp)
+                }
+                lines.append("")
+            }
+            if params {
+                let param_parts = []
+                for p in params {
+                    param_parts.append(p[0] + ": " + p[1])
+                }
+                let ret_ann = ""
+                if returns != "None" {
+                    ret_ann = " -> " + returns
+                }
+                lines.append("def " + func_name + "(" + ", ".join(param_parts) + ")" + ret_ann + ":")
+            } else {
+                lines.append("def " + func_name + "():")
+            }
+            lines.append("    \"\"\"" + description.capitalize() + ".\"\"\"")
+            if returns and returns != "None" {
+                if returns == "bool" {
+                    lines.append("    return True")
+                } else {
+                    if returns == "str" {
+                        lines.append("    result = ''")
+                        lines.append("    return result")
+                    } else {
+                        if returns == "list" or returns == "List[Any]" {
+                            lines.append("    results = []")
+                            lines.append("    return results")
+                        } else {
+                            if "Dict" in returns {
+                                lines.append("    result = {}")
+                                lines.append("    return result")
+                            } else {
+                                if returns == "int" {
+                                    lines.append("    result = 0")
+                                    lines.append("    return result")
+                                } else {
+                                    lines.append("    pass")
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                lines.append("    pass")
+            }
+            return "\n".join(lines)
+        } else {
+            if lang == "javascript" or lang == "typescript" {
+                let param_parts = []
+                for p in params {
+                    if lang == "typescript" {
+                        param_parts.append(p[0] + ": " + p[1].lower())
+                    } else {
+                        param_parts.append(p[0])
+                    }
+                }
+                let lines = ["function " + func_name + "(" + ", ".join(param_parts) + ") {"]
+                if returns and returns != "None" and returns != "null" {
+                    lines.append("  return null;")
+                }
+                lines.append("}")
+                return "\n".join(lines)
+            }
+        }
+        return "// " + func_name + ": " + description
+    }
+
+    fn _inference_chain(self, query: str, topic: str, domain: str, context: Dict[str, Any]) -> List[any] {
+        let claims = context.get("established_claims", [])
+        let themes = context.get("running_themes", [])
+        let directive = context.get("system_directive", "")
+
+        if not claims and not themes {
+            return []
+        }
+
+        let inferences = []
+        let q_words = set()
+        for w in query.split() {
+            let wc = w.lower().strip(".,!?")
+            if len(wc) > 3 {
+                q_words.add(wc)
+            }
+        }
+
+        let relevant_claims = []
+        for claim in claims {
+            let c_words = set()
+            for w in claim.split() {
+                let wc = w.lower().strip(".,!?")
+                if len(wc) > 3 {
+                    c_words.add(wc)
+                }
+            }
+            let overlap = len(q_words & c_words)
+            if overlap >= 1 {
+                relevant_claims.append([claim, overlap])
+            }
+        }
+        relevant_claims.sort(key: fn(x) { return x[1] }, reverse: true)
+
+        if not relevant_claims {
+            return []
+        }
+
+        let i = 0
+        while i < min(3, len(relevant_claims)) {
+            let claim_a = relevant_claims[i][0]
+            let a_words = set()
+            for w in claim_a.split() {
+                let wc = w.lower().strip(".,!?")
+                if len(wc) > 4 {
+                    a_words.add(wc)
+                }
+            }
+            let j = i + 1
+            while j < min(4, len(relevant_claims)) {
+                let claim_b = relevant_claims[j][0]
+                let b_words = set()
+                for w in claim_b.split() {
+                    let wc = w.lower().strip(".,!?")
+                    if len(wc) > 4 {
+                        b_words.add(wc)
+                    }
+                }
+                let shared = a_words & b_words - self._FILLER_WORDS
+                if len(shared) >= 2 {
+                    let shared_list = list(shared)[:3]
+                    let shared_str = ", ".join(shared_list)
+                    let ca_short = claim_a
+                    if len(claim_a) > 120 {
+                        ca_short = claim_a[:120]
+                    }
+                    let cb_short = claim_b
+                    if len(claim_b) > 120 {
+                        cb_short = claim_b[:120]
+                    }
+                    inferences.append("Connecting two established points -- " + self._lc(ca_short) + " and " + self._lc(cb_short) + " -- through their shared concepts (" + shared_str + "), we can see a pattern emerging.")
+                }
+                j += 1
+            }
+            i += 1
+        }
+
+        if themes and relevant_claims {
+            let best_claim = relevant_claims[0][0][:140]
+            let active_themes = []
+            for t in themes[:3] {
+                if t.lower() in query.lower() {
+                    active_themes.append(t)
+                } else {
+                    for c in relevant_claims {
+                        if t.lower() in c[0].lower() {
+                            active_themes.append(t)
+                            break
+                        }
+                    }
+                }
+            }
+            if active_themes {
+                inferences.append("The recurring thread of " + ", ".join(active_themes) + " provides important framing here. Given what we established -- " + self._lc(best_claim) + " -- the logical next step is to examine how this interacts with the specific question being asked.")
+            }
+        }
+
+        if directive and relevant_claims {
+            let best = relevant_claims[0][0][:100]
+            inferences.append("Working from the established evidence -- " + self._lc(best) + " -- and applying this to the current thread of inquiry, several implications follow.")
+        }
+
+        return inferences[:3]
+    }
+
+    fn _compose_reasoned_response(self, query: str, topic: str, domain: str, intent: str, context: Dict[str, Any], personality: Dict[str, float]) -> str {
+        let opener = self._build_contextual_opener(context, query, topic)
+        let has_history = context.get("has_history", false)
+        let claims = context.get("established_claims", [])
+        let themes = context.get("running_themes", [])
+        let arc = context.get("emotional_arc", "neutral")
+
+        let paragraphs: List[str] = []
+
+        let inference_chains = self._inference_chain(query, topic, domain, context)
+        let has_grounded_inference = len(inference_chains) > 0
+
+        let _well_covered_domains = {"science", "technology", "mathematics", "history", "geography", "philosophy", "economics", "medicine", "music", "art"}
+        let _skip_disclaimer_intents = {"suggest", "evaluate"}
+        if not has_grounded_inference and not has_history and intent not in _skip_disclaimer_intents {
+            if domain not in _well_covered_domains {
+                paragraphs.append("I don't have specific data on " + topic + " in my knowledge base right now.")
+            }
+        }
+
+        let context_reasoning = ""
+        if has_history and claims {
+            let topic_words = set()
+            for w in topic.lower().split() {
+                if len(w) > 3 {
+                    topic_words.add(w)
+                }
+            }
+            let relevant_claims = []
+            for c in claims {
+                for w in topic_words {
+                    if w in c.lower() {
+                        relevant_claims.append(c)
+                        break
+                    }
+                }
+            }
+            if relevant_claims {
+                context_reasoning = relevant_claims[-1]
+            }
+        }
+
+        if context_reasoning and len(context_reasoning) > 30 {
+            let cr = context_reasoning[:140]
+            if len(context_reasoning) > 140 {
+                cr = cr.rsplit(" ", 1)[0]
+            }
+            paragraphs.append(opener + "From what we've established -- " + self._lc(cr) + " -- I can reason further into this.")
+        } else {
+            if has_history and themes {
+                paragraphs.append(opener + "This builds on the thread we've been pulling about " + ", ".join(themes[:3]) + ".")
+            } else {
+                if opener {
+                    paragraphs.append(opener.rstrip())
+                }
+            }
+        }
+
+        let _creative_intents = {"write", "compose", "create", "tell", "generate", "make"}
+        let _creative_forms = {"poem", "story", "tale", "song", "haiku", "limerick", "narrative", "fiction", "verse", "ballad", "sonnet"}
+        let _ql_words = set(query.lower().split())
+        let _is_creative_request = len(_ql_words & _creative_intents) > 0 and len(_ql_words & _creative_forms) > 0
+
+        if _is_creative_request {
+            paragraphs = []
+            let _creative_output = self._compose_creative(query, topic, domain, personality)
+            if _creative_output {
+                paragraphs.append(_creative_output)
+            }
+        }
+
+        if intent == "opinion" and not _is_creative_request {
+            paragraphs = []
+            return self._compose_opinion(query, topic, domain, inference_chains, personality)
+        }
+
+        let domain_principles = self._domain_first_principles(domain)
+        if domain_principles {
+            paragraphs.append(domain_principles)
+        }
+
+        for inference in inference_chains {
+            paragraphs.append(inference)
+        }
+
+        let _RAW_ENGINE_MARKERS = ["parsed goals:", "holds(", "backward chaining", "depth 0", "proved via", "[sub]"]
+        if _shared_logic != None {
+            try {
+                _shared_logic.ingest_text(query, source: "query")
+                for chain in inference_chains {
+                    _shared_logic.ingest_text(chain, source: "inference")
+                }
+                let logic_result = _shared_logic.query(query)
+                if logic_result.answered and logic_result.confidence > 0.4 {
+                    if logic_result.reasoning_trace {
+                        let trace = logic_result.reasoning_trace
+                        let has_raw = false
+                        for m in _RAW_ENGINE_MARKERS {
+                            if m in trace.lower() {
+                                has_raw = true
+                                break
+                            }
+                        }
+                        if not has_raw {
+                            paragraphs.append("Through formal reasoning: " + trace)
+                        }
+                    }
+                    for df in logic_result.derived_facts[:2] {
+                        let lit = getattr(df, "literal", "")
+                        if lit {
+                            let lit_raw = false
+                            for m in _RAW_ENGINE_MARKERS {
+                                if m in lit.lower() {
+                                    lit_raw = true
+                                    break
+                                }
+                            }
+                            if not lit_raw {
+                                paragraphs.append("This implies: " + lit)
+                            }
+                        }
+                    }
+                }
+            } catch(e) {
+                pass
+            }
+        }
+
+        if _shared_planner != None {
+            try {
+                let _plan = _shared_planner.plan(query, domain: domain)
+                if _plan and len(_plan.steps) >= 3 {
+                    let clean_steps = []
+                    let _q_lower = query.lower().rstrip("?!.")
+                    for step in _plan.steps[:5] {
+                        let desc = getattr(step, "description", "")
+                        if not desc {
+                            continue
+                        }
+                        let has_raw = false
+                        for m in _RAW_ENGINE_MARKERS {
+                            if m in desc.lower() {
+                                has_raw = true
+                                break
+                            }
+                        }
+                        if has_raw {
+                            continue
+                        }
+                        desc = desc.replace(query, topic).replace(_q_lower, topic)
+                        clean_steps.append(desc)
+                    }
+                    // NRS-MODEL-005: never emit internal planner step
+                    // descriptions ("Gather data and evidence for X",
+                    // "Break down into analyzable dimensions", …) to the
+                    // user. They are scaffolding for retrieval/inference,
+                    // not the answer. The plan still executes; we just
+                    // don't echo it back as if it were the response.
+                    pass
+                }
+            } catch(e) {
+                pass
+            }
+        }
+
+        if intent == "code" {
+            let code_resp = self._compose_code_response(query, topic, [], context)
+            if code_resp {
+                return code_resp
+            }
+        }
+
+        if intent == "suggest" {
+            // NRS-MODEL-005: previous template was hardcoded for food
+            // recommendations and fired on every "what should I do"
+            // prompt. Replaced with a domain-neutral abstention.
+            return "I don't have a grounded recommendation for " + topic + " in my current knowledge packs. The right answer depends on specifics I don't have visibility into -- your constraints, risk tolerance, and what you've already tried. If you can give me a sentence or two of context, I can reason through it more concretely."
+        } else {
+            if intent == "define" {
+                if has_grounded_inference {
+                    paragraphs.append("Based on what we've established in this conversation, " + topic + " can be understood through the connections we've drawn.")
+                } else {
+                    paragraphs.append("While I don't have a verified definition of " + topic + " in my knowledge packs, in the " + domain + " domain it typically relates to the interplay of several core concepts.")
+                }
+            } else {
+                if intent == "explain_mechanism" {
+                    if has_grounded_inference {
+                        paragraphs.append("Drawing on the evidence from our discussion, the mechanism appears to work in layers -- each stage building on what the previous one established, with the reasoning chain we've constructed providing the scaffolding.")
+                    } else {
+                        paragraphs.append("I don't have a verified mechanistic account for this in my knowledge packs. Reasoning from " + domain + " principles, mechanisms like this typically involve layered dependencies -- but I'd recommend verifying the specific causal chain.")
+                    }
+                } else {
+                    if intent == "explain_cause" {
+                        if has_grounded_inference {
+                            paragraphs.append("From the claims we've established, I can trace a plausible causal thread. I'd distinguish between the proximate triggers and the structural causes that made those triggers possible.")
+                        } else {
+                            paragraphs.append("I'm reasoning without verified causal data here. In the " + domain + " domain, complex outcomes like this rarely have a single cause -- but pinpointing the specific factors requires evidence I don't currently have.")
+                        }
+                    } else {
+                        if intent == "compare" {
+                            if has_grounded_inference {
+                                paragraphs.append("Based on what we've discussed, the meaningful comparison isn't just which is 'better' -- it's understanding what each optimizes for, given the tradeoffs we've identified.")
+                            } else {
+                                paragraphs.append("I don't have verified comparative data in my knowledge packs. Generally in " + domain + ", every design choice involves a tradeoff, and the right answer depends on which constraints matter most to the specific situation.")
+                            }
+                        } else {
+                            if has_grounded_inference {
+                                paragraphs.append("Building on what we've established about " + topic + ", I can extend the reasoning further into the " + domain + " space -- though the conclusions here are derived, not directly verified.")
+                            } else {
+                                if arc == "engaged" or arc == "curious" {
+                                    paragraphs.append("I don't have verified facts about " + topic + " specifically, but reasoning from " + domain + " principles, this touches on something fundamental -- though I want to flag that I'm working from inference, not established data.")
+                                } else {
+                                    if arc == "challenging" {
+                                        paragraphs.append("That's a genuine tension worth sitting with. I don't have verified data to resolve it definitively -- the standard view on " + topic + " doesn't fully account for edge cases, and I'd rather be honest about that gap.")
+                                    } else {
+                                        // NRS-MODEL-005: replaced stalling
+                                        // "Let me reason through {topic}..."
+                                        // template with explicit abstention.
+                                        paragraphs.append("I don't have a grounded answer for " + topic + " in my current knowledge packs (" + domain + "). I'd rather flag that gap than fabricate one. If you can rephrase or point me at a more specific angle, I'll try again.")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let analogy = self._generate_analogy(topic, domain)
+        if analogy {
+            paragraphs.append(analogy)
+        }
+
+        if has_history {
+            let thread = self._thread_connection(claims, topic, query)
+            if thread {
+                paragraphs.append(thread)
+            }
+        }
+
+        let followup = self._contextual_followup(query, intent, context)
+        if followup {
+            paragraphs.append(followup)
+        }
+
+        let all_short = true
+        for p in paragraphs {
+            if len(p.strip()) >= 20 {
+                all_short = false
+                break
+            }
+        }
+        if not paragraphs or all_short {
+            let _topic_clean = topic.strip().rstrip("?!.")
+            let dp = domain_principles
+            if not dp {
+                dp = "In the " + domain + " domain, this is a question that requires careful reasoning."
+            }
+            paragraphs = [
+                "Let me think through " + _topic_clean + " from what I know.",
+                dp,
+                "While I don't have a verified answer for " + _topic_clean + " in my knowledge base, I can reason about it from general principles. Would you like me to explore specific aspects of this topic?"
+            ]
+        }
+
+        let filtered = []
+        for p in paragraphs {
+            if p {
+                filtered.append(p)
+            }
+        }
+        return "\n\n".join(filtered)
+    }
+
+    fn _compose_opinion(self, query: str, topic: str, domain: str, inference_chains: List[str], personality: Dict[str, float]) -> str {
+        let _topic = self._extract_topic(query)
+        if len(_topic) < 2 {
+            _topic = topic
+        }
+
+        let _perspectives = {
+            "technology": [
+                _topic + " represents one of the most significant developments of our time",
+                "The potential of " + _topic + " is enormous, but so are the risks if mismanaged",
+                "What excites me about " + _topic + " is how it pushes the boundaries of what's possible"
+            ],
+            "science": [
+                _topic + " is a fascinating area where our understanding keeps evolving",
+                "The scientific progress around " + _topic + " has been remarkable",
+                "What's compelling about " + _topic + " is how it connects to fundamental questions"
+            ],
+            "philosophy": [
+                _topic + " raises profound questions about the nature of knowledge and existence",
+                "Philosophers have debated " + _topic + " for centuries, and for good reason"
+            ]
+        }
+        let _default = [
+            _topic + " is a topic with many dimensions worth considering",
+            "There are compelling arguments on multiple sides of " + _topic,
+            "My analysis of " + _topic + " suggests it's more nuanced than it first appears"
+        ]
+
+        let _openers = _perspectives.get(domain, _default)
+        let parts = [random.choice(_openers) + "."]
+
+        if inference_chains {
+            parts.append("From what I can reason through:")
+            for chain in inference_chains[:3] {
+                parts.append("- " + chain)
+            }
+        } else {
+            let _angles = [
+                "On one hand, " + _topic + " offers real potential for positive impact -- it can drive innovation, improve efficiency, and open new possibilities.",
+                "On the other hand, there are legitimate concerns about how " + _topic + " is developed, governed, and distributed. The risks of unchecked advancement deserve serious attention.",
+                "Ultimately, the trajectory of " + _topic + " depends on the choices we make now -- thoughtful governance, ethical frameworks, and inclusive design can shape it toward beneficial outcomes."
+            ]
+            for a in _angles {
+                parts.append(a)
+            }
+        }
+
+        parts.append("I'd be happy to explore any specific aspect of " + _topic + " in more depth.")
+        return "\n\n".join(parts)
+    }
+
+    fn _compose_creative(self, query: str, topic: str, domain: str, personality: Dict[str, float]) -> str {
+        let ql = query.lower()
+        let subject = topic
+
+        let creative_prefixes = ["a poem about ", "a story about ", "a tale about ", "a song about ", "a haiku about ", "me a poem about ", "me a story about ", "me a tale about "]
+        for prefix in creative_prefixes {
+            if prefix in ql {
+                subject = ql.split(prefix, 1)[1].strip().rstrip("?!.")
+                break
+            }
+        }
+        let articles = ["the ", "a ", "an "]
+        for _art in articles {
+            if subject.lower().startswith(_art) {
+                subject = subject[len(_art):]
+            }
+        }
+
+        if "poem" in ql or "verse" in ql or "ballad" in ql {
+            return self._compose_poem(subject, personality)
+        } else {
+            if "haiku" in ql {
+                return self._compose_haiku(subject)
+            } else {
+                if "story" in ql or "tale" in ql or "narrative" in ql {
+                    return self._compose_story(subject, personality)
+                } else {
+                    if "song" in ql or "lyric" in ql {
+                        return self._compose_poem(subject, personality)
+                    } else {
+                        return self._compose_poem(subject, personality)
+                    }
+                }
+            }
+        }
+    }
+
+    fn _compose_poem(self, subject: str, personality: Dict[str, float]) -> str {
+        let _nature_imagery = {
+            "ocean": ["waves", "tides", "shore", "depths", "salt spray", "horizon", "currents"],
+            "moon": ["silver light", "crescent", "tides", "darkness", "glow", "phases"],
+            "forest": ["canopy", "roots", "moss", "shadows", "birdsong", "leaves"],
+            "mountain": ["peak", "stone", "snow", "wind", "altitude", "silence"],
+            "river": ["current", "banks", "flow", "stones", "reflection", "journey"],
+            "sky": ["clouds", "expanse", "blue", "dawn", "dusk", "stars"],
+            "rain": ["drops", "puddles", "petrichor", "rhythm", "grey skies", "renewal"],
+            "fire": ["flames", "embers", "warmth", "dance", "ash", "light"]
+        }
+        let _emotion_words = {
+            "wonder": ["vast", "infinite", "mysterious", "awe", "magnificent"],
+            "peace": ["gentle", "soft", "calm", "quiet", "serene", "still"],
+            "longing": ["distant", "fading", "memory", "yearning", "ache"],
+            "joy": ["bright", "dancing", "laughter", "golden", "alive"]
+        }
+        let _templates = [
+            "{img1} upon {img1b},\n{emotion} in every {img2},\n{subject_cap} speaks of {theme}\nwhere {img3} meets the {img4}.",
+            "In the {adj1} {subject},\nwhere {img1} {verb1} without end,\nthere lies a {emotion}\nthat words can barely {verb2}.\n\n{img2} upon {img2b},\neach one a {theme}\nwritten in the language\nof {img3} and {img4}.",
+            "Have you heard the {subject} {verb1}?\nIt tells of {img1} and {img2},\nof {adj1} {img3}\nand {emotion} that {verb2} still.\n\nBeneath the {img4},\nthe {subject} remembers\nwhat we have forgotten --\nthat {theme} is everything.",
+            "The {subject} carries {img1}\nacross {adj1} {img2},\neach {img3} a testament\nto the {emotion} of being.\n\nWe stand at the edge\nwhere {img4} begins,\nand the {subject} whispers:\n{theme}."
+        ]
+        let _themes = [
+            "the beauty of impermanence", "the rhythm of existence",
+            "the depth of wonder", "eternity written in moments",
+            "what silence teaches", "the courage to simply be"
+        ]
+
+        let subj_lower = subject.lower()
+        let imagery = _nature_imagery.get(subj_lower, None)
+        if imagery == None {
+            let all_vals = list(_nature_imagery.values())
+            imagery = random.choice(all_vals)
+        }
+        let emotion_keys = list(_emotion_words.keys())
+        let emotion_key = random.choice(emotion_keys)
+        let emotions = _emotion_words[emotion_key]
+
+        random.shuffle(imagery)
+        let template = random.choice(_templates)
+
+        let verbs = ["whisper", "dance", "flow", "breathe", "sing", "unfold", "reach", "drift"]
+        let adjs = ["ancient", "boundless", "tender", "luminous", "wild", "eternal", "quiet"]
+
+        let img1 = "light"
+        if len(imagery) > 0 { img1 = imagery[0] }
+        let img1b = "shadow"
+        if len(imagery) > 1 { img1b = imagery[1] }
+        let img2 = "silence"
+        if len(imagery) > 2 { img2 = imagery[2] }
+        let img2b = "time"
+        if len(imagery) > 3 { img2b = imagery[3] }
+        let img3 = "stillness"
+        if len(imagery) > 4 { img3 = imagery[4] }
+        let img4 = "distance"
+        if len(imagery) > 5 { img4 = imagery[5] }
+
+        let poem = template.replace("{subject}", subject)
+        poem = poem.replace("{subject_cap}", subject.capitalize())
+        poem = poem.replace("{img1b}", img1b)
+        poem = poem.replace("{img1}", img1)
+        poem = poem.replace("{img2b}", img2b)
+        poem = poem.replace("{img2}", img2)
+        poem = poem.replace("{img3}", img3)
+        poem = poem.replace("{img4}", img4)
+        poem = poem.replace("{emotion}", random.choice(emotions))
+        poem = poem.replace("{theme}", random.choice(_themes))
+        poem = poem.replace("{adj1}", random.choice(adjs))
+        poem = poem.replace("{verb1}", random.choice(verbs))
+        poem = poem.replace("{verb2}", random.choice(verbs))
+        return poem
+    }
+
+    fn _compose_haiku(self, subject: str) -> str {
+        let s = subject.lower()
+        let S = subject.capitalize()
+        let _haiku_sets = [
+            S + " in stillness\nlight dances on the surface\nbreath of the unknown",
+            "Beneath the " + s + "\nsecrets older than the stars\nsilence answers all",
+            S + " ever flows\ncarrying forgotten names\ntime returns to shore",
+            "Quiet " + s + " waits\nthe world turns without hurry\nall things find their way",
+            "Morning brings the " + s + "\nshadows retreat to corners\nnature holds its breath",
+            "In the heart of " + s + "\na thousand stories unfold\nwisdom speaks in waves"
+        ]
+        return random.choice(_haiku_sets)
+    }
+
+    fn _compose_story(self, subject: str, personality: Dict[str, float]) -> str {
+        let _openings = [
+            "Once, in a time before memory had a name, there lived a " + subject + ".",
+            "They say that if you listen carefully at dusk, you can still hear the " + subject + ".",
+            "The " + subject + " had always been there -- long before anyone thought to give it a name.",
+            "It began, as most extraordinary things do, with a " + subject + " and an impossible question."
+        ]
+        let _middles = [
+            "The " + subject + " had seen empires rise and fall, had witnessed both the cruelty and kindness that the world could offer. And through it all, it remained.",
+            "At first, no one believed the " + subject + ". How could something so ordinary contain such wonder? But the evidence was undeniable.",
+            "For years, the " + subject + " wandered -- not lost, exactly, but searching. Searching for something that had no name and no shape, only a feeling.",
+            "What the " + subject + " understood, and what others could not, was that the truest things cannot be spoken. They can only be lived."
+        ]
+        let _endings = [
+            "And so the " + subject + " remained, as it always had -- a quiet testament to the fact that some stories never truly end.",
+            "To this day, those who remember speak of the " + subject + " in hushed tones. Not because it was powerful, but because it was true.",
+            "The " + subject + " smiled at this, knowing what we have yet to learn: that endings are merely beginnings wearing a different face."
+        ]
+        return random.choice(_openings) + "\n\n" + random.choice(_middles) + "\n\n" + random.choice(_endings)
+    }
+
+    fn _domain_first_principles(self, domain: str) -> str {
+        let principles = {
+            "philosophy": "In philosophy the answer depends on which tradition you draw from -- empiricist, rationalist, phenomenological -- because the framework shapes the conclusion as much as the evidence does.",
+            "science": "The short answer draws on established physical and natural science. The underlying mechanisms follow well-tested models, though the full picture is always more layered than a one-paragraph summary.",
+            "psychology": "From a cognitive-science perspective, this involves how we perceive, represent, and process information -- and the systematic biases that come with those processes.",
+            "technology": "Technically, this works through layers of abstraction -- each layer solves a specific problem and exposes a simpler interface to the layer above it.",
+            "mathematics": "Mathematically, the answer follows from a small set of axioms and definitions. The structure constrains what's possible and often reveals non-obvious connections.",
+            "history": "Historically, context matters enormously. The same event reads very differently depending on whose perspective you centre and which timeframe you zoom into.",
+            "economics": "Economically, this comes down to incentives and trade-offs. Individual behaviour aggregates into emergent patterns that no single participant designs.",
+            "geography": "Geographically, location and physical features shape everything from climate to culture. The spatial relationships matter.",
+            "medicine": "In medicine, mechanism and individual variation both matter. The textbook answer gives the general rule; clinical practice adapts it to the patient.",
+            "art": "In art and culture, meaning is constructed between creator and audience. Context -- historical, personal, social -- shapes interpretation.",
+            "music": "Music exploits our pattern-detection wiring -- tension and release, expectation and surprise. Structure creates the emotional effect.",
+            "general": "Let me reason through this from what I know."
+        }
+        return principles.get(domain, principles["general"])
+    }
+
+    fn _generate_analogy(self, topic: str, domain: str) -> str {
+        let analogy_seeds = {
+            "philosophy": "Think of " + topic + " like a map -- useful precisely because it leaves things out. The question is what's being omitted and whether that matters.",
+            "science": "An analogy: " + topic + " is like temperature -- it's a macro-level description of something that, at the micro level, looks completely different. The description is real, even if the underlying reality is more complex.",
+            "psychology": "It's similar to how you can't see your own blind spot -- the system that's doing the observing has inherent limitations in observing itself.",
+            "technology": "Think of it like a protocol stack -- what looks simple at the top is supported by layers of complexity underneath, each solving a different problem.",
+            "general": "Here's one way to think about it: " + topic + " is less like a thing and more like a process -- something that emerges from the interaction of simpler components."
+        }
+        return analogy_seeds.get(domain, analogy_seeds.get("general", ""))
+    }
+
+    fn _suggest_followup(self, query: str, intent: str) -> str {
+        return self._contextual_followup(query, intent, {})
+    }
+
+    fn _lc(self, text: str) -> str {
+        if not text {
+            return text
+        }
+        if text[0].isupper() and (len(text) < 2 or not text[1].isupper()) {
+            return text[0].lower() + text[1:]
+        }
+        return text
+    }
+
+    fn _load_composition_rules(self) -> Dict[str, Any] {
+        return {
+            "metaphor": {
+                "structure": "[topic] is like [comparison] because [reason]",
+                "requires": ["topic", "comparison", "reason"]
+            },
+            "explanation": {
+                "structure": "[concept] means [definition]. For example, [example]",
+                "requires": ["concept", "definition", "example"]
+            },
+            "story": {
+                "structure": "[setting] [character] [action] [result]",
+                "requires": ["setting", "character", "action", "result"]
+            }
+        }
+    }
+
+    fn _merge_fragments(self, fragments: List[str], style: PatternStyle, target_length: int) -> str {
+        let merged = ". ".join(fragments)
+        if style.tone == "casual" {
+            merged = merged.replace(". ", ". So, ", 1)
+        } else {
+            if style.tone == "formal" {
+                merged = merged.replace(". ", ". Furthermore, ", 1)
+            }
+        }
+        if len(merged) > target_length {
+            let sentences = merged.split(". ")
+            merged = ". ".join(sentences[:3]) + "."
+        }
+        return merged
+    }
+
+    fn _add_humor_markers(self, text: str) -> str {
+        if "." in text {
+            return text.replace(".", " (if you can believe it).", 1)
+        }
+        return text
+    }
+
+    fn _add_empathy_markers(self, text: str) -> str {
+        return "I understand, " + text[0].lower() + text[1:]
+    }
+
+    fn _add_enthusiasm_markers(self, text: str) -> str {
+        if not text.endswith("!") {
+            return text.replace(".", "!", 1)
+        }
+        return text
+    }
+}
+
+class GenerativeEngine {
+    fn __init__(self) {
+        self.interpolator = PatternInterpolator {}
+        self.synthesizer = CompositionSynthesizer {}
+        self.personality: Dict[str, float] = {
+            "humor": 0.5,
+            "empathy": 0.7,
+            "enthusiasm": 0.6,
+            "formality": 0.4
+        }
+    }
+
+    fn generate(self, prompt: str, mode: GenerationMode, style: Optional[PatternStyle], temperature: float) -> Dict[str, Any] {
+        if mode == None {
+            mode = GenerationMode.INTERPOLATION
+        }
+        if temperature == None {
+            temperature = 0.7
+        }
+        if style == None {
+            style = PatternStyle {
+                tone: "casual",
+                length: "moderate",
+                structure: "narrative",
+                creativity: temperature,
+                emotional_valence: 0.0
+            }
+        }
+
+        if mode == GenerationMode.INTERPOLATION {
+            return self._generate_interpolated(prompt, style, temperature)
+        } else {
+            if mode == GenerationMode.SYNTHESIS {
+                return self._generate_synthesized(prompt, style, temperature)
+            } else {
+                if mode == GenerationMode.COMBINATORIAL {
+                    return self._generate_combinatorial(prompt, style, temperature)
+                }
+            }
+        }
+        return self._generate_interpolated(prompt, style, temperature)
+    }
+
+    fn _generate_interpolated(self, prompt: str, style: PatternStyle, temperature: float) -> Dict[str, Any] {
+        let seed_a = {"text": prompt, "confidence": 0.8, "id": "seed_prompt"}
+        let seed_b = {"text": self._echo_transform(prompt, style), "confidence": 0.7, "id": "echo"}
+        let alpha = max(0.1, min(0.9, temperature))
+        let result = self.interpolator.interpolate_linear(seed_a, seed_b, alpha)
+        return {
+            "text": result["text"],
+            "confidence": result["confidence"],
+            "method": "interpolation",
+            "temperature": temperature,
+            "patterns_used": result.get("patterns_used", [])
+        }
+    }
+
+    fn _generate_synthesized(self, prompt: str, style: PatternStyle, temperature: float) -> Dict[str, Any] {
+        let text = self.synthesizer.synthesize_creative(topic: prompt, style: style, length: int(100 * (1 + temperature)))
+        return {
+            "text": text,
+            "confidence": 0.8 * (1 - temperature * 0.3),
+            "method": "synthesis",
+            "temperature": temperature
+        }
+    }
+
+    fn _generate_combinatorial(self, prompt: str, style: PatternStyle, temperature: float) -> Dict[str, Any] {
+        let patterns = [
+            {"text": prompt, "confidence": 0.8, "id": "prompt_seed"},
+            {"text": self._echo_transform(prompt, style), "confidence": 0.7, "id": "echo_seed"},
+            {"text": self._negate_transform(prompt), "confidence": 0.6, "id": "neg_seed"}
+        ]
+        let result = self.interpolator.interpolate_spherical(patterns, style)
+        return {
+            "text": result["text"],
+            "confidence": result["confidence"],
+            "method": "combinatorial",
+            "temperature": temperature,
+            "patterns_used": result.get("patterns_used", [])
+        }
+    }
+
+    fn chat(self, message: str, conversation_history: List[Dict[str, str]], lobe_facts: Optional[List[str]], knowledge_facts: Optional[List[str]], tone_directive) -> str {
+        let active_personality = dict(self.personality)
+        if tone_directive != None {
+            let traits = getattr(tone_directive, "personality_traits", {})
+            if traits {
+                active_personality.update(traits)
+            }
+            let formality = getattr(tone_directive, "formality", None)
+            if formality != None {
+                active_personality["formality"] = formality
+            }
+        }
+
+        let raw = self.synthesizer.synthesize_conversational(
+            query: message,
+            conversation_history: conversation_history,
+            personality: active_personality,
+            lobe_facts: lobe_facts,
+            knowledge_facts: knowledge_facts
+        )
+
+        if tone_directive != None {
+            raw = self._apply_tone_directive(raw, tone_directive, active_personality)
+        }
+        return raw
+    }
+
+    let _SIMPLIFY_MAP = {
+        "utilize": "use", "implement": "set up", "facilitate": "help",
+        "approximately": "about", "subsequently": "then", "prioritize": "focus on",
+        "demonstrate": "show", "communicate": "talk", "construct": "build",
+        "sufficient": "enough", "numerous": "many", "commence": "start",
+        "terminate": "end", "endeavor": "try", "fundamental": "basic",
+        "component": "part", "significant": "big", "additional": "more",
+        "preceding": "earlier", "functionality": "feature", "mechanism": "way it works",
+        "infrastructure": "system", "methodology": "method", "paradigm": "approach",
+        "epistemological": "about how we know things",
+        "deterministic": "always gives the same answer",
+        "probabilistic": "might give different answers",
+        "heterogeneous": "made of different types",
+        "asynchronous": "happens in the background"
+    }
+
+    let _EXPERT_QUALIFIERS = [
+        "More precisely, ", "To elaborate, ", "It's worth noting that ",
+        "From a technical standpoint, ", "The underlying mechanism is "
+    ]
+
+    let _NUANCE_QUALIFIERS = [
+        "That said, there are nuances -- ",
+        "It's important to note that ",
+        "One caveat worth considering: ",
+        "This generally holds, though "
+    ]
+
+    fn _simplify_text(self, text: str, level: float) -> str {
+        if level >= 0.30 and level < 0.55 {
+            return text
+        }
+        if level >= 0.80 {
+            return text
+        }
+        if level >= 0.55 {
+            return text
+        }
+
+        let result = text
+        for hard in self._SIMPLIFY_MAP.keys() {
+            let easy = self._SIMPLIFY_MAP[hard]
+            if hard in result.lower() {
+                result = re.sub(re.escape(hard), easy, result, flags: re.IGNORECASE)
+            }
+        }
+
+        if level < 0.20 {
+            let sentences = result.split(". ")
+            let short_sentences = []
+            for s in sentences {
+                let st = s.strip()
+                if not st {
+                    continue
+                }
+                let words = st.split()
+                if len(words) > 20 {
+                    let mid = len(words) / 2
+                    short_sentences.append(" ".join(words[:mid]) + ".")
+                    short_sentences.append(" ".join(words[mid:]))
+                } else {
+                    short_sentences.append(st)
+                }
+            }
+            result = ". ".join(short_sentences)
+            if not result.endswith(".") {
+                result += "."
+            }
+        }
+
+        return result
+    }
+
+    fn _apply_tone_directive(self, text: str, directive, personality: Dict[str, float]) -> str {
+        if not text {
+            return text
+        }
+
+        let reading_level = getattr(directive, "reading_level", 0.5)
+
+        text = self._simplify_text(text, reading_level)
+
+        if reading_level < 0.15 and len(text) > 50 {
+            let starts_friendly = false
+            let friendly_starts = ["so basically", "think of it", "imagine", "it's like"]
+            for p in friendly_starts {
+                if text.lower().startswith(p) {
+                    starts_friendly = true
+                    break
+                }
+            }
+            if not starts_friendly {
+                text = "So basically, " + text[0].lower() + text[1:]
+            }
+        }
+
+        if reading_level >= 0.55 and reading_level < 0.80 and len(text) > 200 {
+            let sentences = text.split(". ")
+            if len(sentences) > 3 {
+                let _qual = random.choice(self._NUANCE_QUALIFIERS)
+                let _insert_at = min(3, len(sentences) - 1)
+                let _lowered = sentences[_insert_at]
+                if _lowered and _lowered[0].isupper() {
+                    _lowered = _lowered[0].lower() + _lowered[1:]
+                }
+                sentences[_insert_at] = _qual + _lowered
+                text = ". ".join(sentences)
+            }
+        }
+
+        if reading_level >= 0.80 and len(text) > 150 {
+            let sentences = text.split(". ")
+            if len(sentences) > 2 {
+                let _qual = random.choice(self._EXPERT_QUALIFIERS)
+                let _last = sentences[-1].strip()
+                if _last and not _last.endswith(".") {
+                    _last += "."
+                }
+                if _last and _last[0].isupper() {
+                    _last = _last[0].lower() + _last[1:]
+                }
+                sentences[-1] = _qual + _last
+                text = ". ".join(sentences)
+            }
+        }
+
+        let humor = personality.get("humor", 0)
+        let empathy = personality.get("empathy", 0)
+        let enthusiasm = personality.get("enthusiasm", 0)
+
+        if humor > 0.5 {
+            text = self.synthesizer._add_humor_markers(text)
+        }
+        if empathy > 0.5 {
+            text = self.synthesizer._add_empathy_markers(text)
+        }
+        if enthusiasm > 0.5 {
+            text = self.synthesizer._add_enthusiasm_markers(text)
+        }
+
+        let coloring = getattr(directive, "emotional_coloring", "none")
+        if coloring == "reassuring" and not text.lower().startswith("i understand") {
+            text = "I hear you, and " + text[0].lower() + text[1:]
+        } else {
+            if coloring == "encouraging" {
+                text = "Great question -- " + text[0].lower() + text[1:]
+            }
+        }
+
+        let verbosity = getattr(directive, "verbosity", "normal")
+        if (verbosity == "concise" or verbosity == "brief") and len(text) > 500 {
+            let sentences = text.split(". ")
+            let limit = max(3, len(sentences) / 2)
+            text = ". ".join(sentences[:limit]) + "."
+        }
+
+        let formality = personality.get("formality", 0.5)
+        if formality < 0.25 and reading_level < 0.55 and text[0:1].isupper() {
+            let contractions = {
+                "I am ": "I'm ",
+                "You are ": "You're ",
+                "It is ": "It's ",
+                "They are ": "They're ",
+                "We are ": "We're ",
+                "do not ": "don't ",
+                "does not ": "doesn't ",
+                "cannot ": "can't ",
+                "will not ": "won't ",
+                "is not ": "isn't ",
+                "are not ": "aren't ",
+                "would not ": "wouldn't ",
+                "could not ": "couldn't "
+            }
+            for formal in contractions.keys() {
+                text = text.replace(formal, contractions[formal])
+            }
+        }
+
+        return text
+    }
+
+    fn mode_style_profile(mode_vector) -> PatternStyle {
+        let analytical = getattr(mode_vector, "analytical", 0)
+        let creative = getattr(mode_vector, "creative", 0)
+        let empathetic = getattr(mode_vector, "empathetic", 0)
+        let exploratory = getattr(mode_vector, "exploratory", 0)
+        let critical = getattr(mode_vector, "critical", 0)
+        let metacognitive = getattr(mode_vector, "metacognitive", 0)
+        let factual = getattr(mode_vector, "factual", 0)
+
+        let tone = "casual"
+        let creativity = 0.5
+        if creative > 0.6 {
+            tone = "expressive"
+            creativity = 0.9
+        } else {
+            if empathetic > 0.5 {
+                tone = "warm"
+                creativity = 0.4
+            } else {
+                if exploratory > 0.5 {
+                    tone = "curious"
+                    creativity = 0.7
+                } else {
+                    if critical > 0.5 {
+                        tone = "careful"
+                        creativity = 0.2
+                    } else {
+                        if metacognitive > 0.5 {
+                            tone = "reflective"
+                            creativity = 0.3
+                        } else {
+                            if analytical > 0.7 {
+                                tone = "precise"
+                                creativity = 0.1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let structure = "conversational"
+        if analytical > 0.7 or critical > 0.5 {
+            structure = "structured"
+        } else {
+            if creative > 0.6 {
+                structure = "narrative"
+            }
+        }
+
+        let length = "moderate"
+        if factual > 0.8 and creative < 0.2 {
+            length = "concise"
+        } else {
+            if metacognitive > 0.5 or analytical > 0.7 {
+                length = "detailed"
+            }
+        }
+
+        let valence = creative * 0.3 + empathetic * 0.3 + exploratory * 0.2 - critical * 0.2 - analytical * 0.1
+
+        return PatternStyle {
+            tone: tone,
+            length: length,
+            structure: structure,
+            creativity: creativity,
+            emotional_valence: max(-1.0, min(1.0, valence))
+        }
+    }
+
+    fn generate_followup_options(self, query: str, answer: str, intent: str, domain: str, context: Optional[Dict[str, Any]]) -> List[any] {
+        return self.synthesizer.generate_followup_options(
+            query: query,
+            answer: answer,
+            intent: intent,
+            domain: domain,
+            context: context
+        )
+    }
+
+    fn set_personality(self, traits: Dict[str, float]) {
+        self.personality.update(traits)
+    }
+
+    fn _echo_transform(self, text: str, style: PatternStyle) -> str {
+        let words = text.split()
+        if style.creativity > 0.5 and len(words) > 2 {
+            let rev = []
+            let i = min(4, len(words)) - 1
+            while i >= 0 {
+                rev.append(words[i])
+                i -= 1
+            }
+            return " ".join(rev) + " " + " ".join(words[4:])
+        }
+        if len(words) > 1 {
+            return " ".join(words[1:] + words[:1])
+        }
+        return text
+    }
+
+    fn _negate_transform(self, text: str) -> str {
+        let negations = {
+            "is": "is not",
+            "are": "are not",
+            "can": "cannot",
+            "will": "will not",
+            "has": "has not"
+        }
+        let words = text.split()
+        let i = 0
+        while i < len(words) {
+            if words[i].lower() in negations {
+                words[i] = negations[words[i].lower()]
+                break
+            }
+            i += 1
+        }
+        return " ".join(words)
+    }
+}
+
+export GenerationMode, PatternStyle, PatternInterpolator, CompositionSynthesizer, GenerativeEngine, set_agi_engines

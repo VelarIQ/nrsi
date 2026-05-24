@@ -1,0 +1,1046 @@
+/// NRS Telecom Fault Isolation — Automation Engine.
+///
+/// Turns the manual "upload file, get report" workflow into a
+/// fully automated pipeline that:
+///
+///   1. Watches for new data (file drop, SFTP, S3, HTTP push)
+///   2. Runs the full TelecomFaultIsolator analysis
+///   3. Exports reports (Excel, PDF, HTML, JSON)
+///   4. Sends notifications (webhook, email, Slack, PagerDuty)
+///   5. Archives results with provenance
+///   6. Runs on a schedule or continuously
+///
+/// ═══════════════════════════════════════════════════════════════════
+///   AUTOMATION FLOW
+/// ═══════════════════════════════════════════════════════════════════
+///
+///   Data Sources                    Triggers
+///   ─────────────                   ────────
+///   Local directory (file drop)     inotify / poll
+///   SFTP server (Ericsson OSS)      scheduled pull
+///   S3/GCS bucket                   event notification
+///   HTTP POST (webhook)             edge-gateway route
+///   Email attachment                IMAP poll
+///        │
+///        ▼
+///   ┌─ INGESTION ───────────────────────────────────────────────────┐
+///   │  Detect format, validate, deduplicate, queue                  │
+///   └────────────┬──────────────────────────────────────────────────┘
+///                │
+///                ▼
+///   ┌─ ANALYSIS ────────────────────────────────────────────────────┐
+///   │  TelecomFaultIsolator.analyze() — full 9-phase pipeline       │
+///   └────────────┬──────────────────────────────────────────────────┘
+///                │
+///                ▼
+///   ┌─ EXPORT ──────────────────────────────────────────────────────┐
+///   │  Excel + PDF + HTML + JSON to output directory                │
+///   └────────────┬──────────────────────────────────────────────────┘
+///                │
+///                ▼
+///   ┌─ NOTIFY ──────────────────────────────────────────────────────┐
+///   │  Webhook, email, Slack, PagerDuty based on severity           │
+///   └────────────┬──────────────────────────────────────────────────┘
+///                │
+///                ▼
+///   ┌─ ARCHIVE ─────────────────────────────────────────────────────┐
+///   │  Move processed data, store report, update run log            │
+///   └───────────────────────────────────────────────────────────────┘
+
+module telecom_automation
+
+import time from "std/time"
+import json from "std/json"
+import os from "std/os"
+import hashlib from "std/hashlib"
+import datetime from "std/datetime"
+import threading from "std/threading"
+import logging from "std/logging"
+import TelecomFaultIsolator, AnalysisReport from "telecom_analyzer"
+import ReportExporter from "telecom_report_export"
+import NRSFileEngine, get_engine as get_file_engine from "nrs_file_engine"
+import get_causal_reasoner, get_logic_engine, get_working_memory from "lobes"
+import detect_domain, get_confidence_floor from "nrs_domain_registry"
+import get_seeder from "nrs_vlt_seeder"
+
+let _tc_log = logging.getLogger("nrs.telecom-automation")
+import create_default_factory from "nrs_parser_factory"
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  ENUMS AND TYPES
+// ═══════════════════════════════════════════════════════════════════
+
+enum DataSourceType {
+    FILE_DROP = "file_drop",
+    SFTP = "sftp",
+    S3 = "s3",
+    GCS = "gcs",
+    HTTP_PUSH = "http_push",
+    EMAIL = "email"
+}
+
+enum NotifyChannel {
+    WEBHOOK = "webhook",
+    EMAIL = "email",
+    SLACK = "slack",
+    PAGERDUTY = "pagerduty",
+    LOG_ONLY = "log_only"
+}
+
+enum RunStatus {
+    SUCCESS = "success",
+    FAILURE = "failure",
+    SKIPPED = "skipped",
+    RUNNING = "running"
+}
+
+type AutomationConfig {
+    watch_dir: string,
+    output_dir: string,
+    archive_dir: string,
+    poll_interval_sec: int,
+    file_patterns: List[string],
+    auto_export_formats: List[string],
+    notify_channels: List[Dict[string, string]],
+    severity_threshold: string,
+    min_records: int,
+    max_file_age_hours: int,
+    deduplicate: bool,
+    sftp_host: string,
+    sftp_port: int,
+    sftp_user: string,
+    sftp_key_path: string,
+    sftp_remote_dir: string,
+    s3_bucket: string,
+    s3_prefix: string,
+    gcs_bucket: string,
+    gcs_prefix: string
+}
+
+type RunRecord {
+    run_id: string,
+    timestamp: float,
+    source_file: string,
+    source_type: string,
+    records_parsed: int,
+    towers_found: int,
+    primary_fault: string,
+    confidence: float,
+    severity: string,
+    trust_level: string,
+    elapsed_ms: float,
+    export_paths: Dict[string, string],
+    notifications_sent: List[string],
+    status: string,
+    error: string
+}
+
+type WatchState {
+    processed_files: Dict[string, float],
+    last_poll: float,
+    total_runs: int,
+    total_faults_found: int,
+    uptime_start: float
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  DEFAULT CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════
+
+fn default_config() -> AutomationConfig {
+    return AutomationConfig {
+        watch_dir: "/data/telecom/incoming",
+        output_dir: "/data/telecom/reports",
+        archive_dir: "/data/telecom/archive",
+        poll_interval_sec: 30,
+        file_patterns: get_file_engine().supported_extensions(),
+        auto_export_formats: ["xlsx", "pdf", "html", "json"],
+        notify_channels: [],
+        severity_threshold: "WARNING",
+        min_records: 10,
+        max_file_age_hours: 168,
+        deduplicate: true,
+        sftp_host: "",
+        sftp_port: 22,
+        sftp_user: "",
+        sftp_key_path: "",
+        sftp_remote_dir: "",
+        s3_bucket: "",
+        s3_prefix: "",
+        gcs_bucket: "",
+        gcs_prefix: ""
+    }
+}
+
+fn config_from_env() -> AutomationConfig {
+    let cfg = default_config()
+    cfg.watch_dir = os.environ.get("NRS_TELECOM_WATCH_DIR", cfg.watch_dir)
+    cfg.output_dir = os.environ.get("NRS_TELECOM_OUTPUT_DIR", cfg.output_dir)
+    cfg.archive_dir = os.environ.get("NRS_TELECOM_ARCHIVE_DIR", cfg.archive_dir)
+
+    let interval = os.environ.get("NRS_TELECOM_POLL_INTERVAL", "")
+    if interval != "" { cfg.poll_interval_sec = int(interval) }
+
+    let min_rec = os.environ.get("NRS_TELECOM_MIN_RECORDS", "")
+    if min_rec != "" { cfg.min_records = int(min_rec) }
+
+    cfg.sftp_host = os.environ.get("NRS_TELECOM_SFTP_HOST", "")
+    let sftp_port = os.environ.get("NRS_TELECOM_SFTP_PORT", "")
+    if sftp_port != "" { cfg.sftp_port = int(sftp_port) }
+    cfg.sftp_user = os.environ.get("NRS_TELECOM_SFTP_USER", "")
+    cfg.sftp_key_path = os.environ.get("NRS_TELECOM_SFTP_KEY", "")
+    cfg.sftp_remote_dir = os.environ.get("NRS_TELECOM_SFTP_DIR", "")
+
+    cfg.s3_bucket = os.environ.get("NRS_TELECOM_S3_BUCKET", "")
+    cfg.s3_prefix = os.environ.get("NRS_TELECOM_S3_PREFIX", "")
+    cfg.gcs_bucket = os.environ.get("NRS_TELECOM_GCS_BUCKET", "")
+    cfg.gcs_prefix = os.environ.get("NRS_TELECOM_GCS_PREFIX", "")
+
+    let webhook_url = os.environ.get("NRS_TELECOM_WEBHOOK_URL", "")
+    if webhook_url != "" {
+        append(cfg.notify_channels, {"channel": "webhook", "url": webhook_url})
+    }
+
+    let slack_url = os.environ.get("NRS_TELECOM_SLACK_WEBHOOK", "")
+    if slack_url != "" {
+        append(cfg.notify_channels, {"channel": "slack", "url": slack_url})
+    }
+
+    let pd_key = os.environ.get("NRS_TELECOM_PAGERDUTY_KEY", "")
+    if pd_key != "" {
+        append(cfg.notify_channels, {"channel": "pagerduty", "routing_key": pd_key})
+    }
+
+    let email_to = os.environ.get("NRS_TELECOM_EMAIL_TO", "")
+    if email_to != "" {
+        append(cfg.notify_channels, {
+            "channel": "email",
+            "to": email_to,
+            "smtp_host": os.environ.get("NRS_TELECOM_SMTP_HOST", "smtp.gmail.com"),
+            "smtp_port": os.environ.get("NRS_TELECOM_SMTP_PORT", "587"),
+            "smtp_user": os.environ.get("NRS_TELECOM_SMTP_USER", ""),
+            "smtp_pass": os.environ.get("NRS_TELECOM_SMTP_PASS", "")
+        })
+    }
+
+    return cfg
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  NOTIFICATION DISPATCHER
+// ═══════════════════════════════════════════════════════════════════
+
+class NotificationDispatcher {
+
+    fn init(self) {
+        self._sent: List[string] = []
+    }
+
+    fn dispatch(self, report: AnalysisReport, run: RunRecord,
+                channels: List[Dict[string, string]], export_paths: Dict[string, string]) -> List[string] {
+        let sent: List[string] = []
+
+        for ch in channels {
+            let channel_type = ch.get("channel", "log_only")
+
+            if channel_type == "webhook" {
+                let ok = self._send_webhook(ch, report, run, export_paths)
+                if ok { append(sent, "webhook:" + ch.get("url", "")) }
+            }
+
+            if channel_type == "slack" {
+                let ok = self._send_slack(ch, report, run)
+                if ok { append(sent, "slack") }
+            }
+
+            if channel_type == "pagerduty" {
+                let ok = self._send_pagerduty(ch, report, run)
+                if ok { append(sent, "pagerduty") }
+            }
+
+            if channel_type == "email" {
+                let ok = self._send_email(ch, report, run, export_paths)
+                if ok { append(sent, "email:" + ch.get("to", "")) }
+            }
+        }
+
+        self._sent = sent
+        return sent
+    }
+
+    fn _build_summary(self, report: AnalysisReport, run: RunRecord) -> Dict[string, Any] {
+        let pf = report.primary_fault
+        return {
+            "run_id": run.run_id,
+            "source_file": run.source_file,
+            "records": report.total_records,
+            "towers": report.total_towers,
+            "primary_fault": pf.tower_id,
+            "confidence": pf.confidence,
+            "severity": pf.fault_severity,
+            "domain": pf.fault_domain,
+            "root_cause": pf.root_cause,
+            "trust_level": report.trust_level,
+            "elapsed_ms": report.elapsed_ms,
+            "recommendations": pf.recommendations,
+            "evidence_count": len(pf.evidence),
+            "alternatives": len(report.alternative_hypotheses),
+            "timestamp": run.timestamp,
+            "provenance": report.provenance_hash
+        }
+    }
+
+    fn _send_webhook(self, ch: Dict[string, string], report: AnalysisReport,
+                     run: RunRecord, export_paths: Dict[string, string]) -> bool {
+        let url = ch.get("url", "")
+        if url == "" { return false }
+
+        let payload = self._build_summary(report, run)
+        payload["export_paths"] = export_paths
+
+        let urllib_request = __import__("urllib.request")
+        let req = urllib_request.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        try {
+            let resp = urllib_request.request.urlopen(req, timeout=10)
+            return resp.status >= 200 and resp.status < 300
+        } catch {
+            return false
+        }
+    }
+
+    fn _send_slack(self, ch: Dict[string, string], report: AnalysisReport,
+                   run: RunRecord) -> bool {
+        let url = ch.get("url", "")
+        if url == "" { return false }
+
+        let pf = report.primary_fault
+        let sev_emoji = ":white_check_mark:"
+        if pf.fault_severity == "CRITICAL" { sev_emoji = ":rotating_light:" }
+        if pf.fault_severity == "MAJOR" { sev_emoji = ":warning:" }
+        if pf.fault_severity == "MINOR" { sev_emoji = ":large_yellow_circle:" }
+
+        let text = sev_emoji + " *NRS Telecom Fault Isolation*\n"
+        text = text + "*Faulty Tower:* `" + pf.tower_id + "`\n"
+        text = text + "*Severity:* " + pf.fault_severity + " | *Domain:* " + pf.fault_domain + "\n"
+        text = text + "*Confidence:* " + format_float(pf.confidence * 100.0, 1) + "%\n"
+        text = text + "*Records:* " + str(report.total_records) + " | *Elapsed:* " + format_float(report.elapsed_ms, 1) + "ms\n"
+        text = text + "*Root Cause:* " + pf.root_cause[0:200] + "\n"
+        text = text + "*Source:* `" + run.source_file + "`"
+
+        let payload = {"text": text}
+        let urllib_request = __import__("urllib.request")
+        let req = urllib_request.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        try {
+            urllib_request.request.urlopen(req, timeout=10)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    fn _send_pagerduty(self, ch: Dict[string, string], report: AnalysisReport,
+                       run: RunRecord) -> bool {
+        let routing_key = ch.get("routing_key", "")
+        if routing_key == "" { return false }
+
+        let pf = report.primary_fault
+        let pd_severity = "warning"
+        if pf.fault_severity == "CRITICAL" { pd_severity = "critical" }
+        if pf.fault_severity == "MAJOR" { pd_severity = "error" }
+
+        let payload = {
+            "routing_key": routing_key,
+            "event_action": "trigger",
+            "payload": {
+                "summary": "Telecom fault: " + pf.tower_id + " (" + pf.fault_severity + ") - " + pf.fault_domain,
+                "severity": pd_severity,
+                "source": "nrs-telecom-analyzer",
+                "component": pf.tower_id,
+                "group": "telecom",
+                "custom_details": self._build_summary(report, run)
+            }
+        }
+
+        let urllib_request = __import__("urllib.request")
+        let req = urllib_request.request.Request(
+            "https://events.pagerduty.com/v2/enqueue",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        try {
+            urllib_request.request.urlopen(req, timeout=10)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    fn _send_email(self, ch: Dict[string, string], report: AnalysisReport,
+                   run: RunRecord, export_paths: Dict[string, string]) -> bool {
+        let to_addr = ch.get("to", "")
+        if to_addr == "" { return false }
+
+        let smtp_host = ch.get("smtp_host", "smtp.gmail.com")
+        let smtp_port = int(ch.get("smtp_port", "587"))
+        let smtp_user = ch.get("smtp_user", "")
+        let smtp_pass = ch.get("smtp_pass", "")
+
+        let pf = report.primary_fault
+        let subject = "[NRS] Telecom Fault: " + pf.tower_id + " (" + pf.fault_severity + ")"
+
+        let body = "NRS Telecom Fault Isolation Report\n"
+        body = body + "=" * 50 + "\n\n"
+        body = body + "Faulty Tower: " + pf.tower_id + "\n"
+        body = body + "Severity: " + pf.fault_severity + "\n"
+        body = body + "Domain: " + pf.fault_domain + "\n"
+        body = body + "Confidence: " + format_float(pf.confidence * 100.0, 1) + "%\n"
+        body = body + "Records: " + str(report.total_records) + "\n"
+        body = body + "Analysis Time: " + format_float(report.elapsed_ms, 1) + "ms\n\n"
+        body = body + "Root Cause:\n" + pf.root_cause + "\n\n"
+        body = body + "Recommendations:\n"
+        for rec in pf.recommendations {
+            body = body + "  - " + rec + "\n"
+        }
+        body = body + "\nReport files attached or available at configured output directory.\n"
+        body = body + "Provenance: " + report.provenance_hash + "\n"
+
+        let smtplib = __import__("smtplib")
+        let email_mime = __import__("email.mime.text")
+        let MIMEText = email_mime.mime.text.MIMEText
+
+        let msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = smtp_user
+        msg["To"] = to_addr
+
+        try {
+            let server = smtplib.SMTP(smtp_host, smtp_port)
+            server.starttls()
+            if smtp_user != "" and smtp_pass != "" {
+                server.login(smtp_user, smtp_pass)
+            }
+            server.sendmail(smtp_user, [to_addr], msg.as_string())
+            server.quit()
+            return true
+        } catch {
+            return false
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  FILE SOURCE MANAGER
+// ═══════════════════════════════════════════════════════════════════
+
+class FileSourceManager {
+
+    fn init(self, config: AutomationConfig) {
+        self._config = config
+        self._processed: Dict[string, float] = {}
+    }
+
+    fn scan_local(self) -> List[string] {
+        let new_files: List[string] = []
+        let watch = self._config.watch_dir
+
+        if !os.path.isdir(watch) { return new_files }
+
+        let now = time.time()
+        let max_age = float(self._config.max_file_age_hours) * 3600.0
+
+        for entry in os.listdir(watch) {
+            let full_path = os.path.join(watch, entry)
+            if !os.path.isfile(full_path) { continue }
+
+            let matches_pattern = false
+            for pat in self._config.file_patterns {
+                if entry.lower().endswith(pat) { matches_pattern = true }
+            }
+            if !matches_pattern { continue }
+
+            if self._config.deduplicate and full_path in self._processed { continue }
+
+            let mtime = os.path.getmtime(full_path)
+            if now - mtime > max_age { continue }
+
+            append(new_files, full_path)
+        }
+
+        return new_files
+    }
+
+    fn scan_sftp(self) -> List[string] {
+        let cfg = self._config
+        if cfg.sftp_host == "" { return [] }
+
+        let downloaded: List[string] = []
+        try {
+            let paramiko = __import__("paramiko")
+            let client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            if cfg.sftp_key_path != "" {
+                client.connect(cfg.sftp_host, port=cfg.sftp_port,
+                              username=cfg.sftp_user, key_filename=cfg.sftp_key_path)
+            } else {
+                client.connect(cfg.sftp_host, port=cfg.sftp_port,
+                              username=cfg.sftp_user)
+            }
+
+            let sftp = client.open_sftp()
+            let remote_files = sftp.listdir(cfg.sftp_remote_dir)
+
+            for rf in remote_files {
+                let matches = false
+                for pat in cfg.file_patterns {
+                    if rf.lower().endswith(pat) { matches = true }
+                }
+                if !matches { continue }
+
+                let remote_path = cfg.sftp_remote_dir + "/" + rf
+                let local_path = os.path.join(cfg.watch_dir, "sftp_" + rf)
+
+                if self._config.deduplicate and local_path in self._processed { continue }
+
+                sftp.get(remote_path, local_path)
+                append(downloaded, local_path)
+            }
+
+            sftp.close()
+            client.close()
+        } catch {
+            // SFTP errors are non-fatal; log and continue
+        }
+
+        return downloaded
+    }
+
+    fn scan_s3(self) -> List[string] {
+        let cfg = self._config
+        if cfg.s3_bucket == "" { return [] }
+
+        let downloaded: List[string] = []
+        try {
+            let boto3 = __import__("boto3")
+            let s3 = boto3.client("s3")
+            let response = s3.list_objects_v2(Bucket=cfg.s3_bucket, Prefix=cfg.s3_prefix)
+
+            let contents = response.get("Contents", [])
+            for obj in contents {
+                let key = obj["Key"]
+                let filename = key.split("/")[-1]
+
+                let matches = false
+                for pat in cfg.file_patterns {
+                    if filename.lower().endswith(pat) { matches = true }
+                }
+                if !matches { continue }
+
+                let local_path = os.path.join(cfg.watch_dir, "s3_" + filename)
+                if self._config.deduplicate and local_path in self._processed { continue }
+
+                s3.download_file(cfg.s3_bucket, key, local_path)
+                append(downloaded, local_path)
+            }
+        } catch {
+            // S3 errors non-fatal
+        }
+
+        return downloaded
+    }
+
+    fn scan_gcs(self) -> List[string] {
+        let cfg = self._config
+        if cfg.gcs_bucket == "" { return [] }
+
+        let downloaded: List[string] = []
+        try {
+            let gcs_mod = __import__("google.cloud.storage")
+            let client = gcs_mod.cloud.storage.Client()
+            let bucket = client.bucket(cfg.gcs_bucket)
+            let blobs = bucket.list_blobs(prefix=cfg.gcs_prefix)
+
+            for blob in blobs {
+                let filename = blob.name.split("/")[-1]
+
+                let matches = false
+                for pat in cfg.file_patterns {
+                    if filename.lower().endswith(pat) { matches = true }
+                }
+                if !matches { continue }
+
+                let local_path = os.path.join(cfg.watch_dir, "gcs_" + filename)
+                if self._config.deduplicate and local_path in self._processed { continue }
+
+                blob.download_to_filename(local_path)
+                append(downloaded, local_path)
+            }
+        } catch {
+            // GCS errors non-fatal
+        }
+
+        return downloaded
+    }
+
+    fn mark_processed(self, path: string) {
+        self._processed[path] = time.time()
+    }
+
+    fn get_processed_count(self) -> int {
+        return len(self._processed)
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  ARCHIVER
+// ═══════════════════════════════════════════════════════════════════
+
+class Archiver {
+
+    fn init(self, archive_dir: string) {
+        self._archive_dir = archive_dir
+        os.makedirs(archive_dir, exist_ok=true)
+    }
+
+    fn archive_source(self, source_path: string) -> string {
+        let filename = os.path.basename(source_path)
+        let ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        let dest = os.path.join(self._archive_dir, ts + "_" + filename)
+
+        let shutil = __import__("shutil")
+        shutil.move(source_path, dest)
+        return dest
+    }
+
+    fn save_run_record(self, run: RunRecord) {
+        let log_path = os.path.join(self._archive_dir, "run_log.jsonl")
+        let record = {
+            "run_id": run.run_id,
+            "timestamp": run.timestamp,
+            "source_file": run.source_file,
+            "source_type": run.source_type,
+            "records_parsed": run.records_parsed,
+            "towers_found": run.towers_found,
+            "primary_fault": run.primary_fault,
+            "confidence": run.confidence,
+            "severity": run.severity,
+            "trust_level": run.trust_level,
+            "elapsed_ms": run.elapsed_ms,
+            "export_paths": run.export_paths,
+            "notifications_sent": run.notifications_sent,
+            "status": run.status,
+            "error": run.error
+        }
+        let f = open(log_path, "a", encoding="utf-8")
+        f.write(json.dumps(record) + "\n")
+        f.close()
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SEVERITY GATE
+// ═══════════════════════════════════════════════════════════════════
+
+fn _severity_rank(sev: string) -> int {
+    if sev == "CRITICAL" { return 0 }
+    if sev == "MAJOR" { return 1 }
+    if sev == "MINOR" { return 2 }
+    if sev == "WARNING" { return 3 }
+    return 4
+}
+
+fn should_notify(report: AnalysisReport, threshold: string) -> bool {
+    let report_sev = report.primary_fault.fault_severity
+    return _severity_rank(report_sev) <= _severity_rank(threshold)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN AUTOMATION ENGINE
+// ═══════════════════════════════════════════════════════════════════
+
+class TelecomAutomation {
+
+    fn init(self, config: AutomationConfig) {
+        self._config = config
+        self._isolator = TelecomFaultIsolator()
+        self._exporter = ReportExporter()
+        self._notifier = NotificationDispatcher()
+        self._file_engine = get_file_engine()
+        self._file_engine.set_parser_factory(create_default_factory())
+        self._sources = FileSourceManager(config)
+        self._archiver = Archiver(config.archive_dir)
+        self._state = WatchState {
+            processed_files: {},
+            last_poll: 0.0,
+            total_runs: 0,
+            total_faults_found: 0,
+            uptime_start: time.time()
+        }
+        self._running = false
+        self._thread = None
+
+        os.makedirs(config.watch_dir, exist_ok=true)
+        os.makedirs(config.output_dir, exist_ok=true)
+    }
+
+    /// Process a single file: analyze, export, notify, archive.
+    fn process_file(self, file_path: string, source_type: string) -> RunRecord {
+        let run_id = hashlib.sha256((file_path + str(time.time())).encode("utf-8")).hexdigest()[0:16]
+        let run_start = time.time()
+
+        let run = RunRecord {
+            run_id: run_id,
+            timestamp: run_start,
+            source_file: file_path,
+            source_type: source_type,
+            records_parsed: 0,
+            towers_found: 0,
+            primary_fault: "",
+            confidence: 0.0,
+            severity: "INFO",
+            trust_level: "RAW",
+            elapsed_ms: 0.0,
+            export_paths: {},
+            notifications_sent: [],
+            status: "running",
+            error: ""
+        }
+
+        try {
+            // Universal file ingestion — handles any format, builds
+            // new parsers on the fly if needed
+            let ingestion = self._file_engine.ingest(file_path)
+
+            if !ingestion.success or len(ingestion.data_text.strip()) == 0 {
+                run.status = "skipped"
+                let warn_str = ""
+                if len(ingestion.warnings) > 0 { warn_str = " | " + join(ingestion.warnings, "; ") }
+                run.error = "Ingestion failed or empty: " + ingestion.format_detected + warn_str
+                if ingestion.handler_was_generated {
+                    run.error = run.error + " [handler was auto-generated]"
+                }
+                self._archiver.save_run_record(run)
+                return run
+            }
+
+            let raw_data = ingestion.data_text
+            let format_hint = ingestion.data_format
+
+            // Analyze the converted data
+            let report = self._isolator.analyze(raw_data, format_hint)
+
+            if report.total_records < self._config.min_records {
+                run.status = "skipped"
+                run.error = "Too few records: " + str(report.total_records) + " < " + str(self._config.min_records)
+                self._archiver.save_run_record(run)
+                return run
+            }
+
+            run.records_parsed = report.total_records
+            run.towers_found = report.total_towers
+            run.primary_fault = report.primary_fault.tower_id
+            run.confidence = report.primary_fault.confidence
+            run.severity = report.primary_fault.fault_severity
+            run.trust_level = report.trust_level
+            run.elapsed_ms = report.elapsed_ms
+
+            // ── Cognitive enrichment: route through NRS lobes ────────
+            try {
+                let cognitive = self._cognitive_enrich(report, run_id)
+                if cognitive != nil {
+                    run.trust_level = cognitive.get("trust_level", run.trust_level)
+                    if cognitive.get("causal_explanation", nil) != nil {
+                        report.cognitive_analysis = cognitive
+                    }
+                }
+            } catch as ce {
+                _tc_log.warning("Cognitive enrichment failed for run %s: %s", run_id, str(ce))
+            }
+
+            // Export
+            let base_name = "fault_report_" + run_id
+            let paths = self._exporter.export_all(report, self._config.output_dir, base_name)
+            run.export_paths = paths
+
+            // Notify (if severity meets threshold)
+            if should_notify(report, self._config.severity_threshold) {
+                let sent = self._notifier.dispatch(report, run, self._config.notify_channels, paths)
+                run.notifications_sent = sent
+            }
+
+            // Archive source file
+            self._archiver.archive_source(file_path)
+            self._sources.mark_processed(file_path)
+
+            run.status = "success"
+            self._state.total_runs += 1
+            self._state.total_faults_found += 1
+            self._state.processed_files[file_path] = time.time()
+
+        } catch as e {
+            run.status = "failure"
+            run.error = str(e)
+        }
+
+        run.elapsed_ms = (time.time() - run_start) * 1000.0
+        self._archiver.save_run_record(run)
+        return run
+    }
+
+    fn _cognitive_enrich(self, report: AnalysisReport, run_id: string) -> Dict[string, Any] {
+        /// Routes telecom fault analysis through the NRS cognitive pipeline.
+        /// Causal lobe: root-cause chain analysis.
+        /// Logical lobe: consistency check on fault indicators.
+        /// Memory lobe: store findings for future correlation.
+        /// VLT seeder: ingest discovered facts for knowledge growth.
+
+        let result = {}
+        let fault = report.primary_fault
+        let fault_desc = "Tower " + fault.tower_id + " fault: " + fault.fault_type
+        if hasattr(fault, "fault_reason") {
+            fault_desc = fault_desc + " because " + fault.fault_reason
+        }
+
+        // 1. Causal analysis: why did this fault occur?
+        let cr = get_causal_reasoner()
+        cr.ingest(fault_desc, "telecom_automation:" + run_id)
+
+        let causal_result = cr.query("Why did " + fault.tower_id + " fail?")
+        result["causal_explanation"] = causal_result.explanation
+        result["causal_confidence"] = causal_result.confidence
+        result["causal_chains"] = len(causal_result.chains)
+
+        // 2. Logical consistency: are the fault indicators consistent?
+        let le = get_logic_engine()
+        let facts_to_check = []
+        append(facts_to_check, fault.tower_id + " has fault type " + fault.fault_type)
+        append(facts_to_check, fault.tower_id + " severity is " + fault.fault_severity)
+        if hasattr(fault, "kpis") and fault.kpis != nil {
+            for kpi_name in fault.kpis {
+                append(facts_to_check, fault.tower_id + " " + kpi_name + " is " + str(fault.kpis[kpi_name]))
+            }
+        }
+        for f in facts_to_check {
+            le.ingest_text(f, "telecom_fault:" + run_id)
+        }
+        let logic_result = le.query("Is " + fault.tower_id + " fault consistent?")
+        result["logic_consistent"] = logic_result.answered
+        result["logic_confidence"] = logic_result.confidence
+
+        // 3. Memory: store this fault for future pattern correlation
+        let wm = get_working_memory()
+        let mem_content = json.dumps({
+            "run_id": run_id,
+            "tower": fault.tower_id,
+            "fault_type": fault.fault_type,
+            "severity": fault.fault_severity,
+            "confidence": fault.confidence,
+            "timestamp": time.time()
+        })
+        wm.attend({
+            "item_id": "fault_" + run_id,
+            "content": mem_content,
+            "salience": fault.confidence,
+            "item_type": "telecom_fault",
+            "source": "telecom_automation",
+            "timestamp": time.time()
+        })
+
+        // 4. Seed discovered facts into VLT for knowledge growth
+        let seeder = get_seeder()
+        seeder.seed_single(
+            fault_desc,
+            "telecom",
+            "telecom_automation:" + run_id,
+            "t4_observed",
+            fault.confidence,
+            ["fault", "tower", fault.fault_type, fault.fault_severity]
+        )
+
+        // Determine trust level based on cognitive validation
+        let conf_floor = get_confidence_floor("telecom")
+        if causal_result.confidence >= conf_floor and logic_result.confidence >= 0.5 {
+            result["trust_level"] = "VALIDATED"
+        } else if causal_result.confidence >= 0.5 {
+            result["trust_level"] = "REASONED"
+        } else {
+            result["trust_level"] = report.trust_level
+        }
+
+        _tc_log.info("Cognitive enrichment for run %s: causal=%.2f logic=%.2f trust=%s",
+                      run_id, causal_result.confidence, logic_result.confidence,
+                      result["trust_level"])
+        return result
+    }
+
+    /// Run one poll cycle: scan all sources, process new files.
+    fn poll_once(self) -> List[RunRecord] {
+        let results: List[RunRecord] = []
+
+        // Local file drop
+        let local_files = self._sources.scan_local()
+        for fp in local_files {
+            let run = self.process_file(fp, "file_drop")
+            append(results, run)
+        }
+
+        // SFTP
+        let sftp_files = self._sources.scan_sftp()
+        for fp in sftp_files {
+            let run = self.process_file(fp, "sftp")
+            append(results, run)
+        }
+
+        // S3
+        let s3_files = self._sources.scan_s3()
+        for fp in s3_files {
+            let run = self.process_file(fp, "s3")
+            append(results, run)
+        }
+
+        // GCS
+        let gcs_files = self._sources.scan_gcs()
+        for fp in gcs_files {
+            let run = self.process_file(fp, "gcs")
+            append(results, run)
+        }
+
+        self._state.last_poll = time.time()
+        return results
+    }
+
+    /// Start the continuous watch loop in a background thread.
+    fn start(self) {
+        if self._running { return }
+        self._running = true
+        self._thread = threading.Thread(target=self._watch_loop, daemon=true)
+        self._thread.start()
+    }
+
+    /// Stop the watch loop.
+    fn stop(self) {
+        self._running = false
+        if self._thread != None {
+            self._thread.join(timeout=5.0)
+        }
+    }
+
+    fn _watch_loop(self) {
+        while self._running {
+            self.poll_once()
+            time.sleep(float(self._config.poll_interval_sec))
+        }
+    }
+
+    /// Process data pushed via HTTP (from edge-gateway route).
+    fn process_push(self, raw_data: string, filename: string, format_hint: string) -> RunRecord {
+        let temp_path = os.path.join(self._config.watch_dir, "push_" + filename)
+        let f = open(temp_path, "w", encoding="utf-8")
+        f.write(raw_data)
+        f.close()
+        return self.process_file(temp_path, "http_push")
+    }
+
+    /// Get current automation status.
+    fn status(self) -> Dict[string, Any] {
+        let uptime = time.time() - self._state.uptime_start
+        return {
+            "running": self._running,
+            "uptime_seconds": uptime,
+            "total_runs": self._state.total_runs,
+            "total_faults_found": self._state.total_faults_found,
+            "files_processed": self._sources.get_processed_count(),
+            "last_poll": self._state.last_poll,
+            "poll_interval_sec": self._config.poll_interval_sec,
+            "watch_dir": self._config.watch_dir,
+            "output_dir": self._config.output_dir,
+            "notify_channels": len(self._config.notify_channels),
+            "sftp_configured": self._config.sftp_host != "",
+            "s3_configured": self._config.s3_bucket != "",
+            "gcs_configured": self._config.gcs_bucket != "",
+            "supported_formats": len(self._file_engine.supported_extensions()),
+            "generated_handlers": self._file_engine._registry.generated_count(),
+            "engine": "NRSFileEngine+ParserFactory"
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONVENIENCE: ONE-SHOT AND CONTINUOUS MODES
+// ═══════════════════════════════════════════════════════════════════
+
+/// One-shot: analyze a single file and export reports.
+fn analyze_file(file_path: string, output_dir: string) -> RunRecord {
+    let cfg = default_config()
+    cfg.watch_dir = os.path.dirname(file_path)
+    cfg.output_dir = output_dir
+    cfg.archive_dir = os.path.join(output_dir, "archive")
+    let engine = TelecomAutomation(cfg)
+    return engine.process_file(file_path, "manual")
+}
+
+/// Start continuous watch with env-based config.
+fn start_watcher() -> TelecomAutomation {
+    let cfg = config_from_env()
+    let engine = TelecomAutomation(cfg)
+    engine.start()
+    return engine
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  NORMS
+// ═══════════════════════════════════════════════════════════════════
+
+norm require_source_for_analysis {
+    type: prohibition,
+    scope: global,
+    action: "process_file",
+    priority: 95,
+    condition: file_path == "" or file_path == None
+}
+
+norm archive_all_processed_data {
+    type: obligation,
+    scope: global,
+    action: "process_file",
+    priority: 85,
+    condition: true
+}
+
+norm notify_on_critical_faults {
+    type: obligation,
+    scope: global,
+    action: "notify",
+    priority: 90,
+    condition: severity == "CRITICAL" or severity == "MAJOR"
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  EXPORTS
+// ═══════════════════════════════════════════════════════════════════
+
+export AutomationConfig, RunRecord, WatchState
+export DataSourceType, NotifyChannel, RunStatus
+export TelecomAutomation, NotificationDispatcher, FileSourceManager, Archiver
+export default_config, config_from_env, analyze_file, start_watcher, should_notify

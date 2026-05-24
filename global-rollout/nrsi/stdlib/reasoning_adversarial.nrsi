@@ -1,0 +1,683 @@
+/// NRSI — Adversarial Self-Testing.
+///
+/// The system challenges its own conclusions before presenting them:
+/// counterarguments, logical consistency checks, quality ratings,
+/// steel-man opposing views, and weakest-link identification.
+/// All transformer-free.
+
+module reasoning_adversarial
+
+from "reasoning_graph" import CausalGraph, GraphEdge, RelationType
+from "reasoning_inference" import InferenceEngine, InferenceResult
+
+/// ---------- Types ----------
+
+type Counterargument {
+    target_claim: string,
+    challenge: string,
+    challenge_type: string,
+    strength: float,
+    evidence: List[string]
+}
+
+type LogicalConsistencyCheck {
+    chain: List[string],
+    is_valid: bool,
+    issues: List[string],
+    weakest_link: string,
+    weakest_confidence: float
+}
+
+type AnswerQualityRating {
+    grounding_score: float,
+    completeness_score: float,
+    consistency_score: float,
+    confidence_calibration: float,
+    overall_score: float,
+    strengths: List[string],
+    weaknesses: List[string],
+    improvement_suggestions: List[string]
+}
+
+fn quality_grade(r: AnswerQualityRating) -> string {
+    if r.overall_score >= 0.8 {
+        return "A"
+    }
+    if r.overall_score >= 0.6 {
+        return "B"
+    }
+    if r.overall_score >= 0.4 {
+        return "C"
+    }
+    if r.overall_score >= 0.2 {
+        return "D"
+    }
+    return "F"
+}
+
+type SelfTestResult {
+    counterarguments: List[Counterargument],
+    consistency_checks: List[LogicalConsistencyCheck],
+    quality_rating: Optional[AnswerQualityRating],
+    steel_man: string,
+    should_present: bool,
+    confidence_after_challenge: float,
+    reasoning_trace: List[string]
+}
+
+/// ---------- Counterargument Generator ----------
+
+class CounterargumentGenerator {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn challenge(self, subject: string, relation: string, obj: string) -> List[any] {
+        let subject_norm = subject.lower().strip()
+        let obj_norm = obj.lower().strip()
+        let counters: List[Counterargument] = []
+
+        let rel: Optional[RelationType] = None
+        try {
+            rel = RelationType(relation)
+        } catch e {
+            return counters
+        }
+
+        let c1 = self._find_contradicting_edges(subject_norm, rel, obj_norm)
+        for c in c1 {
+            counters.append(c)
+        }
+        let c2 = self._find_alternative_explanations(subject_norm, rel, obj_norm)
+        for c in c2 {
+            counters.append(c)
+        }
+        let c3 = self._check_missing_evidence(subject_norm, rel, obj_norm)
+        for c in c3 {
+            counters.append(c)
+        }
+        let c4 = self._find_exceptions(subject_norm, rel, obj_norm)
+        for c in c4 {
+            counters.append(c)
+        }
+
+        let sorted_counters: List[Counterargument] = []
+        let remaining = list(counters)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            let best_str = remaining[0].strength
+            for i in range(1, len(remaining)) {
+                if remaining[i].strength > best_str {
+                    best_str = remaining[i].strength
+                    best_idx = i
+                }
+            }
+            sorted_counters.append(remaining.pop(best_idx))
+        }
+        return sorted_counters
+    }
+
+    fn _find_contradicting_edges(self, subject: string, relation: RelationType,
+                                  obj: string) -> List[any] {
+        let counters: List[Counterargument] = []
+
+        let opposite_map: Dict[RelationType, RelationType] = {
+            RelationType.CAUSES: RelationType.PREVENTS,
+            RelationType.PREVENTS: RelationType.CAUSES,
+            RelationType.ENABLES: RelationType.INHIBITS,
+            RelationType.INHIBITS: RelationType.ENABLES
+        }
+
+        if relation in opposite_map {
+            let opposite = opposite_map[relation]
+            let edge = self._graph.get_edge(subject, opposite, obj)
+            if edge != None {
+                counters.append(Counterargument {
+                    target_claim: subject + " " + relation.value + " " + obj,
+                    challenge: "But the graph also shows " + subject + " " + opposite.value + " " + obj + " with confidence " + str(round(edge.confidence, 2)),
+                    challenge_type: "direct_contradiction",
+                    strength: edge.confidence,
+                    evidence: [edge.edge_id]
+                })
+            }
+        }
+
+        for e in self._graph.outgoing(subject) {
+            if e.target == obj and e.relation != relation {
+                let is_contra = false
+                if e.relation == RelationType.PREVENTS and relation == RelationType.CAUSES {
+                    is_contra = true
+                }
+                if e.relation == RelationType.CAUSES and relation == RelationType.PREVENTS {
+                    is_contra = true
+                }
+                if is_contra {
+                    counters.append(Counterargument {
+                        target_claim: subject + " " + relation.value + " " + obj,
+                        challenge: "Alternative relation: " + subject + " " + e.relation.value + " " + obj,
+                        challenge_type: "alternative_relation",
+                        strength: e.confidence * 0.7,
+                        evidence: []
+                    })
+                }
+            }
+        }
+        return counters
+    }
+
+    fn _find_alternative_explanations(self, subject: string, relation: RelationType,
+                                       obj: string) -> List[any] {
+        let counters: List[Counterargument] = []
+
+        if relation == RelationType.CAUSES or relation == RelationType.PRODUCES {
+            let other_causes: List[GraphEdge] = []
+            for e in self._graph.incoming(obj, relation) {
+                if e.source != subject {
+                    other_causes.append(e)
+                }
+            }
+            if len(other_causes) > 0 {
+                let alts: List[string] = []
+                for i in range(min(3, len(other_causes))) {
+                    alts.append(other_causes[i].source)
+                }
+                let max_conf = other_causes[0].confidence
+                for e in other_causes {
+                    if e.confidence > max_conf {
+                        max_conf = e.confidence
+                    }
+                }
+                let ev_ids: List[string] = []
+                for i in range(min(3, len(other_causes))) {
+                    ev_ids.append(other_causes[i].edge_id)
+                }
+                counters.append(Counterargument {
+                    target_claim: subject + " " + relation.value + " " + obj,
+                    challenge: "Alternative causes of " + obj + ": " + ", ".join(alts) + ". The claim may overstate " + subject + "'s role.",
+                    challenge_type: "alternative_explanation",
+                    strength: max_conf * 0.6,
+                    evidence: ev_ids
+                })
+            }
+        }
+        return counters
+    }
+
+    fn _check_missing_evidence(self, subject: string, relation: RelationType,
+                                obj: string) -> List[any] {
+        let counters: List[Counterargument] = []
+        let edge = self._graph.get_edge(subject, relation, obj)
+
+        if edge != None {
+            if edge.confidence < 0.5 {
+                counters.append(Counterargument {
+                    target_claim: subject + " " + relation.value + " " + obj,
+                    challenge: "Confidence is only " + str(round(edge.confidence, 2)) + ". This claim needs stronger evidence.",
+                    challenge_type: "weak_evidence",
+                    strength: 1.0 - edge.confidence,
+                    evidence: []
+                })
+            }
+            if edge.evidence == "" or edge.evidence == None {
+                counters.append(Counterargument {
+                    target_claim: subject + " " + relation.value + " " + obj,
+                    challenge: "No supporting evidence is recorded for this claim.",
+                    challenge_type: "no_evidence",
+                    strength: 0.5,
+                    evidence: []
+                })
+            }
+        }
+        return counters
+    }
+
+    fn _find_exceptions(self, subject: string, relation: RelationType,
+                         obj: string) -> List[any] {
+        let counters: List[Counterargument] = []
+        let inhibitors = self._graph.incoming(obj, RelationType.PREVENTS)
+        for e in inhibitors {
+            if e.source != subject {
+                counters.append(Counterargument {
+                    target_claim: subject + " " + relation.value + " " + obj,
+                    challenge: "Note: " + e.source + " can prevent " + obj + ", which may limit this effect.",
+                    challenge_type: "exception",
+                    strength: e.confidence * 0.4,
+                    evidence: []
+                })
+            }
+        }
+        return counters
+    }
+}
+
+/// ---------- Logical Consistency Checker ----------
+
+class LogicalConsistencyChecker {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn check_chain(self, chain: List[string]) -> LogicalConsistencyCheck {
+        if len(chain) < 2 {
+            return LogicalConsistencyCheck { chain: chain, is_valid: true, issues: [], weakest_link: "", weakest_confidence: 0.0 }
+        }
+
+        let issues: List[string] = []
+        let weakest_conf = 1.0
+        let weakest_link = ""
+
+        for i in range(len(chain) - 1) {
+            let src = chain[i].lower().strip()
+            let tgt = chain[i + 1].lower().strip()
+
+            let edges: List[GraphEdge] = []
+            for e in self._graph.outgoing(src) {
+                if e.target == tgt {
+                    edges.append(e)
+                }
+            }
+            if len(edges) == 0 {
+                issues.append("No direct relation from '" + src + "' to '" + tgt + "'")
+                continue
+            }
+
+            let best = edges[0]
+            for e in edges {
+                if e.confidence > best.confidence {
+                    best = e
+                }
+            }
+            if best.confidence < weakest_conf {
+                weakest_conf = best.confidence
+                weakest_link = src + " → " + tgt + " (" + str(round(best.confidence, 2)) + ")"
+            }
+            if best.confidence < 0.2 {
+                issues.append("Very weak link: " + src + " → " + tgt + " (conf " + str(round(best.confidence, 2)) + ")")
+            }
+        }
+
+        for i in range(len(chain)) {
+            for j in range(i + 1, len(chain)) {
+                let a = chain[i].lower().strip()
+                let b = chain[j].lower().strip()
+                let contradicting = self._graph.get_edge(a, RelationType.CONTRADICTS, b)
+                if contradicting != None {
+                    issues.append("Contradiction: '" + a + "' contradicts '" + b + "'")
+                }
+            }
+        }
+
+        return LogicalConsistencyCheck {
+            chain: chain,
+            is_valid: len(issues) == 0,
+            issues: issues,
+            weakest_link: weakest_link,
+            weakest_confidence: weakest_conf
+        }
+    }
+}
+
+/// ---------- Answer Quality Rater ----------
+
+class AnswerQualityRater {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn rate(self, claims: List[Tuple[string, string, string]],
+            inferences: Optional[List[InferenceResult]],
+            knowledge_gaps: Optional[List[string]]) -> AnswerQualityRating {
+        let infs: List[InferenceResult] = []
+        if inferences != None {
+            infs = inferences
+        }
+        let gaps: List[string] = []
+        if knowledge_gaps != None {
+            gaps = knowledge_gaps
+        }
+
+        let grounding = self._rate_grounding(claims)
+        let completeness = self._rate_completeness(claims, gaps)
+        let consistency = self._rate_consistency(claims)
+        let calibration = self._rate_calibration(claims, infs)
+
+        let overall = grounding * 0.35 + completeness * 0.25 + consistency * 0.25 + calibration * 0.15
+
+        let strengths: List[string] = []
+        let weaknesses: List[string] = []
+        let suggestions: List[string] = []
+
+        if grounding >= 0.7 {
+            strengths.append("Claims are well-grounded in the knowledge graph")
+        } else {
+            weaknesses.append("Some claims lack strong graph support")
+            suggestions.append("Seek additional evidence for unsupported claims")
+        }
+        if completeness >= 0.7 {
+            strengths.append("Good coverage of the topic")
+        } else {
+            let gap_str = "unknown"
+            if len(gaps) > 0 {
+                let items: List[string] = []
+                for i in range(min(3, len(gaps))) {
+                    items.append(gaps[i])
+                }
+                gap_str = ", ".join(items)
+            }
+            weaknesses.append("Knowledge gaps: " + gap_str)
+            suggestions.append("Acknowledge areas of incomplete knowledge")
+        }
+        if consistency >= 0.9 {
+            strengths.append("Logically consistent")
+        } else if consistency < 0.5 {
+            weaknesses.append("Potential logical inconsistencies detected")
+            suggestions.append("Review reasoning chain for contradictions")
+        }
+        if calibration >= 0.6 {
+            strengths.append("Confidence levels are well-calibrated")
+        } else {
+            weaknesses.append("Confidence may be over/under-stated")
+        }
+
+        return AnswerQualityRating {
+            grounding_score: grounding,
+            completeness_score: completeness,
+            consistency_score: consistency,
+            confidence_calibration: calibration,
+            overall_score: overall,
+            strengths: strengths,
+            weaknesses: weaknesses,
+            improvement_suggestions: suggestions
+        }
+    }
+
+    fn _rate_grounding(self, claims: List[Tuple[string, string, string]]) -> float {
+        if len(claims) == 0 {
+            return 0.0
+        }
+        let grounded = 0
+        for claim in claims {
+            let subj = claim[0]
+            let rel = claim[1]
+            let obj = claim[2]
+            try {
+                let r = RelationType(rel)
+                if self._graph.get_edge(subj, r, obj) != None {
+                    grounded += 1
+                }
+            } catch e {
+                if self._graph.has_edge(subj, obj) {
+                    grounded += 1
+                }
+            }
+        }
+        return grounded / len(claims)
+    }
+
+    fn _rate_completeness(self, claims: List[Tuple[string, string, string]],
+                           gaps: List[string]) -> float {
+        if len(claims) == 0 {
+            return 0.0
+        }
+        let gap_penalty = len(gaps) * 0.15
+        let result = 1.0 - gap_penalty
+        if result < 0.0 {
+            result = 0.0
+        }
+        return result
+    }
+
+    fn _rate_consistency(self, claims: List[Tuple[string, string, string]]) -> float {
+        let subjects: Set[string] = set()
+        for claim in claims {
+            subjects.add(claim[0])
+            subjects.add(claim[2])
+        }
+
+        let contradictions = 0
+        let subject_list: List[string] = []
+        for s in subjects {
+            subject_list.append(s)
+        }
+        for i in range(len(subject_list)) {
+            for j in range(i + 1, len(subject_list)) {
+                if self._graph.get_edge(subject_list[i], RelationType.CONTRADICTS, subject_list[j]) != None {
+                    contradictions += 1
+                }
+            }
+        }
+
+        if contradictions == 0 {
+            return 1.0
+        }
+        let result = 1.0 - contradictions * 0.3
+        if result < 0.0 {
+            result = 0.0
+        }
+        return result
+    }
+
+    fn _rate_calibration(self, claims: List[Tuple[string, string, string]],
+                          inferences: List[InferenceResult]) -> float {
+        if len(inferences) == 0 {
+            return 0.5
+        }
+        let confs: List[float] = []
+        for inf in inferences {
+            confs.append(inf.confidence)
+        }
+        let avg = 0.0
+        for c in confs {
+            avg += c
+        }
+        avg = avg / len(confs)
+        let max_c = confs[0]
+        let min_c = confs[0]
+        for c in confs {
+            if c > max_c {
+                max_c = c
+            }
+            if c < min_c {
+                min_c = c
+            }
+        }
+        let spread = max_c - min_c
+
+        if avg > 0.3 and spread < 0.5 {
+            return 0.8
+        }
+        if avg > 0.2 {
+            return 0.6
+        }
+        return 0.4
+    }
+}
+
+/// ---------- Steel-Man Generator ----------
+
+class SteelManGenerator {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn steel_man(self, subject: string, relation: string, obj: string) -> string {
+        let subject_norm = subject.lower().strip()
+        let obj_norm = obj.lower().strip()
+
+        let rel: Optional[RelationType] = None
+        try {
+            rel = RelationType(relation)
+        } catch e {
+            return ""
+        }
+
+        let opposite_map: Dict[RelationType, string] = {
+            RelationType.CAUSES: "does not cause",
+            RelationType.PREVENTS: "does not prevent",
+            RelationType.ENABLES: "does not enable",
+            RelationType.INHIBITS: "does not inhibit"
+        }
+
+        let neg = "does not " + relation
+        if rel in opposite_map {
+            neg = opposite_map[rel]
+        }
+
+        let parts: List[string] = []
+        parts.append("The strongest case that " + subject_norm + " " + neg + " " + obj_norm + ":")
+
+        let alt_causes: List[GraphEdge] = []
+        for e in self._graph.incoming(obj_norm) {
+            if e.source != subject_norm and e.confidence >= 0.5 {
+                alt_causes.append(e)
+            }
+        }
+        if len(alt_causes) > 0 {
+            let sorted_alts: List[GraphEdge] = []
+            let remaining = list(alt_causes)
+            while len(remaining) > 0 {
+                let best_idx = 0
+                for i in range(1, len(remaining)) {
+                    if remaining[i].confidence > remaining[best_idx].confidence {
+                        best_idx = i
+                    }
+                }
+                sorted_alts.append(remaining.pop(best_idx))
+            }
+            let best_alt = sorted_alts[0]
+            parts.append("  - " + best_alt.source + " is a stronger " + best_alt.relation.value + " of " + obj_norm + " (confidence " + str(round(best_alt.confidence, 2)) + ")")
+        }
+
+        let preventers = self._graph.incoming(obj_norm, RelationType.PREVENTS)
+        let pcount = 0
+        for p in preventers {
+            if p.source != subject_norm and pcount < 2 {
+                parts.append("  - " + p.source + " can prevent " + obj_norm)
+                pcount += 1
+            }
+        }
+
+        let edge = self._graph.get_edge(subject_norm, rel, obj_norm)
+        if edge != None and edge.confidence < 0.7 {
+            parts.append("  - The evidence is only " + str(round(edge.confidence * 100, 0)) + "% confident, leaving room for doubt")
+        }
+
+        if len(parts) == 1 {
+            return "No strong opposing case could be constructed for '" + subject_norm + " " + neg + " " + obj_norm + "'."
+        }
+
+        return "\n".join(parts)
+    }
+}
+
+/// ---------- Adversarial Self-Tester (Unified) ----------
+
+class AdversarialSelfTester {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._counter = CounterargumentGenerator(graph)
+        self._consistency = LogicalConsistencyChecker(graph)
+        self._rater = AnswerQualityRater(graph)
+        self._steel = SteelManGenerator(graph)
+    }
+
+    fn test(self, claims: List[Tuple[string, string, string]],
+            chains: Optional[List[List[string]]],
+            inferences: Optional[List[InferenceResult]],
+            knowledge_gaps: Optional[List[string]]) -> SelfTestResult {
+
+        let result = SelfTestResult {
+            counterarguments: [],
+            consistency_checks: [],
+            quality_rating: None,
+            steel_man: "",
+            should_present: true,
+            confidence_after_challenge: 0.0,
+            reasoning_trace: []
+        }
+
+        for claim in claims {
+            let counters = self._counter.challenge(claim[0], claim[1], claim[2])
+            for c in counters {
+                result.counterarguments.append(c)
+            }
+        }
+
+        let chain_list: List[List[string]] = []
+        if chains != None {
+            chain_list = chains
+        }
+        for chain in chain_list {
+            let check = self._consistency.check_chain(chain)
+            result.consistency_checks.append(check)
+        }
+
+        result.quality_rating = self._rater.rate(claims, inferences, knowledge_gaps)
+
+        if len(claims) > 0 {
+            result.steel_man = self._steel.steel_man(claims[0][0], claims[0][1], claims[0][2])
+        }
+
+        let strong_counters: List[Counterargument] = []
+        for c in result.counterarguments {
+            if c.strength >= 0.6 {
+                strong_counters.append(c)
+            }
+        }
+        let consistency_ok = true
+        for c in result.consistency_checks {
+            if not c.is_valid {
+                consistency_ok = false
+                break
+            }
+        }
+        let quality_ok = result.quality_rating.overall_score >= 0.3
+
+        result.should_present = consistency_ok and quality_ok
+
+        if result.quality_rating != None {
+            let base_conf = result.quality_rating.grounding_score
+            let counter_penalty = 0.0
+            for c in strong_counters {
+                counter_penalty += c.strength * 0.1
+            }
+            result.confidence_after_challenge = base_conf - counter_penalty
+            if result.confidence_after_challenge < 0.0 {
+                result.confidence_after_challenge = 0.0
+            }
+        }
+
+        let valid_count = 0
+        for c in result.consistency_checks {
+            if c.is_valid {
+                valid_count += 1
+            }
+        }
+
+        result.reasoning_trace = [
+            "Counterarguments found: " + str(len(result.counterarguments)) + " (" + str(len(strong_counters)) + " strong)",
+            "Consistency checks: " + str(len(result.consistency_checks)) + " (" + str(valid_count) + " valid)",
+            "Quality grade: " + quality_grade(result.quality_rating),
+            "Should present: " + str(result.should_present),
+            "Post-challenge confidence: " + str(round(result.confidence_after_challenge, 2))
+        ]
+
+        return result
+    }
+}
+
+/// ---------- Gate ----------
+
+gate self_test_gate(data: raw[SelfTestResult]) -> validated[SelfTestResult] {
+    require confidence >= 0.3
+    validate consistency_check
+    validate quality_check
+}
+
+/// ---------- Exports ----------
+
+export Counterargument, LogicalConsistencyCheck, AnswerQualityRating, SelfTestResult
+export quality_grade
+export CounterargumentGenerator, LogicalConsistencyChecker, AnswerQualityRater
+export SteelManGenerator, AdversarialSelfTester
+export self_test_gate

@@ -1,0 +1,916 @@
+/// NRS Causal Reasoning Engine — Why, What-If, and Counterfactual Analysis.
+///
+/// Directed causal graph with strength propagation, forward/backward chaining,
+/// BFS path finding, counterfactual/intervention analysis, NL extraction.
+
+module causal_engine
+
+import re from "std/regex"
+import collections from "std/collections"
+
+let MAX_CHAINS = 120
+
+fn _normalize(name: string) -> string {
+    return re.sub("\\s+", " ", name.strip().lower())
+}
+
+/// ── Data structures ────────────────────────────────────────────────────
+
+type CausalNode {
+    name: string,
+    description: string,
+    confidence: float,
+    source: string
+}
+
+class CausalEdge {
+    fn new(cause: string, effect: string, strength: float, mechanism: string,
+           confidence: float, source: string, inhibitory: bool) -> CausalEdge {
+        let e = CausalEdge {}
+        e.cause = cause
+        e.effect = effect
+        e.strength = strength
+        e.mechanism = mechanism
+        e.confidence = confidence
+        e.source = source
+        e.inhibitory = inhibitory
+        return e
+    }
+
+    fn effective_strength(self) -> float {
+        if self.inhibitory { return -self.strength }
+        return self.strength
+    }
+}
+
+type CausalChain {
+    nodes: List[string],
+    edges: List[CausalEdge],
+    total_strength: float,
+    explanation: string
+}
+
+type CounterfactualResult {
+    intervention: string,
+    affected_nodes: List[string],
+    unaffected_nodes: List[string],
+    explanation: string,
+    confidence: float
+}
+
+type CausalResult {
+    query_type: string,
+    answered: bool,
+    explanation: string,
+    chains: List[CausalChain],
+    counterfactual: Optional[CounterfactualResult],
+    confidence: float
+}
+
+/// ── CausalGraph ────────────────────────────────────────────────────────
+
+class CausalGraph {
+    fn new() -> CausalGraph {
+        let g = CausalGraph {}
+        g._nodes = {}
+        g._forward = {}
+        g._backward = {}
+        return g
+    }
+
+    fn add_node(self, name: string, description: string, confidence: float, source: string) -> CausalNode {
+        let key = _normalize(name)
+        if key not in self._nodes {
+            self._nodes[key] = CausalNode { name: key, description: description, confidence: confidence, source: source }
+        }
+        return self._nodes[key]
+    }
+
+    fn add_edge(self, cause: string, effect: string, strength: float, mechanism: string,
+                confidence: float, source: string, inhibitory: bool) -> CausalEdge {
+        let c = _normalize(cause)
+        let e = _normalize(effect)
+        if c == e {
+            return CausalEdge.new(c, e, 0.0, mechanism, 0.0, source, inhibitory)
+        }
+        self.add_node(c, "", 1.0, "")
+        self.add_node(e, "", 1.0, "")
+        let clamped = abs(strength)
+        if clamped < 0.0 { clamped = 0.0 }
+        if clamped > 1.0 { clamped = 1.0 }
+        let edge = CausalEdge.new(c, e, clamped, mechanism, confidence, source, inhibitory)
+        if c not in self._forward { self._forward[c] = [] }
+        self._forward[c].append(edge)
+        if e not in self._backward { self._backward[e] = [] }
+        self._backward[e].append(edge)
+        return edge
+    }
+
+    fn has_node(self, name: string) -> bool {
+        return _normalize(name) in self._nodes
+    }
+
+    fn get_node(self, name: string) -> Optional[CausalNode] {
+        return self._nodes.get(_normalize(name), None)
+    }
+
+    fn roots(self) -> List[any] {
+        let result: List[string] = []
+        for n in self._nodes.keys() {
+            if self._backward.get(n, []).len() == 0 {
+                result.append(n)
+            }
+        }
+        return result
+    }
+
+    fn leaves(self) -> List[any] {
+        let result: List[string] = []
+        for n in self._nodes.keys() {
+            if self._forward.get(n, []).len() == 0 {
+                result.append(n)
+            }
+        }
+        return result
+    }
+
+    fn node_count(self) -> int { return self._nodes.len() }
+    fn edge_count(self) -> int {
+        let total = 0
+        for edges in self._forward.values() { total += edges.len() }
+        return total
+    }
+
+    fn forward_chain(self, start: string, max_depth: int) -> List[any] {
+        let start_k = _normalize(start)
+        if start_k not in self._nodes { return [] }
+        let chains: List[CausalChain] = []
+        self._dfs_forward(start_k, [start_k], [], 1.0, max_depth, Set.new(), chains)
+        chains.sort_by(fn(c) { return -abs(c.total_strength) })
+        return chains
+    }
+
+    fn _dfs_forward(self, current: string, path_nodes: List[string], path_edges: List[CausalEdge],
+                    cumulative: float, remaining: int, visited: Set[string], out: List[CausalChain]) -> void {
+        if out.len() >= MAX_CHAINS { return }
+        if remaining <= 0 || current in visited {
+            if path_nodes.len() > 1 {
+                out.append(_make_chain(path_nodes, path_edges, cumulative))
+            }
+            return
+        }
+        let visited_here = Set.copy(visited)
+        visited_here.add(current)
+        let edges = self._forward.get(current, [])
+        if edges.len() == 0 {
+            if path_nodes.len() > 1 {
+                out.append(_make_chain(path_nodes, path_edges, cumulative))
+            }
+            return
+        }
+        for edge in edges {
+            let nxt = edge.effect
+            let new_cum = cumulative * edge.effective_strength()
+            let new_nodes = List.copy(path_nodes)
+            new_nodes.append(nxt)
+            let new_edges = List.copy(path_edges)
+            new_edges.append(edge)
+            self._dfs_forward(nxt, new_nodes, new_edges, new_cum, remaining - 1, visited_here, out)
+        }
+    }
+
+    fn backward_chain(self, target: string, max_depth: int) -> List[any] {
+        let target_k = _normalize(target)
+        if target_k not in self._nodes { return [] }
+        let chains: List[CausalChain] = []
+        self._dfs_backward(target_k, [target_k], [], 1.0, max_depth, Set.new(), chains)
+        for c in chains {
+            c.nodes.reverse()
+            c.edges.reverse()
+        }
+        chains.sort_by(fn(c) { return -abs(c.total_strength) })
+        return chains
+    }
+
+    fn _dfs_backward(self, current: string, path_nodes: List[string], path_edges: List[CausalEdge],
+                     cumulative: float, remaining: int, visited: Set[string], out: List[CausalChain]) -> void {
+        if out.len() >= MAX_CHAINS { return }
+        if remaining <= 0 || current in visited {
+            if path_nodes.len() > 1 {
+                out.append(_make_chain(List.copy(path_nodes), List.copy(path_edges), cumulative))
+            }
+            return
+        }
+        let visited_here = Set.copy(visited)
+        visited_here.add(current)
+        let edges = self._backward.get(current, [])
+        if edges.len() == 0 {
+            if path_nodes.len() > 1 {
+                out.append(_make_chain(List.copy(path_nodes), List.copy(path_edges), cumulative))
+            }
+            return
+        }
+        for edge in edges {
+            let prev = edge.cause
+            let new_cum = cumulative * edge.effective_strength()
+            let new_nodes = List.copy(path_nodes)
+            new_nodes.append(prev)
+            let new_edges = List.copy(path_edges)
+            new_edges.append(edge)
+            self._dfs_backward(prev, new_nodes, new_edges, new_cum, remaining - 1, visited_here, out)
+        }
+    }
+
+    fn find_path(self, cause: string, effect: string) -> Optional[CausalChain] {
+        let cause_k = _normalize(cause)
+        let effect_k = _normalize(effect)
+        if cause_k not in self._nodes || effect_k not in self._nodes { return None }
+        if cause_k == effect_k { return _make_chain([cause_k], [], 1.0) }
+
+        let queue = collections.deque()
+        queue.append([cause_k, [cause_k], []])
+        let visited: Set[string] = Set.of(cause_k)
+
+        while queue.len() > 0 {
+            let item = queue.popleft()
+            let current = item[0]
+            let path_nodes = item[1]
+            let path_edges = item[2]
+            for edge in self._forward.get(current, []) {
+                let nxt = edge.effect
+                if nxt in visited { continue }
+                let new_nodes = List.copy(path_nodes)
+                new_nodes.append(nxt)
+                let new_edges = List.copy(path_edges)
+                new_edges.append(edge)
+                if nxt == effect_k {
+                    let strength = 1.0
+                    for e in new_edges {
+                        strength *= e.effective_strength()
+                    }
+                    return _make_chain(new_nodes, new_edges, strength)
+                }
+                visited.add(nxt)
+                queue.append([nxt, new_nodes, new_edges])
+            }
+        }
+        return None
+    }
+
+    fn all_causes(self, target: string, min_strength: float) -> List[any] {
+        let target_k = _normalize(target)
+        if target_k not in self._nodes { return [] }
+        let best: Dict[string, float] = {}
+        let queue = collections.deque()
+        queue.append([target_k, 1.0])
+        while queue.len() > 0 {
+            let item = queue.popleft()
+            let current = item[0]
+            let cum = item[1]
+            for edge in self._backward.get(current, []) {
+                let prev = edge.cause
+                let path_str = cum * abs(edge.effective_strength())
+                if prev not in best || path_str > best[prev] {
+                    best[prev] = path_str
+                    queue.append([prev, path_str])
+                }
+            }
+        }
+        let results: List[List[any]] = []
+        for n, s in best.items() {
+            if s >= min_strength {
+                results.append([n, round(s, 4)])
+            }
+        }
+        results.sort_by(fn(x) { return -x[1] })
+        return results
+    }
+
+    fn all_effects(self, source: string, min_strength: float) -> List[any] {
+        let source_k = _normalize(source)
+        if source_k not in self._nodes { return [] }
+        let best: Dict[string, float] = {}
+        let queue = collections.deque()
+        queue.append([source_k, 1.0])
+        while queue.len() > 0 {
+            let item = queue.popleft()
+            let current = item[0]
+            let cum = item[1]
+            for edge in self._forward.get(current, []) {
+                let nxt = edge.effect
+                let path_str = cum * abs(edge.effective_strength())
+                if nxt not in best || path_str > best[nxt] {
+                    best[nxt] = path_str
+                    queue.append([nxt, path_str])
+                }
+            }
+        }
+        let results: List[List[any]] = []
+        for n, s in best.items() {
+            if s >= min_strength {
+                results.append([n, round(s, 4)])
+            }
+        }
+        results.sort_by(fn(x) { return -x[1] })
+        return results
+    }
+
+    fn counterfactual(self, removed_node: string) -> CounterfactualResult {
+        let removed = _normalize(removed_node)
+        if removed not in self._nodes {
+            return CounterfactualResult {
+                intervention: "remove " + removed_node,
+                affected_nodes: [], unaffected_nodes: [],
+                explanation: "Node '" + removed_node + "' not found in causal graph.",
+                confidence: 0.0
+            }
+        }
+
+        let downstream = self._bfs_reachable_forward(removed)
+        downstream.discard(removed)
+        if downstream.len() == 0 {
+            return CounterfactualResult {
+                intervention: "remove " + removed,
+                affected_nodes: [], unaffected_nodes: [],
+                explanation: "'" + removed + "' has no downstream effects.",
+                confidence: 1.0
+            }
+        }
+
+        let original_roots: Set[string] = Set.new()
+        for n in self._nodes.keys() {
+            if self._backward.get(n, []).len() == 0 { original_roots.add(n) }
+        }
+        original_roots.discard(removed)
+        let non_downstream: Set[string] = Set.new()
+        for n in self._nodes.keys() {
+            if n not in downstream && n != removed { non_downstream.add(n) }
+        }
+        let sources = original_roots.union(non_downstream)
+        let reachable_without = self._bfs_forward_excluding(sources, removed)
+
+        let affected = downstream.difference(reachable_without).sorted()
+        let unaffected = downstream.intersection(reachable_without).sorted()
+
+        let conf = 1.0
+        if downstream.len() > 0 {
+            conf = affected.len() / downstream.len()
+        }
+        let explanation = self._build_counterfactual_text(removed, affected, unaffected)
+        return CounterfactualResult {
+            intervention: "remove " + removed,
+            affected_nodes: affected, unaffected_nodes: unaffected,
+            explanation: explanation, confidence: round(conf, 4)
+        }
+    }
+
+    fn intervene(self, node: string, new_state: string) -> CounterfactualResult {
+        let node_key = _normalize(node)
+        if node_key not in self._nodes {
+            self.add_node(node_key, "", 1.0, "")
+        }
+
+        let effects = self.all_effects(node_key, 0.1)
+        let affected: List[string] = []
+        for pair in effects { affected.append(pair[0]) }
+        let affected_set = Set.from(affected)
+        let remaining: List[string] = []
+        for n in self._nodes.keys() {
+            if n != node_key && n not in affected_set { remaining.append(n) }
+        }
+        remaining.sort()
+
+        let parts: List[string] = ["Intervening on '" + node_key + "' (setting to " + new_state + "):"]
+        if affected.len() > 0 {
+            parts.append("  Downstream effects (" + string(affected.len()) + "):")
+            let count = 0
+            for pair in effects {
+                if count >= 15 { break }
+                parts.append("    - " + pair[0] + " (strength " + format(pair[1], ".2f") + ")")
+                count += 1
+            }
+            if effects.len() > 15 {
+                parts.append("    ... and " + string(effects.len() - 15) + " more")
+            }
+        } else {
+            parts.append("  No downstream effects found.")
+        }
+
+        return CounterfactualResult {
+            intervention: "set " + node_key + " = " + new_state,
+            affected_nodes: affected, unaffected_nodes: remaining,
+            explanation: parts.join("\n"),
+            confidence: 0.8
+        }
+    }
+
+    fn _bfs_reachable_forward(self, start: string) -> any {
+        let visited: Set[string] = Set.new()
+        let queue = collections.deque()
+        queue.append(start)
+        while queue.len() > 0 {
+            let node = queue.popleft()
+            if node in visited { continue }
+            visited.add(node)
+            for edge in self._forward.get(node, []) {
+                if edge.effect not in visited { queue.append(edge.effect) }
+            }
+        }
+        return visited
+    }
+
+    fn _bfs_forward_excluding(self, sources: Set[string], excluded: string) -> any {
+        let visited: Set[string] = Set.new()
+        let queue = collections.deque()
+        for s in sources {
+            if s != excluded { queue.append(s) }
+        }
+        while queue.len() > 0 {
+            let node = queue.popleft()
+            if node in visited || node == excluded { continue }
+            visited.add(node)
+            for edge in self._forward.get(node, []) {
+                let nxt = edge.effect
+                if nxt not in visited && nxt != excluded { queue.append(nxt) }
+            }
+        }
+        return visited
+    }
+
+    fn _build_counterfactual_text(self, removed: string, affected: List[string], unaffected: List[string]) -> string {
+        let parts: List[string] = ["If '" + removed + "' had not occurred:"]
+        if affected.len() > 0 {
+            parts.append("  These " + string(affected.len()) + " effect(s) would NOT have happened:")
+            let count = 0
+            for n in affected {
+                if count >= 15 { break }
+                parts.append("    - " + n)
+                count += 1
+            }
+            if affected.len() > 15 {
+                parts.append("    ... and " + string(affected.len() - 15) + " more")
+            }
+        }
+        if unaffected.len() > 0 {
+            parts.append("  These " + string(unaffected.len()) + " effect(s) would STILL have happened (alternative causes exist):")
+            let count = 0
+            for n in unaffected {
+                if count >= 15 { break }
+                parts.append("    - " + n)
+                count += 1
+            }
+            if unaffected.len() > 15 {
+                parts.append("    ... and " + string(unaffected.len() - 15) + " more")
+            }
+        }
+        if affected.len() == 0 && unaffected.len() == 0 {
+            parts.append("  No downstream effects found.")
+        }
+        return parts.join("\n")
+    }
+}
+
+fn _make_chain(nodes: List[string], edges: List[CausalEdge], strength: float) -> CausalChain {
+    let parts: List[string] = []
+    let i = 0
+    for n in nodes {
+        parts.append(n)
+        if i < edges.len() {
+            if edges[i].inhibitory {
+                parts.append(" -X-> ")
+            } else {
+                parts.append(" -> ")
+            }
+        }
+        i += 1
+    }
+    return CausalChain {
+        nodes: List.copy(nodes), edges: List.copy(edges),
+        total_strength: round(strength, 4),
+        explanation: parts.join("")
+    }
+}
+
+/// ── CausalExtractor — NLP pattern matching ─────────────────────────────
+
+let CAUSAL_PATTERNS: List[List[any]] = [
+    ["(?P<cause>.+?)\\s+causes?\\s+(?P<effect>.+)", 0.9, false],
+    ["(?P<cause>.+?)\\s+leads?\\s+to\\s+(?P<effect>.+)", 0.8, false],
+    ["(?P<cause>.+?)\\s+results?\\s+in\\s+(?P<effect>.+)", 0.8, false],
+    ["(?P<cause>.+?)\\s+produces?\\s+(?P<effect>.+)", 0.8, false],
+    ["(?P<cause>.+?)\\s+triggers?\\s+(?P<effect>.+)", 0.85, false],
+    ["(?P<cause>.+?)\\s+brings?\\s+about\\s+(?P<effect>.+)", 0.75, false],
+    ["(?P<cause>.+?)\\s+gives?\\s+rise\\s+to\\s+(?P<effect>.+)", 0.75, false],
+    ["(?P<cause>.+?)\\s+generates?\\s+(?P<effect>.+)", 0.75, false],
+    ["(?P<effect>.+?)\\s+is\\s+caused\\s+by\\s+(?P<cause>.+)", 0.9, false],
+    ["(?P<effect>.+?)\\s+is\\s+due\\s+to\\s+(?P<cause>.+)", 0.8, false],
+    ["(?P<effect>.+?)\\s+happens?\\s+because\\s+of\\s+(?P<cause>.+)", 0.8, false],
+    ["(?P<effect>.+?)\\s+results?\\s+from\\s+(?P<cause>.+)", 0.8, false],
+    ["(?P<effect>.+?)\\s+stems?\\s+from\\s+(?P<cause>.+)", 0.75, false],
+    ["(?P<effect>.+?)\\s+arises?\\s+from\\s+(?P<cause>.+)", 0.75, false],
+    ["(?P<effect>.+?)\\s+is\\s+(?:a\\s+)?(?:result|consequence)\\s+of\\s+(?P<cause>.+)", 0.8, false],
+    ["if\\s+(?P<cause>.+?)\\s*,?\\s+then\\s+(?P<effect>.+)", 0.7, false],
+    ["when\\s+(?P<cause>.+?)\\s*,\\s+(?P<effect>.+)", 0.65, false],
+    ["whenever\\s+(?P<cause>.+?)\\s*,\\s+(?P<effect>.+)", 0.7, false],
+    ["(?P<cause>.+?)\\s+contributes?\\s+to\\s+(?P<effect>.+)", 0.6, false],
+    ["(?P<cause>.+?)\\s+is\\s+a\\s+factor\\s+in\\s+(?P<effect>.+)", 0.5, false],
+    ["(?P<cause>.+?)\\s+plays?\\s+a\\s+role\\s+in\\s+(?P<effect>.+)", 0.5, false],
+    ["(?P<cause>.+?)\\s+prevents?\\s+(?P<effect>.+)", 0.8, true],
+    ["(?P<cause>.+?)\\s+inhibits?\\s+(?P<effect>.+)", 0.75, true],
+    ["(?P<cause>.+?)\\s+blocks?\\s+(?P<effect>.+)", 0.8, true],
+    ["(?P<cause>.+?)\\s+stops?\\s+(?P<effect>.+)", 0.8, true],
+    ["(?P<cause>.+?)\\s+increases?\\s+(?P<effect>.+)", 0.6, false],
+    ["(?P<cause>.+?)\\s+raises?\\s+(?P<effect>.+)", 0.6, false],
+    ["(?P<cause>.+?)\\s+boosts?\\s+(?P<effect>.+)", 0.6, false],
+    ["(?P<cause>.+?)\\s+promotes?\\s+(?P<effect>.+)", 0.6, false],
+    ["(?P<cause>.+?)\\s+enhances?\\s+(?P<effect>.+)", 0.6, false],
+    ["(?P<cause>.+?)\\s+decreases?\\s+(?P<effect>.+)", 0.6, true],
+    ["(?P<cause>.+?)\\s+lowers?\\s+(?P<effect>.+)", 0.6, true],
+    ["(?P<cause>.+?)\\s+diminishes?\\s+(?P<effect>.+)", 0.6, true],
+    ["(?P<cause>.+?)\\s+reduces?\\s+(?P<effect>.+)", 0.6, true],
+    ["because\\s+of\\s+(?P<cause>.+?)\\s*,\\s+(?P<effect>.+)", 0.8, false],
+    ["due\\s+to\\s+(?P<cause>.+?)\\s*,\\s+(?P<effect>.+)", 0.8, false],
+    ["(?P<cause>.+?)\\s*,?\\s+therefore\\s+(?P<effect>.+)", 0.75, false],
+    ["(?P<cause>.+?)\\s*,?\\s+consequently\\s+(?P<effect>.+)", 0.75, false],
+    ["(?P<cause>.+?)\\s*,?\\s+thus\\s+(?P<effect>.+)", 0.7, false],
+    ["(?P<cause>.+?)\\s*,?\\s+so\\s+(?P<effect>.+)", 0.65, false],
+    ["(?P<cause>.+?)\\s+(?:and\\s+)?(?:thereby|hence)\\s+(?P<effect>.+)", 0.7, false]
+]
+
+let CROSS_SENTENCE_PATTERNS: List[string] = [
+    "^(?:this|that|it)\\s+(?:led\\s+to|caused|resulted\\s+in|produced|triggered|meant)\\s+(?P<effect>.+)",
+    "^as\\s+a\\s+result\\s*,\\s*(?P<effect>.+)",
+    "^consequently\\s*,\\s*(?P<effect>.+)",
+    "^therefore\\s*,\\s*(?P<effect>.+)",
+    "^thus\\s*,\\s*(?P<effect>.+)",
+    "^hence\\s*,\\s*(?P<effect>.+)"
+]
+
+class CausalExtractor {
+    fn new() -> CausalExtractor {
+        return CausalExtractor {}
+    }
+
+    fn extract(self, text: string, source: string) -> List[any] {
+        let edges: List[CausalEdge] = []
+        let sentences = _split_sentences(text)
+        let prev_subject = ""
+
+        for sent in sentences {
+            sent = sent.strip()
+            if sent == "" { continue }
+
+            let matched = false
+            for pattern_data in CAUSAL_PATTERNS {
+                let pattern = pattern_data[0]
+                let strength = pattern_data[1]
+                let inhibitory = pattern_data[2]
+                let m = re.search(pattern, sent, re.IGNORECASE)
+                if m != None {
+                    let cause = _clean_entity(m.group("cause"))
+                    let effect = _clean_entity(m.group("effect"))
+                    if cause != "" && effect != "" && cause != effect {
+                        edges.append(CausalEdge.new(cause, effect, strength, "", 1.0, source, inhibitory))
+                        prev_subject = cause
+                        matched = true
+                    }
+                    break
+                }
+            }
+
+            if !matched && prev_subject != "" {
+                for ref_pat in CROSS_SENTENCE_PATTERNS {
+                    let ref_m = re.search(ref_pat, sent, re.IGNORECASE)
+                    if ref_m != None {
+                        let effect = _clean_entity(ref_m.group("effect"))
+                        if effect != "" && effect != prev_subject {
+                            edges.append(CausalEdge.new(prev_subject, effect, 0.6, "", 1.0, source, false))
+                            matched = true
+                        }
+                        break
+                    }
+                }
+            }
+
+            if !matched {
+                let subj = _extract_subject(sent)
+                if subj != "" { prev_subject = subj }
+            }
+        }
+
+        return edges
+    }
+
+    fn extract_from_conversation(self, history: List[Dict[string, any]]) -> List[any] {
+        let edges: List[CausalEdge] = []
+        for entry in history {
+            let content = entry.get("content", "")
+            let role = entry.get("role", "unknown")
+            if content != "" {
+                edges.extend(self.extract(content, "conversation:" + role))
+            }
+        }
+        return edges
+    }
+}
+
+fn _split_sentences(text: string) -> List[any] {
+    return re.split("(?<=[.!?])\\s+", text.strip())
+}
+
+fn _clean_entity(text: string) -> string {
+    text = text.strip().rstrip(".,;:!?")
+    text = re.sub("^(?:the|a|an)\\s+", "", text, re.IGNORECASE)
+    text = re.sub("\\s+", " ", text)
+    return text.strip().lower()
+}
+
+fn _extract_subject(sentence: string) -> string {
+    let m = re.match(
+        "^(?:the|a|an)?\\s*(.+?)(?:\\s+(?:is|was|has|had|does|did|will|would|can|could|may|might|should)\\b)",
+        sentence, re.IGNORECASE)
+    if m != None {
+        return _clean_entity(m.group(1))
+    }
+    let words = sentence.split(" ")
+    if words.len() > 0 {
+        let phrase = words[0:3].join(" ")
+        return _clean_entity(phrase)
+    }
+    return ""
+}
+
+/// ── CausalReasoner — question answering ────────────────────────────────
+
+let QUERY_PATTERNS: List[List[any]] = [
+    ["why\\s+(?:did|does|do|is|was|were|has|had|have)\\s+(?P<target>.+?)(?:\\s+happen(?:ed)?|\\s+occur(?:red)?)?\\s*\\??\\s*$", "why"],
+    ["why\\s+(?P<target>.+?)\\s*\\??\\s*$", "why"],
+    ["what\\s+(?:caused|causes|has\\s+caused)\\s+(?P<target>.+?)\\s*\\??\\s*$", "what_caused"],
+    ["what\\s+if\\s+(?:there\\s+(?:was|were)\\s+no|not?|without)\\s+(?P<target>.+?)\\s*\\??\\s*$", "counterfactual"],
+    ["what\\s+if\\s+(?P<target>.+?)\\s+(?:hadn't|had\\s+not|didn't|did\\s+not)\\s+(?:happened?|occurred?|existed?)\\s*\\??\\s*$", "counterfactual"],
+    ["without\\s+(?P<target>.+?)\\s*,?\\s*(?:what|how)", "counterfactual"],
+    ["what\\s+(?:would|will)\\s+happen\\s+if\\s+(?:we\\s+)?(?P<target>.+?)\\s*\\??\\s*$", "intervention"],
+    ["what\\s+happens?\\s+(?:if|when)\\s+(?:we\\s+)?(?P<target>.+?)\\s*\\??\\s*$", "intervention"],
+    ["(?:does|do|did|can|could|would)\\s+(?P<cause>.+?)\\s+(?:cause|lead\\s+to|result\\s+in|produce)\\s+(?P<effect>.+?)\\s*\\??\\s*$", "path_check"],
+    ["is\\s+(?:there\\s+)?(?:a\\s+)?(?:causal\\s+)?(?:link|connection|relationship|path)\\s+(?:between|from)\\s+(?P<cause>.+?)\\s+(?:and|to)\\s+(?P<effect>.+?)\\s*\\??\\s*$", "path_check"],
+    ["(?:what\\s+are\\s+)?(?:the\\s+)?effects?\\s+of\\s+(?P<target>.+?)\\s*\\??\\s*$", "effects"],
+    ["what\\s+does\\s+(?P<target>.+?)\\s+(?:cause|lead\\s+to|result\\s+in|produce|affect)\\s*\\??\\s*$", "effects"]
+]
+
+class CausalReasoner {
+    fn new() -> CausalReasoner {
+        let cr = CausalReasoner {}
+        cr._graph = CausalGraph.new()
+        cr._extractor = CausalExtractor.new()
+        cr._query_count = 0
+        return cr
+    }
+
+    fn graph(self) -> CausalGraph { return self._graph }
+
+    fn ingest(self, text: string, source: string) -> int {
+        let edges = self._extractor.extract(text, source)
+        for e in edges {
+            self._graph.add_edge(e.cause, e.effect, e.strength, e.mechanism, e.confidence, e.source, e.inhibitory)
+        }
+        return edges.len()
+    }
+
+    fn ingest_conversation(self, history: List[Dict[string, any]]) -> int {
+        let edges = self._extractor.extract_from_conversation(history)
+        for e in edges {
+            self._graph.add_edge(e.cause, e.effect, e.strength, e.mechanism, e.confidence, e.source, e.inhibitory)
+        }
+        return edges.len()
+    }
+
+    fn add_claim(self, cause: string, effect: string, strength: float, mechanism: string, inhibitory: bool) -> void {
+        self._graph.add_edge(cause, effect, strength, mechanism, 1.0, "", inhibitory)
+    }
+
+    fn query(self, question: string) -> CausalResult {
+        self._query_count += 1
+        let classified = self._classify_query(question)
+        let qtype = classified[0]
+        let entities = classified[1]
+
+        if qtype == "why" { return self._handle_why(entities.get("target", "")) }
+        if qtype == "what_caused" { return self._handle_what_caused(entities.get("target", "")) }
+        if qtype == "counterfactual" { return self._handle_counterfactual(entities.get("target", "")) }
+        if qtype == "intervention" { return self._handle_intervention(entities.get("target", "")) }
+        if qtype == "path_check" { return self._handle_path_check(entities.get("cause", ""), entities.get("effect", "")) }
+        if qtype == "effects" { return self._handle_effects(entities.get("target", "")) }
+
+        return CausalResult {
+            query_type: "unknown", answered: false,
+            explanation: "Could not determine the type of causal question: '" + question + "'",
+            chains: [], counterfactual: None, confidence: 0.0
+        }
+    }
+
+    fn explain_why(self, target: string) -> string {
+        return self._handle_why(target).explanation
+    }
+
+    fn explain_what_if(self, condition: string) -> string {
+        return self._handle_counterfactual(condition).explanation
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        return {
+            "nodes": self._graph.node_count(),
+            "edges": self._graph.edge_count(),
+            "roots": self._graph.roots().len(),
+            "leaves": self._graph.leaves().len(),
+            "queries_answered": self._query_count
+        }
+    }
+
+    fn _classify_query(self, question: string) -> List[any] {
+        let q = question.strip()
+        for pattern_data in QUERY_PATTERNS {
+            let pattern = pattern_data[0]
+            let qtype = pattern_data[1]
+            let m = re.search(pattern, q, re.IGNORECASE)
+            if m != None {
+                let entities: Dict[string, string] = {}
+                let gd = m.groupdict()
+                for key in ["target", "cause", "effect"] {
+                    if key in gd && gd[key] != None {
+                        entities[key] = _clean_entity(gd[key])
+                    }
+                }
+                return [qtype, entities]
+            }
+        }
+        return ["unknown", {}]
+    }
+
+    fn _resolve_node(self, name: string) -> Optional[string] {
+        let key = _normalize(name)
+        if self._graph.has_node(key) { return key }
+        for n in self._graph._nodes.keys() {
+            if key in n || n in key { return n }
+        }
+        let query_words = Set.from(key.split(" "))
+        let best: Optional[string] = None
+        let best_score = 0
+        for n in self._graph._nodes.keys() {
+            let overlap = query_words.intersection(Set.from(n.split(" "))).len()
+            if overlap > best_score {
+                best = n
+                best_score = overlap
+            }
+        }
+        if best_score > 0 { return best }
+        return None
+    }
+
+    fn _handle_why(self, target: string) -> CausalResult {
+        let node = self._resolve_node(target)
+        if node == None {
+            return CausalResult { query_type: "why", answered: false, explanation: "No causal information found for '" + target + "'.", chains: [], counterfactual: None, confidence: 0.0 }
+        }
+        let chains = self._graph.backward_chain(node, 6)
+        if chains.len() == 0 {
+            return CausalResult { query_type: "why", answered: false, explanation: "'" + node + "' appears to be a root cause with no known prior causes.", chains: [], counterfactual: None, confidence: 0.5 }
+        }
+        let explanation = _prose_why(node, chains)
+        let best_conf = 0.0
+        for c in chains {
+            let ac = abs(c.total_strength)
+            if ac > best_conf { best_conf = ac }
+        }
+        return CausalResult { query_type: "why", answered: true, explanation: explanation, chains: chains, counterfactual: None, confidence: round(best_conf, 4) }
+    }
+
+    fn _handle_what_caused(self, target: string) -> CausalResult {
+        let node = self._resolve_node(target)
+        if node == None {
+            return CausalResult { query_type: "what_caused", answered: false, explanation: "No causal information found for '" + target + "'.", chains: [], counterfactual: None, confidence: 0.0 }
+        }
+        let causes = self._graph.all_causes(node, 0.1)
+        let chains = self._graph.backward_chain(node, 6)
+        if causes.len() == 0 {
+            return CausalResult { query_type: "what_caused", answered: false, explanation: "'" + node + "' has no known causes in the causal graph.", chains: [], counterfactual: None, confidence: 0.5 }
+        }
+        let parts: List[string] = ["The causes of '" + node + "' (ranked by causal strength):"]
+        for pair in causes {
+            parts.append("  - " + pair[0] + ": strength " + format(pair[1], ".2f"))
+        }
+        let conf = 0.0
+        if causes.len() > 0 { conf = causes[0][1] }
+        return CausalResult { query_type: "what_caused", answered: true, explanation: parts.join("\n"), chains: chains, counterfactual: None, confidence: round(conf, 4) }
+    }
+
+    fn _handle_counterfactual(self, target: string) -> CausalResult {
+        let node = self._resolve_node(target)
+        if node == None {
+            return CausalResult { query_type: "counterfactual", answered: false, explanation: "No causal information found for '" + target + "'.", chains: [], counterfactual: None, confidence: 0.0 }
+        }
+        let cf = self._graph.counterfactual(node)
+        return CausalResult { query_type: "counterfactual", answered: true, explanation: cf.explanation, chains: [], counterfactual: cf, confidence: cf.confidence }
+    }
+
+    fn _handle_intervention(self, target: string) -> CausalResult {
+        let node = self._resolve_node(target)
+        if node == None { node = _normalize(target) }
+        let iv = self._graph.intervene(node, "active")
+        let chains = self._graph.forward_chain(node, 5)
+        return CausalResult { query_type: "intervention", answered: true, explanation: iv.explanation, chains: chains, counterfactual: iv, confidence: iv.confidence }
+    }
+
+    fn _handle_path_check(self, cause: string, effect: string) -> CausalResult {
+        let c_node = self._resolve_node(cause)
+        let e_node = self._resolve_node(effect)
+        if c_node == None || e_node == None {
+            let missing = cause
+            if c_node != None { missing = effect }
+            return CausalResult { query_type: "path_check", answered: false, explanation: "Node '" + missing + "' not found in causal graph.", chains: [], counterfactual: None, confidence: 0.0 }
+        }
+        let path = self._graph.find_path(c_node, e_node)
+        if path != None {
+            return CausalResult { query_type: "path_check", answered: true, explanation: "Yes, '" + c_node + "' causes '" + e_node + "' via: " + path.explanation + " (strength " + format(path.total_strength, ".2f") + ")", chains: [path], counterfactual: None, confidence: abs(path.total_strength) }
+        }
+        return CausalResult { query_type: "path_check", answered: true, explanation: "No causal path found from '" + c_node + "' to '" + e_node + "'.", chains: [], counterfactual: None, confidence: 0.8 }
+    }
+
+    fn _handle_effects(self, target: string) -> CausalResult {
+        let node = self._resolve_node(target)
+        if node == None {
+            return CausalResult { query_type: "effects", answered: false, explanation: "No causal information found for '" + target + "'.", chains: [], counterfactual: None, confidence: 0.0 }
+        }
+        let effects = self._graph.all_effects(node, 0.1)
+        let chains = self._graph.forward_chain(node, 5)
+        if effects.len() == 0 {
+            return CausalResult { query_type: "effects", answered: false, explanation: "'" + node + "' has no known downstream effects.", chains: [], counterfactual: None, confidence: 0.5 }
+        }
+        let parts: List[string] = ["Effects of '" + node + "' (ranked by causal strength):"]
+        for pair in effects {
+            parts.append("  - " + pair[0] + ": strength " + format(pair[1], ".2f"))
+        }
+        let conf = 0.0
+        if effects.len() > 0 { conf = effects[0][1] }
+        return CausalResult { query_type: "effects", answered: true, explanation: parts.join("\n"), chains: chains, counterfactual: None, confidence: round(conf, 4) }
+    }
+}
+
+fn _prose_why(target: string, chains: List[CausalChain]) -> string {
+    if chains.len() == 0 {
+        return "No causal explanation found for '" + target + "'."
+    }
+    let parts: List[string] = ["'" + target + "' occurred because:"]
+    let root_map: Dict[string, List[CausalChain]] = {}
+    for chain in chains {
+        let root = "unknown"
+        if chain.nodes.len() > 0 { root = chain.nodes[0] }
+        if root not in root_map { root_map[root] = [] }
+        root_map[root].append(chain)
+    }
+
+    let ranked: List[List[any]] = []
+    for root, root_chains in root_map.items() {
+        let max_str = 0.0
+        for c in root_chains {
+            let ac = abs(c.total_strength)
+            if ac > max_str { max_str = ac }
+        }
+        ranked.append([root, root_chains, max_str])
+    }
+    ranked.sort_by(fn(x) { return -x[2] })
+
+    let idx = 1
+    for item in ranked {
+        let root = item[0]
+        let root_chains = item[1]
+        let best = root_chains[0]
+        for c in root_chains {
+            if abs(c.total_strength) > abs(best.total_strength) { best = c }
+        }
+        let strength_str = format(abs(best.total_strength), ".2f")
+
+        if best.nodes.len() == 2 {
+            parts.append("\n  " + string(idx) + ". '" + root + "' directly caused '" + target + "' (strength " + strength_str + ").")
+        } else {
+            let chain_desc = best.nodes.join(" -> ")
+            let steps = best.nodes.len() - 1
+            parts.append("\n  " + string(idx) + ". Root cause '" + root + "' led to '" + target + "' through " + string(steps) + " step(s):")
+            parts.append("     " + chain_desc)
+            parts.append("     Overall causal strength: " + strength_str)
+        }
+
+        if root_chains.len() > 1 {
+            parts.append("     (" + string(root_chains.len()) + " distinct path(s) from this root cause)")
+        }
+        idx += 1
+    }
+
+    let total_roots = root_map.len()
+    if total_roots > 1 {
+        parts.append("\nIn total, " + string(total_roots) + " independent root cause(s) contribute to '" + target + "'.")
+    }
+    return parts.join("\n")
+}
+
+export CausalNode, CausalEdge, CausalChain, CounterfactualResult, CausalResult
+export CausalGraph, CausalExtractor, CausalReasoner

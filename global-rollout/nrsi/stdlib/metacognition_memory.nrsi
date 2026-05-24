@@ -1,0 +1,779 @@
+/// NRSI Metacognition — Memory Stack.
+///
+/// Provides the persistence and retrieval layer for all metacognitive
+/// state: sessions, user models, episodic memory with semantic recall,
+/// goal state, lessons, and strategy snapshots.
+///
+/// Storage backends are pluggable.  The default InMemoryMetaStore
+/// works without infrastructure for development and testing.
+/// RedisMetaStore wraps an aioredis pool for production.
+///
+/// Retention and scoping rules:
+/// - L1 (Ephemeral/Session): TTL = session duration, max 50 turns.
+/// - L2 (User Model): TTL = 365 days from last interaction, versioned.
+/// - L3 (Episodic): TTL = 90 days, max 500 episodes per user.
+/// - L4 (Lessons): TTL = none (permanent until invalidated), max 1000.
+/// - L5 (Strategy Snapshots): TTL = none, max 100 per user.
+/// - Goal State: TTL = session duration + 24 h grace.
+
+module metacognition_memory
+
+from "metacognition_types" import ConversationEpisode, GoalState, LessonRecord, StrategyPolicySnapshot, UserModel, _now_ms, _uid
+import json from "std/json"
+
+/// ── Semantic similarity (TF-IDF word-overlap) ──────────────────────
+
+let _STOP_WORDS: Set[string] = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "has",
+    "have", "had", "do", "does", "did", "will", "can", "may", "in",
+    "of", "to", "for", "on", "with", "at", "by", "from", "as", "or",
+    "and", "but", "not", "it", "its", "this", "that", "i", "you", "we",
+    "they", "my", "your", "me", "so", "if", "all", "no", "any", "up",
+    "out", "about", "what", "which", "how", "when", "where", "who"
+}
+
+fn _tokenize(text: string) -> List[any] {
+    let tokens: List[string] = []
+    for w in text.lower().split() {
+        let cleaned = w.strip(".,!?;:\"'()-[]{}/*")
+        if len(cleaned) > 2 and cleaned not in _STOP_WORDS {
+            tokens.append(cleaned)
+        }
+    }
+    return tokens
+}
+
+class _TFIDFIndex {
+    fn __init__(self) {
+        self._vocab: Dict[string, int] = {}
+        self._idf: Dict[string, float] = {}
+        self._doc_count = 0
+        self._doc_freq: Dict[string, int] = {}
+        self._vectors: Dict[string, Dict[string, float]] = {}
+    }
+
+    fn add(self, doc_id: string, text: string) {
+        let tokens = _tokenize(text)
+        if len(tokens) == 0 {
+            return
+        }
+        let tf: Dict[string, float] = {}
+        for t in tokens {
+            tf[t] = tf.get(t, 0.0) + 1.0
+        }
+        let max_tf = 1.0
+        for t in tf {
+            if tf[t] > max_tf {
+                max_tf = tf[t]
+            }
+        }
+        for t in tf {
+            tf[t] = 0.5 + 0.5 * (tf[t] / max_tf)
+        }
+
+        let old_tokens: Set[string] = set()
+        if doc_id in self._vectors {
+            for ot in self._vectors[doc_id] {
+                old_tokens.add(ot)
+            }
+            for ot in old_tokens {
+                self._doc_freq[ot] = max(0, self._doc_freq.get(ot, 1) - 1)
+            }
+        } else {
+            self._doc_count += 1
+        }
+
+        for t in tf {
+            self._doc_freq[t] = self._doc_freq.get(t, 0) + 1
+            if t not in self._vocab {
+                self._vocab[t] = len(self._vocab)
+            }
+        }
+
+        self._vectors[doc_id] = tf
+        self._recompute_idf()
+    }
+
+    fn remove(self, doc_id: string) {
+        let vec = self._vectors.pop(doc_id, None)
+        if vec != None {
+            self._doc_count = max(0, self._doc_count - 1)
+            for t in vec {
+                self._doc_freq[t] = max(0, self._doc_freq.get(t, 1) - 1)
+            }
+            self._recompute_idf()
+        }
+    }
+
+    fn query(self, text: string, doc_ids: Optional[List[string]],
+             top_k: int) -> List[any] {
+        let tokens = _tokenize(text)
+        if len(tokens) == 0 {
+            return []
+        }
+        let q_tf: Dict[string, float] = {}
+        for t in tokens {
+            q_tf[t] = q_tf.get(t, 0.0) + 1.0
+        }
+        let max_tf = 1.0
+        for t in q_tf {
+            if q_tf[t] > max_tf {
+                max_tf = q_tf[t]
+            }
+        }
+        for t in q_tf {
+            q_tf[t] = 0.5 + 0.5 * (q_tf[t] / max_tf)
+        }
+
+        let q_vec: Dict[string, float] = {}
+        for t in q_tf {
+            q_vec[t] = q_tf[t] * self._idf.get(t, 0.0)
+        }
+
+        let candidates: List[string] = []
+        if doc_ids != None {
+            candidates = doc_ids
+        } else {
+            for k in self._vectors {
+                candidates.append(k)
+            }
+        }
+
+        let scored: List[Tuple[string, float]] = []
+        for did in candidates {
+            let d_tf = self._vectors.get(did)
+            if d_tf == None {
+                continue
+            }
+            let d_vec: Dict[string, float] = {}
+            for t in d_tf {
+                d_vec[t] = d_tf[t] * self._idf.get(t, 0.0)
+            }
+            let score = _cosine_sparse(q_vec, d_vec)
+            if score > 0.01 {
+                scored.append((did, score))
+            }
+        }
+
+        let sorted_scored: List[Tuple[string, float]] = []
+        let remaining = list(scored)
+        while len(remaining) > 0 and len(sorted_scored) < top_k {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i][1] > remaining[best_idx][1] {
+                    best_idx = i
+                }
+            }
+            sorted_scored.append(remaining.pop(best_idx))
+        }
+        return sorted_scored
+    }
+
+    fn _recompute_idf(self) {
+        let n = max(self._doc_count, 1)
+        self._idf = {}
+        for term in self._doc_freq {
+            let df = self._doc_freq[term]
+            self._idf[term] = math_log((n + 1) / (df + 1)) + 1.0
+        }
+    }
+}
+
+fn _cosine_sparse(a: Dict[string, float], b: Dict[string, float]) -> float {
+    let shared: Set[string] = set()
+    for k in a {
+        if k in b {
+            shared.add(k)
+        }
+    }
+    if len(shared) == 0 {
+        return 0.0
+    }
+    let dot = 0.0
+    for k in shared {
+        dot += a[k] * b[k]
+    }
+    let sum_a = 0.0
+    for v in a.values() {
+        sum_a += v * v
+    }
+    let sum_b = 0.0
+    for v in b.values() {
+        sum_b += v * v
+    }
+    let norm_a = math_sqrt(sum_a)
+    if norm_a == 0.0 {
+        norm_a = 1e-9
+    }
+    let norm_b = math_sqrt(sum_b)
+    if norm_b == 0.0 {
+        norm_b = 1e-9
+    }
+    return dot / (norm_a * norm_b)
+}
+
+fn _text_signature(text: string, dim: int) -> List[any] {
+    if dim == None {
+        dim = 128
+    }
+    let h = sha256(text.lower().encode("utf-8")).digest()
+    let expanded = h
+    while len(expanded) < dim * 4 {
+        h = sha256(h).digest()
+        expanded += h
+    }
+    let sig: List[float] = []
+    for i in range(dim) {
+        let byte_val = expanded[i % len(expanded)]
+        sig.append((byte_val / 127.5) - 1.0)
+    }
+    return sig
+}
+
+fn _cosine_vec(a: List[float], b: List[float]) -> float {
+    let dot = 0.0
+    for i in range(len(a)) {
+        dot += a[i] * b[i]
+    }
+    let sum_a = 0.0
+    for x in a {
+        sum_a += x * x
+    }
+    let sum_b = 0.0
+    for y in b {
+        sum_b += y * y
+    }
+    let norm_a = math_sqrt(sum_a)
+    if norm_a == 0.0 {
+        norm_a = 1e-9
+    }
+    let norm_b = math_sqrt(sum_b)
+    if norm_b == 0.0 {
+        norm_b = 1e-9
+    }
+    return dot / (norm_a * norm_b)
+}
+
+/// ── Abstract store (interface) ─────────────────────────────────────
+
+class MetaStore {
+    fn save_episode(self, episode: ConversationEpisode) { pass }
+    fn load_episode(self, episode_id: string) -> Optional[ConversationEpisode] { return None }
+    fn list_episodes(self, user_id: string, limit: int) -> List[any] { return [] }
+    fn search_episodes_semantic(self, user_id: string, query: string, top_k: int) -> List[any] { return [] }
+    fn save_user_model(self, model: UserModel) { pass }
+    fn load_user_model(self, user_id: string) -> Optional[UserModel] { return None }
+    fn save_goal(self, goal: GoalState) { pass }
+    fn load_active_goal(self, session_id: string) -> Optional[GoalState] { return None }
+    fn save_lesson(self, lesson: LessonRecord) { pass }
+    fn load_lessons(self, user_id: string, domain: string, limit: int) -> List[any] { return [] }
+    fn search_lessons_semantic(self, user_id: string, query: string, top_k: int) -> List[any] { return [] }
+    fn save_snapshot(self, snapshot: StrategyPolicySnapshot) { pass }
+    fn load_latest_snapshot(self, user_id: string) -> Optional[StrategyPolicySnapshot] { return None }
+}
+
+/// ── In-memory implementation ───────────────────────────────────────
+
+class InMemoryMetaStore(MetaStore) {
+    let EPISODE_LIMIT = 500
+    let LESSON_LIMIT = 1000
+    let SNAPSHOT_LIMIT = 100
+
+    fn __init__(self) {
+        self._episodes: Dict[string, ConversationEpisode] = {}
+        self._user_models: Dict[string, UserModel] = {}
+        self._goals: Dict[string, GoalState] = {}
+        self._lessons: Dict[string, LessonRecord] = {}
+        self._snapshots: Dict[string, StrategyPolicySnapshot] = {}
+        self._episode_index = _TFIDFIndex()
+        self._lesson_index = _TFIDFIndex()
+    }
+
+    fn save_episode(self, episode: ConversationEpisode) {
+        self._episodes[episode.episode_id] = episode
+        let sig_text = episode.summary + " " + " ".join(episode.running_themes) + " " + " ".join(episode.entities)
+        let turn_parts: List[string] = []
+        let start = max(0, len(episode.turns) - 6)
+        for i in range(start, len(episode.turns)) {
+            turn_parts.append(episode.turns[i].content)
+        }
+        let turn_text = " ".join(turn_parts)
+        self._episode_index.add(episode.episode_id, sig_text + " " + turn_text)
+        self._enforce_episode_limit(episode.user_id)
+    }
+
+    fn load_episode(self, episode_id: string) -> Optional[ConversationEpisode] {
+        return self._episodes.get(episode_id)
+    }
+
+    fn list_episodes(self, user_id: string, limit: int) -> List[any] {
+        let matches: List[ConversationEpisode] = []
+        for ep in self._episodes.values() {
+            if ep.user_id == user_id {
+                matches.append(ep)
+            }
+        }
+        let sorted_matches: List[ConversationEpisode] = []
+        let remaining = list(matches)
+        while len(remaining) > 0 and len(sorted_matches) < limit {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i].updated_at_ms > remaining[best_idx].updated_at_ms {
+                    best_idx = i
+                }
+            }
+            sorted_matches.append(remaining.pop(best_idx))
+        }
+        return sorted_matches
+    }
+
+    fn search_episodes_semantic(self, user_id: string, query: string,
+                                top_k: int) -> List[any] {
+        let user_eids: List[string] = []
+        for eid in self._episodes {
+            if self._episodes[eid].user_id == user_id {
+                user_eids.append(eid)
+            }
+        }
+        if len(user_eids) == 0 {
+            return []
+        }
+        let hits = self._episode_index.query(query, user_eids, top_k)
+        let results: List[Tuple[ConversationEpisode, float]] = []
+        for hit in hits {
+            let ep = self._episodes.get(hit[0])
+            if ep != None {
+                results.append((ep, hit[1]))
+            }
+        }
+        return results
+    }
+
+    fn _enforce_episode_limit(self, user_id: string) {
+        let user_eps: List[string] = []
+        for eid in self._episodes {
+            if self._episodes[eid].user_id == user_id {
+                user_eps.append(eid)
+            }
+        }
+        while len(user_eps) > self.EPISODE_LIMIT {
+            let oldest = user_eps.pop(0)
+            self._episodes.pop(oldest, None)
+            self._episode_index.remove(oldest)
+        }
+    }
+
+    fn save_user_model(self, model: UserModel) {
+        self._user_models[model.user_id] = model
+    }
+
+    fn load_user_model(self, user_id: string) -> Optional[UserModel] {
+        return self._user_models.get(user_id)
+    }
+
+    fn save_goal(self, goal: GoalState) {
+        self._goals[goal.session_id] = goal
+    }
+
+    fn load_active_goal(self, session_id: string) -> Optional[GoalState] {
+        let goal = self._goals.get(session_id)
+        if goal != None and goal.status == "active" {
+            return goal
+        }
+        return None
+    }
+
+    fn save_lesson(self, lesson: LessonRecord) {
+        self._lessons[lesson.lesson_id] = lesson
+        self._lesson_index.add(
+            lesson.lesson_id,
+            lesson.description + " " + lesson.domain + " " +
+            lesson.lesson_type + " " + " ".join(lesson.reuse_conditions)
+        )
+        self._enforce_lesson_limit(lesson.user_id)
+    }
+
+    fn load_lessons(self, user_id: string, domain: string,
+                    limit: int) -> List[any] {
+        let matches: List[LessonRecord] = []
+        for l in self._lessons.values() {
+            if l.user_id == user_id and not l.invalidated {
+                if domain == "" or l.domain == domain {
+                    matches.append(l)
+                }
+            }
+        }
+        let sorted_matches: List[LessonRecord] = []
+        let remaining = list(matches)
+        while len(remaining) > 0 and len(sorted_matches) < limit {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i].created_at_ms > remaining[best_idx].created_at_ms {
+                    best_idx = i
+                }
+            }
+            sorted_matches.append(remaining.pop(best_idx))
+        }
+        return sorted_matches
+    }
+
+    fn search_lessons_semantic(self, user_id: string, query: string,
+                               top_k: int) -> List[any] {
+        let user_lids: List[string] = []
+        for lid in self._lessons {
+            let les = self._lessons[lid]
+            if les.user_id == user_id and not les.invalidated {
+                user_lids.append(lid)
+            }
+        }
+        if len(user_lids) == 0 {
+            return []
+        }
+        let hits = self._lesson_index.query(query, user_lids, top_k)
+        let results: List[Tuple[LessonRecord, float]] = []
+        for hit in hits {
+            let les = self._lessons.get(hit[0])
+            if les != None {
+                results.append((les, hit[1]))
+            }
+        }
+        return results
+    }
+
+    fn _enforce_lesson_limit(self, user_id: string) {
+        let user_lessons: List[string] = []
+        for lid in self._lessons {
+            if self._lessons[lid].user_id == user_id {
+                user_lessons.append(lid)
+            }
+        }
+        while len(user_lessons) > self.LESSON_LIMIT {
+            let oldest = user_lessons.pop(0)
+            self._lessons.pop(oldest, None)
+            self._lesson_index.remove(oldest)
+        }
+    }
+
+    fn save_snapshot(self, snapshot: StrategyPolicySnapshot) {
+        self._snapshots[snapshot.snapshot_id] = snapshot
+        let user_snaps: List[string] = []
+        for sid in self._snapshots {
+            if self._snapshots[sid].user_id == snapshot.user_id {
+                user_snaps.append(sid)
+            }
+        }
+        while len(user_snaps) > self.SNAPSHOT_LIMIT {
+            let oldest = user_snaps.pop(0)
+            self._snapshots.pop(oldest, None)
+        }
+    }
+
+    fn load_latest_snapshot(self, user_id: string) -> Optional[StrategyPolicySnapshot] {
+        let candidates: List[StrategyPolicySnapshot] = []
+        for s in self._snapshots.values() {
+            if s.user_id == user_id {
+                candidates.append(s)
+            }
+        }
+        if len(candidates) == 0 {
+            return None
+        }
+        let best = candidates[0]
+        for s in candidates {
+            if s.version > best.version {
+                best = s
+            }
+        }
+        return best
+    }
+}
+
+/// ── Redis-backed implementation ────────────────────────────────────
+
+class RedisMetaStore(MetaStore) {
+    let EPISODE_TTL = 90 * 86400
+    let USER_MODEL_TTL = 365 * 86400
+    let GOAL_TTL = 25 * 3600
+
+    fn __init__(self, redis_pool: Any) {
+        self._r = redis_pool
+    }
+
+    fn save_episode(self, episode: ConversationEpisode) {
+        let key = "meta:ep:" + episode.episode_id
+        self._r.set(key, json.dumps(episode.to_dict()), self.EPISODE_TTL)
+        let idx_key = "meta:ep_idx:" + episode.user_id
+        self._r.zadd(idx_key, {episode.episode_id: episode.updated_at_ms})
+        self._r.zremrangebyrank(idx_key, 0, -501)
+    }
+
+    fn load_episode(self, episode_id: string) -> Optional[ConversationEpisode] {
+        let raw = self._r.get("meta:ep:" + episode_id)
+        if raw == None {
+            return None
+        }
+        return ConversationEpisode.from_dict(json.loads(raw))
+    }
+
+    fn list_episodes(self, user_id: string, limit: int) -> List[any] {
+        let idx_key = "meta:ep_idx:" + user_id
+        let ids = self._r.zrevrange(idx_key, 0, limit - 1)
+        let episodes: List[ConversationEpisode] = []
+        for eid in ids {
+            let ep = self.load_episode(str(eid))
+            if ep != None {
+                episodes.append(ep)
+            }
+        }
+        return episodes
+    }
+
+    fn search_episodes_semantic(self, user_id: string, query: string,
+                                top_k: int) -> List[any] {
+        let episodes = self.list_episodes(user_id, 100)
+        let q_sig = _text_signature(query, 128)
+        let scored: List[Tuple[ConversationEpisode, float]] = []
+        for ep in episodes {
+            let sig_text = ep.summary + " " + " ".join(ep.running_themes)
+            let ep_sig = _text_signature(sig_text, 128)
+            let score = _cosine_vec(q_sig, ep_sig)
+            scored.append((ep, score))
+        }
+        let sorted_scored: List[Tuple[ConversationEpisode, float]] = []
+        let remaining = list(scored)
+        while len(remaining) > 0 and len(sorted_scored) < top_k {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i][1] > remaining[best_idx][1] {
+                    best_idx = i
+                }
+            }
+            sorted_scored.append(remaining.pop(best_idx))
+        }
+        return sorted_scored
+    }
+
+    fn save_user_model(self, model: UserModel) {
+        let key = "meta:user:" + model.user_id
+        self._r.set(key, json.dumps(model.to_dict()), self.USER_MODEL_TTL)
+    }
+
+    fn load_user_model(self, user_id: string) -> Optional[UserModel] {
+        let raw = self._r.get("meta:user:" + user_id)
+        if raw == None {
+            return None
+        }
+        return UserModel.from_dict(json.loads(raw))
+    }
+
+    fn save_goal(self, goal: GoalState) {
+        let key = "meta:goal:" + goal.session_id
+        self._r.set(key, json.dumps(goal.to_dict()), self.GOAL_TTL)
+    }
+
+    fn load_active_goal(self, session_id: string) -> Optional[GoalState] {
+        let raw = self._r.get("meta:goal:" + session_id)
+        if raw == None {
+            return None
+        }
+        let goal = GoalState.from_dict(json.loads(raw))
+        if goal.status == "active" {
+            return goal
+        }
+        return None
+    }
+
+    fn save_lesson(self, lesson: LessonRecord) {
+        let key = "meta:les:" + lesson.lesson_id
+        self._r.set(key, json.dumps(lesson.to_dict()))
+        let idx_key = "meta:les_idx:" + lesson.user_id
+        self._r.zadd(idx_key, {lesson.lesson_id: lesson.created_at_ms})
+        self._r.zremrangebyrank(idx_key, 0, -1001)
+    }
+
+    fn load_lessons(self, user_id: string, domain: string,
+                    limit: int) -> List[any] {
+        let idx_key = "meta:les_idx:" + user_id
+        let ids = self._r.zrevrange(idx_key, 0, limit * 2)
+        let lessons: List[LessonRecord] = []
+        for lid in ids {
+            let raw = self._r.get("meta:les:" + str(lid))
+            if raw == None {
+                continue
+            }
+            let les = LessonRecord.from_dict(json.loads(raw))
+            if les.invalidated {
+                continue
+            }
+            if domain != "" and les.domain != domain {
+                continue
+            }
+            lessons.append(les)
+            if len(lessons) >= limit {
+                break
+            }
+        }
+        return lessons
+    }
+
+    fn search_lessons_semantic(self, user_id: string, query: string,
+                               top_k: int) -> List[any] {
+        let lessons = self.load_lessons(user_id, "", 200)
+        let q_sig = _text_signature(query, 128)
+        let scored: List[Tuple[LessonRecord, float]] = []
+        for les in lessons {
+            let ls = _text_signature(les.description + " " + les.domain, 128)
+            let score = _cosine_vec(q_sig, ls)
+            scored.append((les, score))
+        }
+        let sorted_scored: List[Tuple[LessonRecord, float]] = []
+        let remaining = list(scored)
+        while len(remaining) > 0 and len(sorted_scored) < top_k {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i][1] > remaining[best_idx][1] {
+                    best_idx = i
+                }
+            }
+            sorted_scored.append(remaining.pop(best_idx))
+        }
+        return sorted_scored
+    }
+
+    fn save_snapshot(self, snapshot: StrategyPolicySnapshot) {
+        let key = "meta:snap:" + snapshot.snapshot_id
+        self._r.set(key, json.dumps(snapshot.to_dict()))
+        self._r.set("meta:snap_latest:" + snapshot.user_id, snapshot.snapshot_id)
+    }
+
+    fn load_latest_snapshot(self, user_id: string) -> Optional[StrategyPolicySnapshot] {
+        let sid = self._r.get("meta:snap_latest:" + user_id)
+        if sid == None {
+            return None
+        }
+        let raw = self._r.get("meta:snap:" + str(sid))
+        if raw == None {
+            return None
+        }
+        return StrategyPolicySnapshot.from_dict(json.loads(raw))
+    }
+}
+
+/// ── Unified Memory Facade ──────────────────────────────────────────
+
+class MetacognitionMemory {
+    fn __init__(self, store: Optional[MetaStore]) {
+        if store != None {
+            self.store = store
+        } else {
+            self.store = InMemoryMetaStore()
+        }
+    }
+
+    fn start_episode(self, session_id: string,
+                     user_id: string) -> ConversationEpisode {
+        let ep = ConversationEpisode()
+        ep.session_id = session_id
+        ep.user_id = user_id
+        self.store.save_episode(ep)
+        return ep
+    }
+
+    fn record_turn(self, episode_id: string, role: string, content: string,
+                   metadata: Optional[Dict[string, Any]]) {
+        let ep = self.store.load_episode(episode_id)
+        if ep == None {
+            return
+        }
+        ep.append_turn(role, content, metadata)
+        self.store.save_episode(ep)
+    }
+
+    fn finalize_episode(self, episode_id: string, summary: string,
+                        entities: List[string], claims: List[string],
+                        themes: List[string], outcome: string) {
+        let ep = self.store.load_episode(episode_id)
+        if ep == None {
+            return
+        }
+        ep.summary = summary
+        ep.entities = entities
+        ep.claims = claims
+        ep.running_themes = themes
+        ep.outcome = EpisodeOutcome(outcome)
+        ep.updated_at_ms = _now_ms()
+        self.store.save_episode(ep)
+    }
+
+    fn recall_similar_episodes(self, user_id: string, query: string,
+                               top_k: int) -> List[any] {
+        let results = self.store.search_episodes_semantic(user_id, query, top_k)
+        let episodes: List[ConversationEpisode] = []
+        for r in results {
+            episodes.append(r[0])
+        }
+        return episodes
+    }
+
+    fn get_or_create_user(self, user_id: string) -> UserModel {
+        let model = self.store.load_user_model(user_id)
+        if model == None {
+            model = UserModel(user_id)
+            self.store.save_user_model(model)
+        }
+        return model
+    }
+
+    fn update_user(self, model: UserModel) {
+        model.touch()
+        self.store.save_user_model(model)
+    }
+
+    fn get_or_create_goal(self, session_id: string) -> GoalState {
+        let goal = self.store.load_active_goal(session_id)
+        if goal == None {
+            goal = GoalState()
+            goal.session_id = session_id
+            self.store.save_goal(goal)
+        }
+        return goal
+    }
+
+    fn update_goal(self, goal: GoalState) {
+        goal.updated_at_ms = _now_ms()
+        self.store.save_goal(goal)
+    }
+
+    fn store_lesson(self, lesson: LessonRecord) {
+        self.store.save_lesson(lesson)
+    }
+
+    fn recall_relevant_lessons(self, user_id: string, query: string,
+                               top_k: int) -> List[any] {
+        let results = self.store.search_lessons_semantic(user_id, query, top_k)
+        let lessons: List[LessonRecord] = []
+        for r in results {
+            lessons.append(r[0])
+        }
+        return lessons
+    }
+
+    fn get_or_create_strategy(self, user_id: string) -> StrategyPolicySnapshot {
+        let snap = self.store.load_latest_snapshot(user_id)
+        if snap == None {
+            snap = StrategyPolicySnapshot()
+            snap.user_id = user_id
+            self.store.save_snapshot(snap)
+        }
+        return snap
+    }
+
+    fn save_strategy(self, snapshot: StrategyPolicySnapshot) {
+        self.store.save_snapshot(snapshot)
+    }
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export MetaStore, InMemoryMetaStore, RedisMetaStore
+export MetacognitionMemory

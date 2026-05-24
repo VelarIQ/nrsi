@@ -1,0 +1,2005 @@
+/// NRSI Web Retrieval Engine — PVS-4 live data access through NRSIP overlay.
+///
+/// Two-mode retrieval:
+///   1. Search API (Brave Search) for structured discovery
+///   2. Direct HTTP crawl for deep page reading
+///
+/// Complete conversion of `nrsip/web_retrieval.py`.
+
+module web_retrieval
+
+import time from "std/time"
+import re from "std/re"
+import hashlib from "std/hashlib"
+import os from "std/os"
+import logging from "std/logging"
+import httpx from "std/httpx"
+from urllib.parse import urlparse, parse_qs
+
+/// ── Constants ───────────────────────────────────────────────────────────
+
+let BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+let DDG_API_URL = "https://api.duckduckgo.com/"
+let USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+let ACADEMIC_UA = "PRISM-NRS/2.0 (https://velariq.ai; team@velariq.ai)"
+let MAX_CRAWL_BYTES = 200000
+let CRAWL_TIMEOUT = 8.0
+let SEARCH_TIMEOUT = 5.0
+
+let DOMAIN_SOURCE_MAP = {
+    "medical": ["pubmed", "openfda", "clinicaltrials"],
+    "legal": ["courtlistener", "congress"],
+    "science": ["arxiv", "semantic_scholar", "pubmed"],
+    "mathematics": ["wolfram", "oeis", "arxiv"],
+    "financial": ["fred", "sec_edgar", "world_bank"],
+    "history": ["wikipedia", "wikidata", "ddg_api"],
+    "geography": ["geonames", "nominatim", "wikidata"],
+    "technology": ["github", "stackexchange", "arxiv"],
+    "programming": ["github", "stackexchange", "arxiv"],
+    "news": ["newsapi", "gdelt", "wikinews"],
+    "general": ["ddg_api", "wikipedia", "wikidata"]
+}
+
+/// ── Data Types ──────────────────────────────────────────────────────────
+
+type SearchResult {
+    title: string,
+    url: string,
+    snippet: string,
+    source: string,
+    timestamp_ms: int
+}
+
+fn new_search_result(title: string, url: string, snippet: string, source: string) -> SearchResult {
+    return SearchResult {
+        title: title,
+        url: url,
+        snippet: snippet,
+        source: source,
+        timestamp_ms: int(time.time() * 1000)
+    }
+}
+
+type RetrievedFact {
+    text: string,
+    source_url: string,
+    confidence: float,
+    domain: string,
+    retrieval_method: string,
+    timestamp_ms: int,
+    content_hash: string
+}
+
+fn new_retrieved_fact(text: string, source_url: string, confidence: float, domain: string, retrieval_method: string) -> RetrievedFact {
+    let hash = hashlib.sha256(text.encode()).hexdigest()
+    let short_hash = hash[0:16]
+    return RetrievedFact {
+        text: text,
+        source_url: source_url,
+        confidence: confidence,
+        domain: domain,
+        retrieval_method: retrieval_method,
+        timestamp_ms: int(time.time() * 1000),
+        content_hash: short_hash
+    }
+}
+
+/// ── URL Helpers ─────────────────────────────────────────────────────────
+
+fn decode_ddg_url(raw: string) -> string {
+    if "uddg=" in raw {
+        let parsed = urlparse(raw)
+        let qs = parse_qs(parsed.query)
+        let targets = qs.get("uddg", [])
+        if len(targets) > 0 {
+            return unquote(targets[0])
+        }
+    }
+    if raw[0:2] == "//" {
+        return "https:" + raw
+    }
+    return raw
+}
+
+fn strip_html_tags(text: string) -> string {
+    return re.sub("<[^>]+>", "", text)
+}
+
+/// ── Domain Detection Signals ───────────────────────────────────────────
+
+let DOMAIN_SIGNALS = {
+    "medical": ["drug", "treatment", "disease", "symptom", "patient", "clinical",
+                 "therapy", "diagnosis", "vaccine", "cancer", "blood", "surgery",
+                 "hospital", "doctor", "dose", "pharmaceutical", "fda", "trial"],
+    "legal": ["law", "court", "judge", "ruling", "statute", "amendment",
+              "constitutional", "plaintiff", "defendant", "verdict", "legislation",
+              "legal", "attorney", "contract", "liability", "regulation"],
+    "science": ["atom", "molecule", "physics", "chemistry", "biology", "quantum",
+                "evolution", "genome", "experiment", "hypothesis", "theory",
+                "research", "electron", "gravity", "species", "cell"],
+    "mathematics": ["equation", "theorem", "proof", "integral", "derivative",
+                    "matrix", "algebra", "geometry", "probability", "sequence",
+                    "prime", "calculus", "polynomial"],
+    "financial": ["stock", "market", "gdp", "inflation", "economic", "interest rate",
+                  "federal reserve", "bond", "investment", "fiscal", "monetary",
+                  "trade", "recession", "employment", "revenue", "sec filing"],
+    "geography": ["country", "capital", "continent", "ocean", "mountain", "river",
+                  "population", "latitude", "longitude", "border", "region", "city"],
+    "technology": ["software", "algorithm", "database", "api", "cloud", "server",
+                   "encryption", "machine learning", "neural network", "code",
+                   "programming", "compiler", "framework", "docker", "kubernetes"],
+    "news": ["breaking", "today", "latest", "2026", "2025", "yesterday",
+             "announced", "reported", "official", "crisis", "election", "conflict"]
+}
+
+/// ── Query Cleaning ─────────────────────────────────────────────────────
+
+let TEMPORAL_FILLER = ["tonight", "today", "tomorrow", "yesterday", "now",
+    "right now", "currently", "lately", "recently",
+    "this morning", "this evening", "this afternoon",
+    "this week", "this month", "this year"]
+
+let SEARCH_STOP = ["a", "an", "the", "i", "me", "my", "we", "our", "you", "your",
+    "it", "its", "is", "am", "are", "was", "were", "be", "been",
+    "have", "has", "had", "do", "does", "did", "will", "shall",
+    "would", "could", "should", "can", "may", "might",
+    "for", "to", "of", "in", "on", "at", "by", "with", "from",
+    "and", "or", "but", "not", "so", "if", "then", "than",
+    "just", "really", "very", "quite", "some", "any", "all",
+    "about", "like", "also", "there", "here", "that", "this",
+    "get", "got", "make", "made", "think", "know", "good"]
+
+let QUESTION_PREFIXES = [
+    "what should i ", "what should we ", "what is the best ",
+    "what is ", "what are ", "what's ",
+    "how does ", "how do ", "how to ", "how can i ", "how can we ",
+    "how is ", "how are ",
+    "why is ", "why do ", "why does ", "why are ",
+    "tell me about ", "can you explain ", "explain ",
+    "describe ", "define ", "what do you know about ",
+    "is there ", "are there ", "does ", "do ",
+    "can you ", "could you ", "would you ",
+    "i want to know ", "i'd like to know "]
+
+fn kw_in_text(kw: string, text: string, text_words: List[string]) -> bool {
+    if " " in kw {
+        return kw in text
+    }
+    for w in text_words {
+        if w == kw {
+            return true
+        }
+    }
+    return false
+}
+
+fn detect_query_domain(query: string) -> string {
+    let ql = query.lower()
+    let ql_words = []
+    for w in ql.split() {
+        let bare = w.strip(".,;:!?\"'()-")
+        ql_words.append(bare)
+    }
+    let scores = {}
+    for domain in DOMAIN_SIGNALS {
+        let keywords = DOMAIN_SIGNALS[domain]
+        let c = 0
+        for kw in keywords {
+            if kw_in_text(kw, ql, ql_words) {
+                c += 1
+            }
+        }
+        if c > 0 {
+            scores[domain] = c
+        }
+    }
+    if len(scores) == 0 {
+        return "general"
+    }
+    let best_domain = "general"
+    let best_score = 0
+    for d in scores {
+        if scores[d] > best_score {
+            best_score = scores[d]
+            best_domain = d
+        }
+    }
+    return best_domain
+}
+
+fn clean_query_for_search(query: string) -> string {
+    let q = query.strip().rstrip("?!.")
+    let tokens = q.split()
+    let cleaned = []
+    for tok in tokens {
+        let bare = tok.strip(".,;:!?\"'()-").lower()
+        let is_filler = false
+        for filler in TEMPORAL_FILLER {
+            if bare == filler {
+                is_filler = true
+                break
+            }
+        }
+        if not is_filler {
+            cleaned.append(tok)
+        }
+    }
+    let result = " ".join(cleaned).strip()
+    if len(result) >= 3 {
+        return result
+    }
+    return query.strip()
+}
+
+fn core_topic_words(query: string) -> List[any] {
+    let cleaned = clean_query_for_search(query)
+    let words = []
+    for w in cleaned.split() {
+        if len(w) > 2 {
+            let is_stop = false
+            for sw in SEARCH_STOP {
+                if w == sw {
+                    is_stop = true
+                    break
+                }
+            }
+            if not is_stop {
+                words.append(w)
+            }
+        }
+    }
+    return words
+}
+
+fn fact_is_metadata(text: string) -> bool {
+    let low = text.lower().strip()
+    if re.match("^[\\w\\s]{2,40}\\s*[-–—]\\s*wikipedia", low) {
+        return true
+    }
+    if re.match("^\\d{4}-\\d{2}-\\d{2}", low) {
+        return true
+    }
+    let meta_prefixes = ["search results", "results for", "related topics",
+        "see also", "external links", "jump to", "from wikipedia",
+        "category:", "template:", "portal:", "file:", "talk:"]
+    for prefix in meta_prefixes {
+        if low[0:len(prefix)] == prefix {
+            return true
+        }
+    }
+    if len(low) < 30 and " - " in low {
+        return true
+    }
+    return false
+}
+
+fn fact_relevant_to_topic(fact_text: string, topic_words: List[string]) -> bool {
+    if len(topic_words) == 0 {
+        return true
+    }
+    let fl = fact_text.lower()
+    let hits = 0
+    for w in topic_words {
+        if w in fl {
+            hits += 1
+        }
+    }
+    return hits >= 1
+}
+
+/// ── Confidence by Source ────────────────────────────────────────────────
+
+let CONFIDENCE_BY_SOURCE = {
+    "pubmed": 0.90, "clinicaltrials": 0.88, "openfda": 0.88,
+    "arxiv": 0.85, "semantic_scholar": 0.85,
+    "courtlistener": 0.88, "congress": 0.85,
+    "fred": 0.90, "world_bank": 0.85, "sec_edgar": 0.85,
+    "wolfram_short": 0.90, "wolfram_full": 0.88,
+    "wikipedia": 0.75, "wikidata": 0.80,
+    "geonames": 0.85, "oeis": 0.90,
+    "stackexchange": 0.70, "newsapi": 0.70,
+    "ddg_api_abstract": 0.72, "ddg_api_topic": 0.65
+}
+
+/// ── Web Retrieval Engine ───────────────────────────────────────────────
+
+class WebRetrievalEngine {
+    fn __init__(self, api_key: string = "", wolfram_id: string = "", http_client: Optional[any] = None) {
+        let brave_key = os.environ.get("BRAVE_SEARCH_API_KEY", "")
+        let wolf_key = os.environ.get("WOLFRAM_APP_ID", "")
+        if api_key != "" {
+            self._api_key = api_key
+        } else {
+            self._api_key = brave_key
+        }
+        if wolfram_id != "" {
+            self._wolfram_id = wolfram_id
+        } else {
+            self._wolfram_id = wolf_key
+        }
+        self._client = http_client
+        self._search_count = 0
+        self._crawl_count = 0
+        self._failures = 0
+    }
+
+    fn _get_client(self) -> any {
+        if self._client == None {
+            self._client = httpx.Client(
+                timeout: CRAWL_TIMEOUT,
+                headers: {"User-Agent": USER_AGENT},
+                follow_redirects: true
+            )
+        }
+        return self._client
+    }
+
+    fn _src_client(self) -> any {
+        return httpx.Client(
+            timeout: SEARCH_TIMEOUT,
+            follow_redirects: true,
+            headers: {"User-Agent": ACADEMIC_UA}
+        )
+    }
+
+    /// ── Main Search Cascade ────────────────────────────────────────────
+
+    fn search(self, query: string, count: int, locale: string) -> List[any] {
+        self._search_count += 1
+
+        if self._api_key != "" {
+            let results = self._brave_search(query, count, locale)
+            if len(results) > 0 {
+                return results
+            }
+        }
+
+        let results = self._ddg_api_search(query, count)
+        if len(results) > 0 {
+            return results
+        }
+
+        let results = self._fallback_search(query, count, locale)
+        if len(results) > 0 {
+            return results
+        }
+
+        return self._wikipedia_search(query, count)
+    }
+
+    /// ── Brave Search ───────────────────────────────────────────────────
+
+    fn _brave_search(self, query: string, count: int, locale: string) -> List[any] {
+        let client = self._get_client()
+        try {
+            let params = {"q": query, "count": count, "text_decorations": false}
+            if locale != "" {
+                let parts = locale.split("-")
+                let lang = parts[0]
+                params["search_lang"] = lang
+                if len(parts) > 1 {
+                    let country = parts[1].upper()
+                    params["country"] = country
+                }
+            }
+            let resp = client.get(
+                BRAVE_SEARCH_URL,
+                params: params,
+                headers: {"X-Subscription-Token": self._api_key, "Accept": "application/json"},
+                timeout: SEARCH_TIMEOUT
+            )
+            resp.raise_for_status()
+            let data = resp.json()
+
+            let results = []
+            let web_results = data.get("web", {}).get("results", [])
+            let idx = 0
+            for item in web_results {
+                if idx >= count {
+                    break
+                }
+                results.append(new_search_result(
+                    item.get("title", ""),
+                    item.get("url", ""),
+                    item.get("description", ""),
+                    "brave_search"
+                ))
+                idx += 1
+            }
+            return results
+        } catch(e) {
+            logging.warning("Brave search failed: " + str(e) + ", falling back")
+            self._failures += 1
+            return []
+        }
+    }
+
+    /// ── DDG API Search ─────────────────────────────────────────────────
+
+    fn _ddg_api_search(self, query: string, count: int) -> List[any] {
+        let client = self._get_client()
+        try {
+            let resp = client.get(DDG_API_URL, params: {
+                "q": query, "format": "json", "no_html": "1",
+                "skip_disambig": "1", "no_redirect": "1"
+            }, timeout: SEARCH_TIMEOUT)
+            if resp.status_code != 200 {
+                return []
+            }
+            let data = resp.json()
+            let results = []
+
+            let abstract = data.get("Abstract", "")
+            let abstract_url = data.get("AbstractURL", "")
+            let abstract_source = data.get("AbstractSource", "")
+            if abstract != "" and len(abstract) > 30 {
+                let title = query
+                if abstract_source != "" {
+                    title = abstract_source + ": " + data.get("Heading", query)
+                }
+                let url = abstract_url
+                if url == "" {
+                    url = "https://duckduckgo.com/?q=" + query
+                }
+                results.append(new_search_result(
+                    title, url, abstract[0:500], "ddg_api_abstract"
+                ))
+            }
+
+            let answer = data.get("Answer", "")
+            if answer != "" and len(answer) > 20 {
+                results.append(new_search_result(
+                    "DDG Answer: " + query,
+                    "https://duckduckgo.com/?q=" + query,
+                    answer[0:500],
+                    "ddg_api_answer"
+                ))
+            }
+
+            let topics = data.get("RelatedTopics", [])
+            let tidx = 0
+            for topic in topics {
+                if tidx >= count {
+                    break
+                }
+                if typeof(topic) == "dict" {
+                    let text = topic.get("Text", "")
+                    let url = topic.get("FirstURL", "")
+                    if text != "" and len(text) > 30 and url != "" {
+                        let title = text[0:80]
+                        if " - " in text {
+                            title = text.split(" - ")[0][0:80]
+                        }
+                        results.append(new_search_result(
+                            title, url, text[0:500], "ddg_api_topic"
+                        ))
+                    }
+                    let subtopics = topic.get("Topics", [])
+                    for sub in subtopics {
+                        if typeof(sub) == "dict" and sub.get("Text") != "" {
+                            results.append(new_search_result(
+                                sub.get("Text", "")[0:80],
+                                sub.get("FirstURL", ""),
+                                sub.get("Text", "")[0:500],
+                                "ddg_api_subtopic"
+                            ))
+                        }
+                    }
+                }
+                tidx += 1
+            }
+
+            return results[0:count]
+        } catch(e) {
+            logging.debug("DDG API search failed: " + str(e))
+            return []
+        }
+    }
+
+    /// ── Wolfram Alpha ──────────────────────────────────────────────────
+
+    fn _wolfram_search(self, query: string, count: int) -> List[any] {
+        if self._wolfram_id == "" {
+            return []
+        }
+        try {
+            let wa_client = httpx.Client(timeout: SEARCH_TIMEOUT, follow_redirects: true)
+            try {
+                let short_resp = wa_client.get(
+                    "https://api.wolframalpha.com/v1/result",
+                    params: {"appid": self._wolfram_id, "i": query}
+                )
+                let short_answer = ""
+                if short_resp.status_code == 200 {
+                    short_answer = short_resp.text.strip()
+                }
+
+                let full_resp = wa_client.get(
+                    "https://api.wolframalpha.com/v2/query",
+                    params: {
+                        "appid": self._wolfram_id, "input": query,
+                        "format": "plaintext", "output": "json"
+                    }
+                )
+                let results = []
+
+                if short_answer != "" and len(short_answer) > 5 {
+                    results.append(new_search_result(
+                        "Wolfram|Alpha: " + query[0:60],
+                        "https://www.wolframalpha.com/input?i=" + query,
+                        short_answer[0:500],
+                        "wolfram_short"
+                    ))
+                }
+
+                if full_resp.status_code == 200 {
+                    let data = full_resp.json()
+                    let pods = data.get("queryresult", {}).get("pods", [])
+                    for pod in pods {
+                        let pod_title = pod.get("title", "")
+                        if pod_title.lower() == "input" or pod_title.lower() == "input interpretation" {
+                            continue
+                        }
+                        let subpods = pod.get("subpods", [])
+                        for subpod in subpods {
+                            let plaintext = subpod.get("plaintext", "")
+                            if plaintext != "" and len(plaintext) > 10 {
+                                results.append(new_search_result(
+                                    "Wolfram|Alpha (" + pod_title + ")",
+                                    "https://www.wolframalpha.com/input?i=" + query,
+                                    plaintext[0:500],
+                                    "wolfram_full"
+                                ))
+                                if len(results) >= count {
+                                    break
+                                }
+                            }
+                        }
+                        if len(results) >= count {
+                            break
+                        }
+                    }
+                }
+
+                return results[0:count]
+            } catch(inner_err) {
+                wa_client.close()
+                raise inner_err
+            }
+        } catch(e) {
+            logging.debug("Wolfram search failed: " + str(e))
+            return []
+        }
+    }
+
+    /// ── DDG HTML Fallback ──────────────────────────────────────────────
+
+    fn _fallback_search(self, query: string, count: int, locale: string) -> List[any] {
+        let client = self._get_client()
+        let params = {"q": query}
+        if locale != "" {
+            params["kl"] = locale.replace("-", "_")
+        }
+
+        let attempt = 0
+        while attempt < 3 {
+            try {
+                let resp = client.get(
+                    "https://html.duckduckgo.com/html/",
+                    params: params,
+                    headers: {"User-Agent": USER_AGENT},
+                    timeout: SEARCH_TIMEOUT
+                )
+                if resp.status_code == 202 {
+                    time.sleep(1.5 * (attempt + 1))
+                    attempt += 1
+                    continue
+                }
+                resp.raise_for_status()
+                let html = resp.text
+
+                let results = []
+                let matches = re.finditer(
+                    "<a rel=\"nofollow\" class=\"result__a\" href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?" +
+                    "<a class=\"result__snippet\"[^>]*>(.*?)</a>",
+                    html, re.DOTALL
+                )
+                for match in matches {
+                    if len(results) >= count {
+                        break
+                    }
+                    let raw_url = match.group(1)
+                    let url = decode_ddg_url(raw_url)
+                    let title = strip_html_tags(match.group(2)).strip()
+                    let snippet = strip_html_tags(match.group(3)).strip()
+                    if url != "" and title != "" {
+                        results.append(new_search_result(
+                            title, url, snippet, "duckduckgo_html"
+                        ))
+                    }
+                }
+                if len(results) > 0 {
+                    return results
+                }
+                time.sleep(0.5 * (attempt + 1))
+            } catch(e) {
+                if attempt >= 2 {
+                    logging.warning("Fallback search failed after 3 attempts: " + str(e))
+                    self._failures += 1
+                    return []
+                }
+                time.sleep(0.5)
+            }
+            attempt += 1
+        }
+        return []
+    }
+
+    /// ── Wikipedia Search ───────────────────────────────────────────────
+
+    fn _wikipedia_search(self, query: string, count: int) -> List[any] {
+        try {
+            let wiki_ua = "PRISM-NRS/2.0 (https://velariq.ai; team@velariq.ai)"
+            let wc = httpx.Client(timeout: SEARCH_TIMEOUT, headers: {"User-Agent": wiki_ua})
+            try {
+                let resp = wc.get("https://en.wikipedia.org/w/api.php", params: {
+                    "action": "query", "list": "search", "srsearch": query,
+                    "format": "json", "srlimit": count, "utf8": "1"
+                })
+                if resp.status_code != 200 {
+                    wc.close()
+                    return []
+                }
+                let data = resp.json()
+                let items = data.get("query", {}).get("search", [])
+                let results = []
+                let idx = 0
+                for item in items {
+                    if idx >= count {
+                        break
+                    }
+                    let title = item.get("title", "")
+                    let snippet = strip_html_tags(item.get("snippet", "")).strip()
+                    let url = "https://en.wikipedia.org/wiki/" + title.replace(" ", "_")
+                    if title != "" and snippet != "" {
+                        results.append(new_search_result(title, url, snippet, "wikipedia"))
+                    }
+                    idx += 1
+                }
+
+                let enrich_idx = 0
+                for sr in results {
+                    if enrich_idx >= 2 {
+                        break
+                    }
+                    try {
+                        let summary = wc.get(
+                            "https://en.wikipedia.org/api/rest_v1/page/summary/" + sr.title.replace(" ", "_")
+                        )
+                        if summary.status_code == 200 {
+                            let extract = summary.json().get("extract", "")
+                            if extract != "" and len(extract) > len(sr.snippet) {
+                                sr.snippet = extract[0:500]
+                            }
+                        }
+                    } catch(inner_err) {
+                        pass
+                    }
+                    enrich_idx += 1
+                }
+
+                wc.close()
+                return results
+            } catch(inner_err) {
+                wc.close()
+                return []
+            }
+        } catch(e) {
+            logging.warning("Wikipedia search failed: " + str(e))
+            return []
+        }
+    }
+
+    /// ── Domain-Specific Sources ────────────────────────────────────────
+
+    fn _pubmed_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let sr = c.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+                    params: {"db": "pubmed", "term": query, "retmax": count,
+                             "retmode": "json", "sort": "relevance"})
+                if sr.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let ids = sr.json().get("esearchresult", {}).get("idlist", [])
+                if len(ids) == 0 {
+                    c.close()
+                    return []
+                }
+                let detail = c.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+                    params: {"db": "pubmed", "id": ",".join(ids), "retmode": "json"})
+                if detail.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let idx = 0
+                for uid in ids {
+                    if idx >= count {
+                        break
+                    }
+                    let doc = detail.json().get("result", {}).get(uid, {})
+                    let title = doc.get("title", "")
+                    let snippet = title + ". " + doc.get("source", "") + " (" + doc.get("pubdate", "") + ")."
+                    let authors_list = doc.get("authors", [])
+                    if len(authors_list) > 0 {
+                        let author_names = []
+                        let ai = 0
+                        for a in authors_list {
+                            if ai >= 3 { break }
+                            author_names.append(a.get("name", ""))
+                            ai += 1
+                        }
+                        snippet = snippet + " Authors: " + ", ".join(author_names) + "."
+                    }
+                    results.append(new_search_result(
+                        title, "https://pubmed.ncbi.nlm.nih.gov/" + uid + "/",
+                        snippet[0:500], "pubmed"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("PubMed search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _openfda_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let limit = count
+                if limit > 5 { limit = 5 }
+                let resp = c.get("https://api.fda.gov/drug/label.json",
+                    params: {"search": query, "limit": limit})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let items = resp.json().get("results", [])
+                let idx = 0
+                for item in items {
+                    if idx >= count { break }
+                    let brand = item.get("openfda", {}).get("brand_name", [""])
+                    let generic = item.get("openfda", {}).get("generic_name", [""])
+                    let name = ""
+                    if len(brand) > 0 and brand[0] != "" {
+                        name = brand[0]
+                    } else if len(generic) > 0 {
+                        name = generic[0]
+                    }
+                    let purpose = " ".join(item.get("purpose", []))[0:200]
+                    let warnings = " ".join(item.get("warnings", []))[0:200]
+                    let snippet = (name + ": " + purpose + " " + warnings).strip()
+                    results.append(new_search_result(
+                        "FDA: " + name, "https://open.fda.gov/",
+                        snippet[0:500], "openfda"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("OpenFDA search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _clinicaltrials_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let page_size = count
+                if page_size > 10 { page_size = 10 }
+                let resp = c.get("https://clinicaltrials.gov/api/v2/studies",
+                    params: {"query.term": query, "pageSize": page_size, "format": "json"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let studies = resp.json().get("studies", [])
+                let idx = 0
+                for study in studies {
+                    if idx >= count { break }
+                    let proto = study.get("protocolSection", {})
+                    let ident = proto.get("identificationModule", {})
+                    let title = ident.get("briefTitle", "")
+                    if title == "" {
+                        title = ident.get("officialTitle", "")
+                    }
+                    let nct = ident.get("nctId", "")
+                    let status = proto.get("statusModule", {}).get("overallStatus", "")
+                    let desc = proto.get("descriptionModule", {}).get("briefSummary", "")[0:300]
+                    let snippet = title + ". Status: " + status + ". " + desc
+                    results.append(new_search_result(
+                        "Trial " + nct + ": " + title[0:80],
+                        "https://clinicaltrials.gov/study/" + nct,
+                        snippet[0:500], "clinicaltrials"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("ClinicalTrials search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _arxiv_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let resp = c.get("http://export.arxiv.org/api/query",
+                    params: {"search_query": "all:" + query, "max_results": count, "sortBy": "relevance"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let entries = re.finditer("<entry>(.*?)</entry>", resp.text, re.DOTALL)
+                for entry in entries {
+                    let block = entry.group(1)
+                    let title_match = re.search("<title>(.*?)</title>", block, re.DOTALL)
+                    let summary_match = re.search("<summary>(.*?)</summary>", block, re.DOTALL)
+                    let link_match = re.search("<id>(.*?)</id>", block)
+                    if title_match != None and summary_match != None {
+                        let t = re.sub("\\s+", " ", title_match.group(1)).strip()
+                        let s = re.sub("\\s+", " ", summary_match.group(1)).strip()[0:400]
+                        let url = ""
+                        if link_match != None {
+                            url = link_match.group(1).strip()
+                        }
+                        results.append(new_search_result(t, url, s, "arxiv"))
+                    }
+                }
+                c.close()
+                return results[0:count]
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("arXiv search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _semantic_scholar_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let limit = count
+                if limit > 10 { limit = 10 }
+                let resp = c.get("https://api.semanticscholar.org/graph/v1/paper/search",
+                    params: {"query": query, "limit": limit,
+                             "fields": "title,abstract,year,citationCount,url"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let papers = resp.json().get("data", [])
+                let idx = 0
+                for paper in papers {
+                    if idx >= count { break }
+                    let title = paper.get("title", "")
+                    let abstract = paper.get("abstract", "")
+                    if abstract == None { abstract = "" }
+                    abstract = abstract[0:400]
+                    let year = str(paper.get("year", ""))
+                    let cites = str(paper.get("citationCount", 0))
+                    let snippet = title + " (" + year + ", " + cites + " citations). " + abstract
+                    results.append(new_search_result(
+                        title, paper.get("url", ""),
+                        snippet[0:500], "semantic_scholar"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("Semantic Scholar search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _oeis_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let resp = c.get("https://oeis.org/search", params: {"q": query, "fmt": "json"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let seqs = resp.json().get("results", [])
+                let idx = 0
+                for seq in seqs {
+                    if idx >= count { break }
+                    let name = seq.get("name", "")
+                    let number = seq.get("number", 0)
+                    let data_vals = seq.get("data", [])
+                    let data_strs = []
+                    let di = 0
+                    for x in data_vals {
+                        if di >= 15 { break }
+                        data_strs.append(str(x))
+                        di += 1
+                    }
+                    let data = ",".join(data_strs)
+                    let num_str = str(number)
+                    while len(num_str) < 6 { num_str = "0" + num_str }
+                    let snippet = "A" + num_str + ": " + name + ". Sequence: " + data
+                    results.append(new_search_result(
+                        "OEIS A" + num_str + ": " + name[0:60],
+                        "https://oeis.org/A" + num_str,
+                        snippet[0:500], "oeis"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("OEIS search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _courtlistener_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let page_size = count
+                if page_size > 10 { page_size = 10 }
+                let resp = c.get("https://www.courtlistener.com/api/rest/v4/search/",
+                    params: {"q": query, "type": "o", "format": "json", "page_size": page_size})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let items = resp.json().get("results", [])
+                let idx = 0
+                for item in items {
+                    if idx >= count { break }
+                    let case_name = item.get("caseName", "")
+                    let court = item.get("court", "")
+                    let date = item.get("dateFiled", "")
+                    let snippet_text = strip_html_tags(item.get("snippet", ""))
+                    let snippet = case_name + " (" + court + ", " + date + "). " + snippet_text
+                    results.append(new_search_result(
+                        case_name + " (" + date + ")",
+                        "https://www.courtlistener.com" + item.get("absolute_url", ""),
+                        snippet[0:500], "courtlistener"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("CourtListener search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _congress_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let limit = count
+                if limit > 10 { limit = 10 }
+                let resp = c.get("https://api.congress.gov/v3/bill",
+                    params: {"query": query, "limit": limit, "format": "json"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let bills = resp.json().get("bills", [])
+                let idx = 0
+                for bill in bills {
+                    if idx >= count { break }
+                    let title = bill.get("title", "")
+                    let number = bill.get("number", "")
+                    let congress = str(bill.get("congress", ""))
+                    let btype = bill.get("type", "")
+                    let action = bill.get("latestAction", {}).get("text", "")
+                    let snippet = btype + number + " (" + congress + "th Congress): " + title + ". Latest: " + action
+                    let url = bill.get("url", "")
+                    if url == "" {
+                        url = "https://congress.gov/bill/" + congress + "th-congress/" + btype.lower() + "/" + number
+                    }
+                    results.append(new_search_result(
+                        btype + number + ": " + title[0:80],
+                        url, snippet[0:500], "congress"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("Congress.gov search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _fred_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let limit = count
+                if limit > 10 { limit = 10 }
+                let resp = c.get("https://api.stlouisfed.org/fred/series/search",
+                    params: {"search_text": query, "limit": limit, "file_type": "json",
+                             "api_key": os.environ.get("FRED_API_KEY", "")})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let seriess = resp.json().get("seriess", [])
+                let idx = 0
+                for series in seriess {
+                    if idx >= count { break }
+                    let sid = series.get("id", "")
+                    let title = series.get("title", "")
+                    let freq = series.get("frequency", "")
+                    let notes = series.get("notes", "")
+                    if notes == None { notes = "" }
+                    notes = notes[0:200]
+                    let snippet = title + " (" + freq + "). " + notes
+                    results.append(new_search_result(
+                        "FRED " + sid + ": " + title[0:80],
+                        "https://fred.stlouisfed.org/series/" + sid,
+                        snippet[0:500], "fred"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("FRED search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _world_bank_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let limit = count
+                if limit > 10 { limit = 10 }
+                let resp = c.get("https://api.worldbank.org/v2/indicator",
+                    params: {"format": "json", "per_page": limit, "source": "2"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let data = resp.json()
+                let indicators = []
+                if typeof(data) == "list" and len(data) > 1 {
+                    indicators = data[1]
+                }
+                let q_lower = query.lower()
+                let q_words = []
+                for w in q_lower.split() {
+                    if len(w) > 3 {
+                        q_words.append(w)
+                    }
+                }
+                let matched = []
+                for ind in indicators {
+                    let combined = (ind.get("name", "") + ind.get("sourceNote", "")).lower()
+                    for w in q_words {
+                        if w in combined {
+                            matched.append(ind)
+                            break
+                        }
+                    }
+                }
+                let results = []
+                let idx = 0
+                for ind in matched {
+                    if idx >= count { break }
+                    let name = ind.get("name", "")
+                    let note = ind.get("sourceNote", "")
+                    if note == None { note = "" }
+                    note = note[0:300]
+                    let iid = ind.get("id", "")
+                    let snippet = name + ". " + note
+                    results.append(new_search_result(
+                        "World Bank: " + name[0:80],
+                        "https://data.worldbank.org/indicator/" + iid,
+                        snippet[0:500], "world_bank"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("World Bank search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _geonames_search(self, query: string, count: int) -> List[any] {
+        try {
+            let username = os.environ.get("GEONAMES_USER", "demo")
+            let c = self._src_client()
+            try {
+                let max_rows = count
+                if max_rows > 10 { max_rows = 10 }
+                let resp = c.get("http://api.geonames.org/searchJSON",
+                    params: {"q": query, "maxRows": max_rows, "username": username, "style": "FULL"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let geonames = resp.json().get("geonames", [])
+                let idx = 0
+                for geo in geonames {
+                    if idx >= count { break }
+                    let name = geo.get("name", "")
+                    let country = geo.get("countryName", "")
+                    let pop = geo.get("population", 0)
+                    let feature = geo.get("fclName", "")
+                    let lat = str(geo.get("lat", ""))
+                    let lng = str(geo.get("lng", ""))
+                    let snippet = name + ", " + country + ". Type: " + feature + ". Population: " + str(pop) + ". Coords: " + lat + ", " + lng + "."
+                    results.append(new_search_result(
+                        name + ", " + country,
+                        "https://www.geonames.org/" + str(geo.get("geonameId", "")),
+                        snippet[0:500], "geonames"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("GeoNames search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _wikidata_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let limit = count
+                if limit > 10 { limit = 10 }
+                let resp = c.get("https://www.wikidata.org/w/api.php",
+                    params: {"action": "wbsearchentities", "search": query,
+                             "language": "en", "limit": limit, "format": "json"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let entities = resp.json().get("search", [])
+                let idx = 0
+                for entity in entities {
+                    if idx >= count { break }
+                    let label = entity.get("label", "")
+                    let desc = entity.get("description", "")
+                    let qid = entity.get("id", "")
+                    let snippet = label + ": " + desc
+                    results.append(new_search_result(
+                        "Wikidata " + qid + ": " + label,
+                        "https://www.wikidata.org/wiki/" + qid,
+                        snippet[0:500], "wikidata"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("Wikidata search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _stackexchange_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let page_size = count
+                if page_size > 10 { page_size = 10 }
+                let resp = c.get("https://api.stackexchange.com/2.3/search/excerpts",
+                    params: {"q": query, "pagesize": page_size, "order": "desc",
+                             "sort": "relevance", "site": "stackoverflow"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let items = resp.json().get("items", [])
+                let idx = 0
+                for item in items {
+                    if idx >= count { break }
+                    let title = strip_html_tags(item.get("title", ""))
+                    let body = strip_html_tags(item.get("excerpt", ""))[0:300]
+                    let snippet = title + ". " + body
+                    results.append(new_search_result(
+                        title,
+                        "https://stackoverflow.com/q/" + str(item.get("question_id", "")),
+                        snippet[0:500], "stackexchange"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("StackExchange search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _sec_edgar_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let resp = c.get("https://efts.sec.gov/LATEST/search-index",
+                    params: {"q": query, "dateRange": "custom",
+                             "startdt": "2024-01-01", "forms": "10-K,10-Q,8-K"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let hits = resp.json().get("hits", {}).get("hits", [])
+                let idx = 0
+                for hit in hits {
+                    if idx >= count { break }
+                    let src = hit.get("_source", {})
+                    let name = src.get("entity_name", "")
+                    let form = src.get("form_type", "")
+                    let date = src.get("file_date", "")
+                    let snippet = name + " filed " + form + " on " + date + "."
+                    results.append(new_search_result(
+                        "SEC " + form + ": " + name,
+                        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company=" + name,
+                        snippet[0:500], "sec_edgar"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("SEC EDGAR search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _newsapi_search(self, query: string, count: int) -> List[any] {
+        let news_api_key = os.environ.get("NEWS_API_KEY", "")
+        if news_api_key == "" {
+            return []
+        }
+        try {
+            let c = self._src_client()
+            try {
+                let page_size = count
+                if page_size > 10 { page_size = 10 }
+                let resp = c.get("https://newsapi.org/v2/everything",
+                    params: {"q": query, "pageSize": page_size, "sortBy": "relevancy",
+                             "language": "en", "apiKey": news_api_key})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let articles = resp.json().get("articles", [])
+                let idx = 0
+                for article in articles {
+                    if idx >= count { break }
+                    let title = article.get("title", "")
+                    let desc = article.get("description", "")
+                    if desc == None { desc = "" }
+                    let source_name = article.get("source", {}).get("name", "")
+                    let pub = article.get("publishedAt", "")[0:10]
+                    let snippet = "[" + source_name + ", " + pub + "] " + title + ". " + desc
+                    results.append(new_search_result(
+                        title, article.get("url", ""),
+                        snippet[0:500], "newsapi"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("NewsAPI search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _github_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let per_page = count
+                if per_page > 10 { per_page = 10 }
+                let resp = c.get("https://api.github.com/search/repositories",
+                    params: {"q": query, "per_page": per_page, "sort": "stars", "order": "desc"},
+                    headers: {"Accept": "application/vnd.github+json"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let repos = resp.json().get("items", [])
+                let idx = 0
+                for repo in repos {
+                    if idx >= count { break }
+                    let name = repo.get("full_name", "")
+                    let desc = repo.get("description", "")
+                    if desc == None { desc = "" }
+                    let stars = repo.get("stargazers_count", 0)
+                    let lang = repo.get("language", "")
+                    if lang == None { lang = "" }
+                    let snippet = name + " (" + lang + ", " + str(stars) + " stars). " + desc
+                    results.append(new_search_result(
+                        name, repo.get("html_url", ""),
+                        snippet[0:500], "github"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("GitHub search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _nominatim_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let limit = count
+                if limit > 10 { limit = 10 }
+                let resp = c.get("https://nominatim.openstreetmap.org/search",
+                    params: {"q": query, "format": "json", "limit": limit, "addressdetails": "1"})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let places = resp.json()
+                let idx = 0
+                for place in places {
+                    if idx >= count { break }
+                    let name = place.get("display_name", "")
+                    let ptype = place.get("type", "")
+                    let lat = str(place.get("lat", ""))
+                    let lon = str(place.get("lon", ""))
+                    let snippet = name + ". Type: " + ptype + ". Coords: " + lat + ", " + lon + "."
+                    let osm_id = str(place.get("osm_id", ""))
+                    let osm_type = place.get("osm_type", "node")
+                    results.append(new_search_result(
+                        name[0:120],
+                        "https://www.openstreetmap.org/" + osm_type + "/" + osm_id,
+                        snippet[0:500], "nominatim"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("Nominatim search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _gdelt_search(self, query: string, count: int) -> List[any] {
+        try {
+            let c = self._src_client()
+            try {
+                let max_records = count
+                if max_records > 10 { max_records = 10 }
+                let resp = c.get("https://api.gdeltproject.org/api/v2/doc/doc",
+                    params: {"query": query, "mode": "artlist", "format": "json", "maxrecords": max_records})
+                if resp.status_code != 200 {
+                    c.close()
+                    return []
+                }
+                let results = []
+                let articles = resp.json().get("articles", [])
+                let idx = 0
+                for article in articles {
+                    if idx >= count { break }
+                    let title = article.get("title", "")
+                    let url = article.get("url", "")
+                    let source_name = article.get("domain", "")
+                    let date = article.get("seendate", "")[0:10]
+                    let lang = article.get("language", "")
+                    let snippet = "[" + source_name + ", " + date + "] " + title + ". Language: " + lang
+                    results.append(new_search_result(
+                        title[0:120], url, snippet[0:500], "gdelt"
+                    ))
+                    idx += 1
+                }
+                c.close()
+                return results
+            } catch(inner_err) {
+                c.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("GDELT search failed: " + str(e))
+            return []
+        }
+    }
+
+    fn _wikinews_search(self, query: string, count: int) -> List[any] {
+        try {
+            let wiki_ua = "PRISM-NRS/2.0 (https://velariq.ai; team@velariq.ai)"
+            let wc = httpx.Client(timeout: SEARCH_TIMEOUT, headers: {"User-Agent": wiki_ua})
+            try {
+                let sr_limit = count
+                if sr_limit > 10 { sr_limit = 10 }
+                let resp = wc.get("https://en.wikinews.org/w/api.php", params: {
+                    "action": "query", "list": "search", "srsearch": query,
+                    "format": "json", "srlimit": sr_limit, "utf8": "1"
+                })
+                if resp.status_code != 200 {
+                    wc.close()
+                    return []
+                }
+                let results = []
+                let items = resp.json().get("query", {}).get("search", [])
+                let idx = 0
+                for item in items {
+                    if idx >= count { break }
+                    let title = item.get("title", "")
+                    let snippet = strip_html_tags(item.get("snippet", "")).strip()
+                    let url = "https://en.wikinews.org/wiki/" + title.replace(" ", "_")
+                    if title != "" {
+                        results.append(new_search_result(title, url, snippet[0:500], "wikinews"))
+                    }
+                    idx += 1
+                }
+                wc.close()
+                return results
+            } catch(inner_err) {
+                wc.close()
+                return []
+            }
+        } catch(e) {
+            logging.debug("Wikinews search failed: " + str(e))
+            return []
+        }
+    }
+
+    /// ── Domain-Aware Router ────────────────────────────────────────────
+
+    fn _dispatch_source(self, src_name: string, query: string, per_source: int) -> List[any] {
+        if src_name == "pubmed" { return self._pubmed_search(query, per_source) }
+        if src_name == "openfda" { return self._openfda_search(query, per_source) }
+        if src_name == "clinicaltrials" { return self._clinicaltrials_search(query, per_source) }
+        if src_name == "arxiv" { return self._arxiv_search(query, per_source) }
+        if src_name == "semantic_scholar" { return self._semantic_scholar_search(query, per_source) }
+        if src_name == "oeis" { return self._oeis_search(query, per_source) }
+        if src_name == "courtlistener" { return self._courtlistener_search(query, per_source) }
+        if src_name == "congress" { return self._congress_search(query, per_source) }
+        if src_name == "fred" { return self._fred_search(query, per_source) }
+        if src_name == "world_bank" { return self._world_bank_search(query, per_source) }
+        if src_name == "geonames" { return self._geonames_search(query, per_source) }
+        if src_name == "wikidata" { return self._wikidata_search(query, per_source) }
+        if src_name == "stackexchange" { return self._stackexchange_search(query, per_source) }
+        if src_name == "sec_edgar" { return self._sec_edgar_search(query, per_source) }
+        if src_name == "newsapi" { return self._newsapi_search(query, per_source) }
+        if src_name == "wolfram" { return self._wolfram_search(query, per_source) }
+        if src_name == "wikipedia" { return self._wikipedia_search(query, per_source) }
+        if src_name == "ddg_api" { return self._ddg_api_search(query, per_source) }
+        if src_name == "github" { return self._github_search(query, per_source) }
+        if src_name == "nominatim" { return self._nominatim_search(query, per_source) }
+        if src_name == "gdelt" { return self._gdelt_search(query, per_source) }
+        if src_name == "wikinews" { return self._wikinews_search(query, per_source) }
+        return []
+    }
+
+    fn domain_search(self, query: string, domain: string, count: int) -> List[any] {
+        let detected = domain
+        if detected == "" {
+            detected = detect_query_domain(query)
+        }
+        let source_names = DOMAIN_SOURCE_MAP.get(detected, DOMAIN_SOURCE_MAP["general"])
+
+        let per_source = count / len(source_names)
+        if per_source < 2 { per_source = 2 }
+
+        let all_results = []
+        for src_name in source_names {
+            let batch = self._dispatch_source(src_name, query, per_source)
+            for r in batch {
+                all_results.append(r)
+            }
+        }
+
+        let seen = {}
+        let deduped = []
+        for r in all_results {
+            let key = r.snippet[0:80].lower()
+            if key not in seen {
+                seen[key] = true
+                deduped.append(r)
+            }
+        }
+
+        return deduped[0:count]
+    }
+
+    /// ── Crawl & Text Extraction ────────────────────────────────────────
+
+    fn crawl(self, url: string) -> Optional[string] {
+        self._crawl_count += 1
+        let client = self._get_client()
+        try {
+            let resp = client.get(url, timeout: CRAWL_TIMEOUT)
+            resp.raise_for_status()
+            let content_type = resp.headers.get("content-type", "")
+            if "text/html" not in content_type and "text/plain" not in content_type {
+                return None
+            }
+            let raw = resp.text[0:MAX_CRAWL_BYTES]
+            return self._extract_text(raw)
+        } catch(e) {
+            logging.warning("Crawl failed for " + url + ": " + str(e))
+            self._failures += 1
+            return None
+        }
+    }
+
+    fn _extract_text(self, html: string) -> string {
+        let text = html
+        text = re.sub("<script[^>]*>.*?</script>", "", text, flags: re.DOTALL)
+        text = re.sub("<style[^>]*>.*?</style>", "", text, flags: re.DOTALL)
+        text = re.sub("<[^>]+>", " ", text)
+        text = re.sub("\\s+", " ", text).strip()
+
+        let lines = []
+        for line in text.split("\n") {
+            let stripped = line.strip()
+            if len(stripped) > 20 {
+                lines.append(stripped)
+            }
+        }
+        return "\n".join(lines[0:100])
+    }
+
+    /// ── Full Fact Retrieval Pipeline ───────────────────────────────────
+
+    fn retrieve_facts(self, query: string, max_facts: int, domain_hint: string) -> List[any] {
+        let detected_domain = domain_hint
+        if detected_domain == "" {
+            detected_domain = detect_query_domain(query)
+        }
+        let search_query = clean_query_for_search(query)
+        let topic_words = core_topic_words(query)
+
+        let domain_results = self.domain_search(search_query, detected_domain, max_facts)
+        let general_results = self.search(search_query, max_facts, "")
+        let wolfram_results = self._wolfram_search(query, 2)
+
+        let facts = []
+
+        for wr in wolfram_results {
+            if wr.snippet != "" and len(wr.snippet) > 10 {
+                let conf = CONFIDENCE_BY_SOURCE.get(wr.source, 0.85)
+                facts.append(new_retrieved_fact(
+                    wr.snippet, wr.url, conf, "wolfram", wr.source
+                ))
+            }
+        }
+
+        for sr in domain_results {
+            if sr.snippet != "" and len(sr.snippet) > 30 {
+                if fact_is_metadata(sr.snippet) { continue }
+                if not fact_relevant_to_topic(sr.snippet, topic_words) { continue }
+                let conf = CONFIDENCE_BY_SOURCE.get(sr.source, 0.80)
+                facts.append(new_retrieved_fact(
+                    sr.snippet, sr.url, conf, detected_domain, sr.source
+                ))
+            }
+        }
+
+        for sr in general_results {
+            if sr.snippet != "" and len(sr.snippet) > 30 {
+                if fact_is_metadata(sr.snippet) { continue }
+                if not fact_relevant_to_topic(sr.snippet, topic_words) { continue }
+                let src_method = sr.source
+                if src_method == "" { src_method = "search_snippet" }
+                let conf = CONFIDENCE_BY_SOURCE.get(sr.source, 0.70)
+                facts.append(new_retrieved_fact(
+                    sr.snippet, sr.url, conf, "web", src_method
+                ))
+            }
+        }
+
+        let crawl_idx = 0
+        for sr in general_results {
+            if crawl_idx >= 2 { break }
+            let crawled = self.crawl(sr.url)
+            if crawled != None and len(crawled) > 100 {
+                let paragraphs = []
+                for p in crawled.split("\n") {
+                    let stripped = p.strip()
+                    if len(stripped) > 50 {
+                        paragraphs.append(stripped)
+                    }
+                }
+                let pi = 0
+                for para in paragraphs {
+                    if pi >= 3 { break }
+                    let text = para[0:500]
+                    if fact_is_metadata(text) {
+                        pi += 1
+                        continue
+                    }
+                    if not fact_relevant_to_topic(text, topic_words) {
+                        pi += 1
+                        continue
+                    }
+                    facts.append(new_retrieved_fact(
+                        text, sr.url, 0.6, "web", "direct_crawl"
+                    ))
+                    pi += 1
+                }
+            }
+            crawl_idx += 1
+        }
+
+        let seen_hashes = {}
+        let deduped = []
+        for fact in facts {
+            if fact.content_hash not in seen_hashes {
+                seen_hashes[fact.content_hash] = true
+                deduped.append(fact)
+            }
+        }
+
+        return deduped[0:max_facts]
+    }
+
+    /// ── Code Search ────────────────────────────────────────────────────
+
+    fn search_code(self, query: string, language: string, max_results: int) -> List[any] {
+        let code_results = []
+        let code_query = query + " code example"
+        if language != "" {
+            code_query = language + " " + query + " example implementation"
+        }
+
+        let search_results = self.search(code_query, max_results, "")
+
+        let all_wiki = true
+        for sr in search_results {
+            if sr.source != "wikipedia" {
+                all_wiki = false
+                break
+            }
+        }
+        if len(search_results) == 0 or all_wiki {
+            let alt_query = query + " " + language + " stackoverflow"
+            let alt_results = self.search(alt_query, max_results, "")
+            if len(alt_results) > 0 {
+                search_results = alt_results
+            }
+        }
+
+        for sr in search_results {
+            let entry = {
+                "title": sr.title,
+                "url": sr.url,
+                "snippet": sr.snippet,
+                "source": sr.source,
+                "type": "search_result",
+                "code_blocks": [],
+                "imports": [],
+                "api_signatures": []
+            }
+            code_results.append(entry)
+        }
+
+        let crawl_domains = ["github.com", "docs.", "pkg.go.dev", "docs.rs",
+                             "developer.mozilla", "cppreference", "pypi.org",
+                             "stackoverflow.com"]
+        let crawl_targets = []
+        for sr in search_results {
+            for d in crawl_domains {
+                if d in sr.url {
+                    crawl_targets.append(sr)
+                    break
+                }
+            }
+            if len(crawl_targets) >= 3 { break }
+        }
+
+        for sr in crawl_targets {
+            let crawled = self.crawl(sr.url)
+            if crawled == None { continue }
+
+            let blocks = self._extract_code_blocks(crawled, language)
+            let imports = self._extract_imports(crawled, language)
+            let sigs = self._extract_api_signatures(crawled, language)
+
+            for entry in code_results {
+                if entry["url"] == sr.url {
+                    entry["code_blocks"] = blocks[0:5]
+                    entry["imports"] = imports[0:10]
+                    entry["api_signatures"] = sigs[0:10]
+                    entry["type"] = "crawled"
+                    entry["full_text"] = crawled[0:3000]
+                    break
+                }
+            }
+        }
+
+        return code_results
+    }
+
+    fn search_error_fix(self, error_message: string, language: string, code_context: string) -> List[any] {
+        let lines = error_message.strip().split("\n")
+        let clean_error = lines[len(lines) - 1][0:200]
+        let query = language + " fix " + clean_error
+
+        let results = self.search(query, 3, "")
+        let fixes = []
+
+        for sr in results {
+            if sr.snippet != "" and len(sr.snippet) > 30 {
+                fixes.append(sr.snippet)
+            }
+        }
+
+        if len(fixes) < 2 {
+            let ci = 0
+            for sr in results {
+                if ci >= 2 { break }
+                let crawled = self.crawl(sr.url)
+                if crawled != None {
+                    let blocks = self._extract_code_blocks(crawled, language)
+                    let bi = 0
+                    for block in blocks {
+                        if bi >= 2 { break }
+                        fixes.append(block)
+                        bi += 1
+                    }
+                }
+                ci += 1
+            }
+        }
+
+        return fixes[0:5]
+    }
+
+    fn lookup_package_api(self, package_name: string, language: string) -> Dict[string, any] {
+        let api_urls = {
+            "python": "https://pypi.org/project/" + package_name + "/",
+            "javascript": "https://www.npmjs.com/package/" + package_name,
+            "typescript": "https://www.npmjs.com/package/" + package_name,
+            "go": "https://pkg.go.dev/" + package_name,
+            "rust": "https://docs.rs/" + package_name + "/latest",
+            "java": "https://mvnrepository.com/artifact/" + package_name
+        }
+        let install_commands = {
+            "python": "pip install " + package_name,
+            "javascript": "npm install " + package_name,
+            "typescript": "npm install " + package_name,
+            "go": "go get " + package_name,
+            "rust": "cargo add " + package_name,
+            "java": "<!-- Maven: " + package_name + " -->"
+        }
+
+        let info = {
+            "package": package_name,
+            "language": language,
+            "description": "",
+            "latest_version": "",
+            "usage_examples": [],
+            "api_functions": [],
+            "install_command": install_commands.get(language, "")
+        }
+
+        let direct_url = api_urls.get(language, "")
+        if direct_url != "" {
+            let crawled = self.crawl(direct_url)
+            if crawled != None {
+                info["description"] = crawled[0:500]
+                info["usage_examples"] = self._extract_code_blocks(crawled, language)[0:3]
+                info["api_functions"] = self._extract_api_signatures(crawled, language)[0:10]
+            }
+        }
+
+        let search_results = self.search(
+            package_name + " " + language + " tutorial example usage", 3, "")
+        for sr in search_results {
+            let crawled = self.crawl(sr.url)
+            if crawled != None {
+                let examples = self._extract_code_blocks(crawled, language)
+                let ei = 0
+                for ex in examples {
+                    if ei >= 2 { break }
+                    info["usage_examples"].append(ex)
+                    ei += 1
+                }
+            }
+        }
+
+        return info
+    }
+
+    fn _extract_code_blocks(self, text: string, language: string) -> List[any] {
+        let blocks = []
+        let lang_short = language[0:2]
+        let pattern = "```(?:" + language + "|" + lang_short + ")?\\s*\\n(.*?)```"
+        let matches = re.finditer(pattern, text, re.DOTALL)
+        for match in matches {
+            let block = match.group(1).strip()
+            if len(block) > 20 {
+                blocks.append(block)
+            }
+        }
+        return blocks[0:10]
+    }
+
+    fn _extract_imports(self, text: string, language: string) -> List[any] {
+        let import_patterns = {
+            "python": "^(?:from\\s+\\S+\\s+import\\s+.+|import\\s+\\S+)",
+            "javascript": "^(?:const\\s+\\{?\\s*\\w+.*\\}?\\s*=\\s*require\\(.+\\)|import\\s+.+\\s+from\\s+.+)",
+            "typescript": "^(?:import\\s+.+\\s+from\\s+.+)",
+            "go": "^(?:import\\s+(?:\"[^\"]+\"|[\\s\\S]*?\\)))",
+            "rust": "^(?:use\\s+\\S+;|extern\\s+crate\\s+\\S+;)",
+            "java": "^(?:import\\s+[\\w.]+\\*?;)"
+        }
+        let pattern = import_patterns.get(language, "")
+        if pattern == "" {
+            return []
+        }
+        let imports = {}
+        let matches = re.finditer(pattern, text, re.MULTILINE)
+        for match in matches {
+            let imp = match.group(0).strip()
+            if imp != "" {
+                imports[imp] = true
+            }
+        }
+        let sorted_imports = []
+        for k in imports {
+            sorted_imports.append(k)
+        }
+        sorted_imports.sort()
+        return sorted_imports[0:20]
+    }
+
+    fn _extract_api_signatures(self, text: string, language: string) -> List[any] {
+        let sig_patterns = {
+            "python": "(?:def|class|async def)\\s+\\w+\\([^)]*\\)(?:\\s*->.*?)?:",
+            "javascript": "(?:function|async function)\\s+\\w+\\([^)]*\\)",
+            "typescript": "(?:function|async function|interface|type|class)\\s+\\w+[\\s\\S]*?[{;]",
+            "go": "func\\s+(?:\\([^)]+\\)\\s+)?\\w+\\([^)]*\\)(?:\\s*(?:\\([^)]+\\)|\\w+))?",
+            "rust": "(?:pub\\s+)?fn\\s+\\w+(?:<[^>]+>)?\\([^)]*\\)(?:\\s*->\\s*\\S+)?",
+            "java": "(?:public|private|protected)\\s+(?:static\\s+)?\\w+\\s+\\w+\\([^)]*\\)"
+        }
+        let pattern = sig_patterns.get(language, "")
+        if pattern == "" {
+            return []
+        }
+        let sigs = {}
+        let matches = re.finditer(pattern, text)
+        for match in matches {
+            let sig = match.group(0).strip()
+            if len(sig) > 10 {
+                sigs[sig] = true
+            }
+        }
+        let sorted_sigs = []
+        for k in sigs {
+            sorted_sigs.append(k)
+        }
+        sorted_sigs.sort()
+        return sorted_sigs[0:20]
+    }
+
+    /// ── Stats ──────────────────────────────────────────────────────────
+
+    fn stats(self) -> Dict[string, int] {
+        return {
+            "searches": self._search_count,
+            "crawls": self._crawl_count,
+            "failures": self._failures
+        }
+    }
+}
+
+/// ── Exports ─────────────────────────────────────────────────────────────
+
+export SearchResult, RetrievedFact
+export new_search_result, new_retrieved_fact
+export decode_ddg_url, strip_html_tags
+export detect_query_domain, clean_query_for_search, core_topic_words
+export fact_is_metadata, fact_relevant_to_topic
+export WebRetrievalEngine

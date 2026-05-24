@@ -1,0 +1,975 @@
+/// NRSI Continuous Learning Engine — Knowledge Acquisition Through Interaction.
+///
+/// Unlike static knowledge packs, this engine:
+///   1. Extracts factual claims from every conversation turn
+///   2. Validates new claims against existing knowledge
+///   3. Promotes high-confidence claims to persistent memory
+///   4. Tracks what queries the system failed on and what it learned
+///   5. Builds an ever-growing understanding of the world
+///
+/// Complete conversion of `nrsip/learning_engine.py`.
+
+module learning_engine
+
+import time from "std/time"
+import re from "std/re"
+import hashlib from "std/hashlib"
+import json from "std/json"
+import os from "std/os"
+import logging from "std/logging"
+
+/// ── Stop Words ─────────────────────────────────────────────────────────
+
+let STOP_WORDS = [
+    "the", "a", "an", "is", "are", "was", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "could", "should", "may", "might", "can", "shall",
+    "to", "of", "in", "for", "on", "with", "at", "by", "from",
+    "as", "into", "through", "during", "before", "after", "above",
+    "below", "between", "and", "but", "or", "not", "no", "nor",
+    "so", "yet", "both", "either", "neither", "each", "every",
+    "all", "any", "few", "more", "most", "some", "such", "than",
+    "too", "very", "just", "about", "up", "out", "if", "then",
+    "that", "this", "these", "those", "it", "its", "what", "which",
+    "who", "whom", "how", "when", "where", "why"
+]
+
+fn _is_stop(w: string) -> bool {
+    for sw in STOP_WORDS {
+        if w == sw { return true }
+    }
+    return false
+}
+
+fn extract_keywords(text: string) -> List[any] {
+    let words = re.findall("\\b[a-zA-Z]{3,}\\b", text.lower())
+    let result = []
+    for w in words {
+        if not _is_stop(w) {
+            result.append(w)
+        }
+    }
+    return result
+}
+
+/// ── Abbreviations and Pronoun Subjects ─────────────────────────────────
+
+let ABBREVIATIONS = [
+    "Mr.", "Mrs.", "Ms.", "Dr.", "Prof.", "Sr.", "Jr.",
+    "vs.", "etc.", "e.g.", "i.e.", "U.S.", "U.K."
+]
+
+let PRONOUN_SUBJECTS = ["it", "this", "that", "they", "he", "she", "we", "i", "you"]
+
+fn _is_pronoun_subject(w: string) -> bool {
+    for p in PRONOUN_SUBJECTS {
+        if w == p { return true }
+    }
+    return false
+}
+
+/// ── Data Types ─────────────────────────────────────────────────────────
+
+class ExtractedClaim {
+    fn new(subject: string, relation: string, object: string, original_text: string, confidence: float, source: string) -> ExtractedClaim {
+        let c = ExtractedClaim {}
+        c.subject = subject
+        c.relation = relation
+        c.object = object
+        c.original_text = original_text
+        c.confidence = confidence
+        c.source = source
+        c.extracted_at = time.time()
+        c.claim_hash = c._compute_hash()
+        return c
+    }
+
+    fn _compute_hash(self) -> string {
+        let normalized = self.subject.lower().strip() + "|" + self.relation.lower().strip() + "|" + self.object.lower().strip()
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[0:16]
+    }
+
+    fn to_dict(self) -> Dict[string, any] {
+        return {
+            "subject": self.subject,
+            "relation": self.relation,
+            "object": self.object,
+            "original_text": self.original_text,
+            "confidence": self.confidence,
+            "source": self.source,
+            "extracted_at": self.extracted_at,
+            "claim_hash": self.claim_hash
+        }
+    }
+}
+
+fn extracted_claim_from_dict(d: Dict[string, any]) -> ExtractedClaim {
+    let c = ExtractedClaim {}
+    c.subject = d["subject"]
+    c.relation = d["relation"]
+    c.object = d["object"]
+    c.original_text = d.get("original_text", "")
+    c.confidence = float(d.get("confidence", 0.5))
+    c.source = d.get("source", "unknown")
+    c.extracted_at = float(d.get("extracted_at", 0))
+    c.claim_hash = d.get("claim_hash", "")
+    if c.claim_hash == "" {
+        c.claim_hash = c._compute_hash()
+    }
+    return c
+}
+
+type LearningEvent {
+    event_type: string,
+    claim: ExtractedClaim,
+    result: string,
+    reason: string,
+    timestamp: float
+}
+
+fn new_learning_event(event_type: string, claim: ExtractedClaim, result: string, reason: string) -> LearningEvent {
+    return LearningEvent {
+        event_type: event_type,
+        claim: claim,
+        result: result,
+        reason: reason,
+        timestamp: time.time()
+    }
+}
+
+fn learning_event_to_dict(ev: LearningEvent) -> Dict[string, any] {
+    return {
+        "event_type": ev.event_type,
+        "claim": ev.claim.to_dict(),
+        "result": ev.result,
+        "reason": ev.reason,
+        "timestamp": ev.timestamp
+    }
+}
+
+/// ── Claim Extraction Patterns ──────────────────────────────────────────
+
+let CLAIM_PATTERNS = [
+    ["(?:the\\s+)?(\\w[\\w\\s]{2,30}?)\\s+(?:is|are)\\s+(?:a|an|the)?\\s*(\\w[\\w\\s]{2,50})", "is_a"],
+    ["(?:the\\s+)?(\\w[\\w\\s]{2,30}?)\\s+(?:has|have|contains?)\\s+(?:a|an|the)?\\s*(\\w[\\w\\s]{2,50})", "has"],
+    ["(?:the\\s+)?(\\w[\\w\\s]{2,30}?)\\s+(?:causes?|leads?\\s+to|results?\\s+in)\\s+(?:a|an|the)?\\s*(\\w[\\w\\s]{2,50})", "causes"],
+    ["(?:the\\s+)?(\\w[\\w\\s]{2,40}?)\\s+(?:happened|occurred|took\\s+place|started|began|ended)\\s+(?:in|on|at|during)\\s+(\\d[\\w\\s,]{1,30})", "temporal"],
+    ["(?:the\\s+)?(\\w[\\w\\s]{2,30}?)\\s+(?:is|are|equals?|=)\\s+(\\d[\\d.,]+\\s*\\w*)", "quantitative"],
+    ["(?:the\\s+)?(\\w[\\w\\s]{2,30}?)\\s+(?:is\\s+(?:in|located\\s+in|found\\s+in|part\\s+of))\\s+(?:the\\s+)?(\\w[\\w\\s]{2,40})", "located_in"],
+    ["(?:the\\s+)?(\\w[\\w\\s]{2,30}?)\\s+(?:is\\s+made\\s+(?:of|from)|consists?\\s+of)\\s+(?:the\\s+)?(\\w[\\w\\s]{2,40})", "made_of"],
+    ["(?:the\\s+)?(\\w[\\w\\s]{2,30}?)\\s+(?:was\\s+(?:created|invented|discovered|founded|built)\\s+by)\\s+(\\w[\\w\\s]{2,40})", "created_by"]
+]
+
+let NON_FACTUAL_PATTERNS = [
+    "^\\s*(?:what|who|where|when|why|how|is|are|can|do|does|did|will|would|could|should)\\b.*\\?",
+    "\\b(?:I think|I believe|maybe|perhaps|probably|might be|could be|in my opinion)\\b",
+    "^\\s*(?:hi|hello|hey|thanks|thank you|ok|okay|sure|yes|no|bye)\\s*$"
+]
+
+/// ── Claim Extractor ────────────────────────────────────────────────────
+
+class ClaimExtractor {
+    fn new() -> ClaimExtractor {
+        let ce = ClaimExtractor {}
+        ce._total_extracted = 0
+        return ce
+    }
+
+    fn _split_sentences(self, text: string) -> List[any] {
+        let protected = text
+        for abbr in ABBREVIATIONS {
+            protected = protected.replace(abbr, abbr.replace(".", "\x00"))
+        }
+        let parts = re.split("(?<=[.!?])\\s+(?=[A-Z])|(?<=[.!?])$", protected)
+        let result = []
+        for s in parts {
+            let cleaned = s.replace("\x00", ".").strip()
+            if cleaned != "" {
+                result.append(cleaned)
+            }
+        }
+        return result
+    }
+
+    fn _is_non_factual(self, text: string) -> bool {
+        for pattern in NON_FACTUAL_PATTERNS {
+            if re.search(pattern, text, re.IGNORECASE) != None {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn _estimate_confidence(self, sentence: string, relation: string, source: string) -> float {
+        let base = 0.50
+        let lower = sentence.lower()
+
+        let strong_words = ["always", "never", "every", "all"]
+        for w in strong_words {
+            if w in lower {
+                base += 0.05
+                break
+            }
+        }
+
+        let weak_words = ["usually", "often", "sometimes", "generally"]
+        for w in weak_words {
+            if w in lower {
+                base -= 0.10
+                break
+            }
+        }
+
+        if relation == "quantitative" or relation == "temporal" {
+            base += 0.10
+        }
+
+        let src = source.lower()
+        if "web" in src {
+            base += 0.05
+        } else if "user" in src {
+            base -= 0.05
+        } else if "inference" in src {
+            base -= 0.10
+        }
+
+        if base < 0.10 { base = 0.10 }
+        if base > 0.95 { base = 0.95 }
+        return base
+    }
+
+    fn extract(self, text: string, source: string) -> List[any] {
+        if text == None or len(text.strip()) < 10 {
+            return []
+        }
+
+        let sentences = self._split_sentences(text)
+        let claims = []
+        let seen_hashes = {}
+
+        for sentence in sentences {
+            let sent = sentence.strip()
+            if len(sent) < 8 {
+                continue
+            }
+            if self._is_non_factual(sent) {
+                continue
+            }
+
+            for pair in CLAIM_PATTERNS {
+                let pattern = pair[0]
+                let relation = pair[1]
+                let matches = re.finditer(pattern, sent, re.IGNORECASE)
+                for match in matches {
+                    let subj = match.group(1).strip()
+                    let obj = match.group(2).strip()
+
+                    if len(subj) < 2 or len(obj) < 2 {
+                        continue
+                    }
+                    if _is_pronoun_subject(subj.lower()) {
+                        continue
+                    }
+
+                    let confidence = self._estimate_confidence(sent, relation, source)
+                    let claim = ExtractedClaim.new(
+                        subj, relation, obj,
+                        sent[0:200], confidence, source
+                    )
+                    if claim.claim_hash not in seen_hashes {
+                        seen_hashes[claim.claim_hash] = true
+                        claims.append(claim)
+                    }
+                }
+            }
+        }
+
+        self._total_extracted += len(claims)
+        return claims
+    }
+
+    fn extract_from_conversation(self, history: List[Dict[string, any]], source: string) -> List[any] {
+        let all_claims = []
+        let seen_hashes = {}
+
+        for turn in history {
+            let role = turn.get("role", "user")
+            let content = turn.get("content", "")
+            if content == "" {
+                continue
+            }
+
+            let effective_source = source + ":" + role
+            let claims = self.extract(content, effective_source)
+
+            for claim in claims {
+                if role == "assistant" or role == "system" {
+                    let new_conf = claim.confidence * 1.15
+                    if new_conf > 1.0 { new_conf = 1.0 }
+                    claim.confidence = new_conf
+                }
+                if claim.claim_hash not in seen_hashes {
+                    seen_hashes[claim.claim_hash] = true
+                    all_claims.append(claim)
+                }
+            }
+        }
+
+        return all_claims
+    }
+
+    fn total_extracted(self) -> int {
+        return self._total_extracted
+    }
+}
+
+/// ── Knowledge Validator ────────────────────────────────────────────────
+
+class KnowledgeValidator {
+    fn new() -> KnowledgeValidator {
+        let kv = KnowledgeValidator {}
+        kv.SOURCE_CREDIBILITY = {
+            "web": 0.60,
+            "user": 0.40,
+            "inference": 0.30,
+            "conversation": 0.45,
+            "conversation:assistant": 0.65,
+            "conversation:system": 0.70,
+            "conversation:user": 0.40
+        }
+        kv._MULTI_VALUED_RELATIONS = ["has", "located_in", "made_of", "causes", "created_by"]
+        return kv
+    }
+
+    fn _is_multi_valued(self, relation: string) -> bool {
+        for r in self._MULTI_VALUED_RELATIONS {
+            if r == relation { return true }
+        }
+        return false
+    }
+
+    fn validate(self, claim: ExtractedClaim, existing_claims: List[ExtractedClaim]) -> List[any] {
+        let contradiction = self._check_contradiction(claim, existing_claims)
+        if contradiction != None {
+            if contradiction.confidence > claim.confidence + 0.15 {
+                return [
+                    "reject", 0.0,
+                    "Contradicts existing claim '" + contradiction.subject + " " + contradiction.relation + " " + contradiction.object + "' (conf=" + str(contradiction.confidence) + ")"
+                ]
+            }
+            return [
+                "pending", 0.5,
+                "Potential contradiction with '" + contradiction.subject + " " + contradiction.relation + " " + contradiction.object + "' — needs resolution"
+            ]
+        }
+
+        let plaus = self._check_plausibility(claim)
+        let plausible = plaus[0]
+        let plaus_reason = plaus[1]
+        if not plausible {
+            return ["reject", 0.0, plaus_reason]
+        }
+
+        let corroboration_count = self._count_corroboration(claim, existing_claims)
+        let corr_boost = corroboration_count * 0.1
+        if corr_boost > 0.3 { corr_boost = 0.3 }
+
+        let source_cred = self._source_credibility(claim.source)
+        let adjustment = source_cred + corr_boost
+        let final_conf = claim.confidence * (0.4 + 0.6 * adjustment)
+
+        if final_conf >= 0.30 {
+            return [
+                "accept", adjustment,
+                "Accepted: source_cred=" + str(source_cred) + ", corroboration=" + str(corroboration_count) + ", adj=" + str(adjustment)
+            ]
+        }
+        if final_conf >= 0.20 {
+            return [
+                "pending", adjustment,
+                "Low confidence (" + str(final_conf) + ") — pending further corroboration"
+            ]
+        }
+        return [
+            "reject", adjustment,
+            "Below acceptance threshold (" + str(final_conf) + ")"
+        ]
+    }
+
+    fn _check_contradiction(self, claim: ExtractedClaim, existing: List[ExtractedClaim]) -> Optional[ExtractedClaim] {
+        let claim_subj = claim.subject.lower().strip()
+        let claim_rel = claim.relation.lower().strip()
+
+        for ex in existing {
+            if ex.subject.lower().strip() == claim_subj and ex.relation.lower().strip() == claim_rel and ex.object.lower().strip() != claim.object.lower().strip() and not self._is_multi_valued(claim_rel) {
+                return ex
+            }
+        }
+        return None
+    }
+
+    fn _check_plausibility(self, claim: ExtractedClaim) -> List[any] {
+        if claim.relation == "quantitative" {
+            let m = re.search("[\\d.,]+", claim.object)
+            if m != None {
+                try {
+                    let num = float(m.group().replace(",", ""))
+                    if num > 1e15 or num < -1e15 {
+                        return [false, "Implausible quantity: " + str(num)]
+                    }
+                } catch(e) {
+                    pass
+                }
+            }
+        }
+
+        if len(claim.subject) > 100 or len(claim.object) > 100 {
+            return [false, "Claim components suspiciously long"]
+        }
+
+        if claim.subject.lower() == claim.object.lower() {
+            return [false, "Tautological claim (subject == object)"]
+        }
+
+        return [true, ""]
+    }
+
+    fn _count_corroboration(self, claim: ExtractedClaim, existing: List[ExtractedClaim]) -> int {
+        let cs = claim.subject.lower().strip()
+        let cr = claim.relation.lower().strip()
+        let co = claim.object.lower().strip()
+        let count = 0
+        for ex in existing {
+            if ex.subject.lower().strip() == cs and ex.relation.lower().strip() == cr and ex.object.lower().strip() == co and ex.source != claim.source {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    fn _source_credibility(self, source: string) -> float {
+        let src = source.lower()
+        if src in self.SOURCE_CREDIBILITY {
+            return self.SOURCE_CREDIBILITY[src]
+        }
+        for key in self.SOURCE_CREDIBILITY {
+            if key in src {
+                return self.SOURCE_CREDIBILITY[key]
+            }
+        }
+        return 0.50
+    }
+}
+
+/// ── Redis Helper ───────────────────────────────────────────────────────
+
+fn _get_redis() -> Optional[any] {
+    try {
+        import redis
+        let host = os.environ.get("REDIS_HOST", "localhost")
+        let port = int(os.environ.get("REDIS_PORT", "6379"))
+        let pw = os.environ.get("REDIS_PASSWORD", "")
+        if pw == "" { pw = None }
+        let db = int(os.environ.get("NRS_KNOWLEDGE_REDIS_DB", "2"))
+        let rc = redis.Redis(
+            host: host, port: port, password: pw, db: db,
+            decode_responses: true, socket_connect_timeout: 3
+        )
+        rc.ping()
+        return rc
+    } catch(e) {
+        return None
+    }
+}
+
+/// ── Learning Engine ────────────────────────────────────────────────────
+
+class LearningEngine {
+    fn new() -> LearningEngine {
+        let le = LearningEngine {}
+        le._extractor = ClaimExtractor.new()
+        le._validator = KnowledgeValidator.new()
+        le._claims = {}
+        le._learning_log = []
+        le._failure_log = []
+        le._generalizations = []
+        le._total_claims_extracted = 0
+        le._total_claims_accepted = 0
+        le._total_interactions = 0
+        le._semantic = None
+
+        le._persistent_store = None
+        try {
+            from "nrsi/lang/cognitive_primitives" import LearnableStore
+            import tempfile
+            let store_path = os.path.join(tempfile.gettempdir(), "nrs_learnable_store.json")
+            le._persistent_store = LearnableStore(
+                decay: 0.005, reinforcement: 0.1,
+                conflict_resolution: "revision",
+                backing: "disk", backing_path: store_path
+            )
+        } catch(e) {
+            pass
+        }
+
+        return le
+    }
+
+    fn set_semantic_engine(self, engine: any) -> void {
+        self._semantic = engine
+    }
+
+    fn learn_from_interaction(self, query: string, response: string, conversation_history: List[Dict[string, any]], response_confidence: float, web_facts: Optional[List[string]]) -> Dict[string, any] {
+        self._total_interactions += 1
+        let result = {
+            "interaction": self._total_interactions,
+            "claims_extracted": 0,
+            "claims_accepted": 0,
+            "claims_rejected": 0,
+            "claims_pending": 0,
+            "contradictions": 0,
+            "events": []
+        }
+
+        let conv_claims = self._extractor.extract_from_conversation(
+            conversation_history, "conversation")
+        let qr_claims = self._extractor.extract(
+            query + ". " + response, "conversation:assistant")
+        let web_claims = []
+        if web_facts != None {
+            for fact_text in web_facts {
+                let wc = self._extractor.extract(fact_text, "web")
+                for c in wc {
+                    web_claims.append(c)
+                }
+            }
+        }
+
+        let all_new = []
+        for c in conv_claims { all_new.append(c) }
+        for c in qr_claims { all_new.append(c) }
+        for c in web_claims { all_new.append(c) }
+
+        let seen = {}
+        let deduplicated = []
+        for c in all_new {
+            if c.claim_hash not in seen and c.claim_hash not in self._claims {
+                seen[c.claim_hash] = true
+                deduplicated.append(c)
+            }
+        }
+
+        result["claims_extracted"] = len(deduplicated)
+        self._total_claims_extracted += len(deduplicated)
+
+        let existing_list = []
+        for h in self._claims {
+            existing_list.append(self._claims[h])
+        }
+
+        for claim in deduplicated {
+            let validation = self._validator.validate(claim, existing_list)
+            let verdict = validation[0]
+            let adj = validation[1]
+            let reason = validation[2]
+
+            let event = None
+
+            if verdict == "accept" {
+                let new_conf = claim.confidence * adj
+                if new_conf > 0.95 { new_conf = 0.95 }
+                claim.confidence = new_conf
+                self._claims[claim.claim_hash] = claim
+                existing_list.append(claim)
+                self._total_claims_accepted += 1
+                result["claims_accepted"] += 1
+                event = new_learning_event("new_fact", claim, "accepted", reason)
+
+                if self._persistent_store != None {
+                    self._persistent_store.store(
+                        text: claim.original_text,
+                        confidence: claim.confidence,
+                        domain: "general",
+                        source: claim.source
+                    )
+                }
+            } else if verdict == "reject" {
+                result["claims_rejected"] += 1
+                let event_type = "new_fact"
+                if "contradict" in reason.lower() {
+                    event_type = "contradiction"
+                    result["contradictions"] += 1
+                }
+                event = new_learning_event(event_type, claim, "rejected", reason)
+            } else {
+                result["claims_pending"] += 1
+                event = new_learning_event("new_fact", claim, "pending_validation", reason)
+            }
+
+            self._learning_log.append(event)
+            result["events"].append(learning_event_to_dict(event))
+        }
+
+        if response_confidence < 0.5 {
+            self.record_failure(query, "Low confidence response (" + str(response_confidence) + ")")
+        }
+
+        return result
+    }
+
+    fn record_failure(self, query: string, reason: string) -> void {
+        self._failure_log.append({
+            "query": query[0:500],
+            "reason": reason,
+            "timestamp": time.time(),
+            "keywords": extract_keywords(query)
+        })
+        logging.debug("Recorded failure: " + query[0:80] + " — " + reason)
+    }
+
+    fn get_knowledge_gaps(self, top_k: int) -> List[any] {
+        if len(self._failure_log) == 0 {
+            return []
+        }
+
+        let keyword_counter = {}
+        let keyword_examples = {}
+
+        for entry in self._failure_log {
+            let keywords = entry.get("keywords", [])
+            for kw in keywords {
+                if kw in keyword_counter {
+                    keyword_counter[kw] += 1
+                } else {
+                    keyword_counter[kw] = 1
+                    keyword_examples[kw] = []
+                }
+                if len(keyword_examples[kw]) < 3 {
+                    keyword_examples[kw].append(entry["query"][0:100])
+                }
+            }
+        }
+
+        let pairs = []
+        for kw in keyword_counter {
+            pairs.append([keyword_counter[kw], kw])
+        }
+        pairs.sort(reverse: true)
+
+        let result = []
+        let idx = 0
+        for pair in pairs {
+            if idx >= top_k { break }
+            let kw = pair[1]
+            let count = pair[0]
+            result.append({
+                "topic": kw,
+                "failure_count": count,
+                "example_queries": keyword_examples[kw]
+            })
+            idx += 1
+        }
+
+        return result
+    }
+
+    fn generalize(self) -> List[any] {
+        let new_generalizations = []
+
+        let obj_groups = {}
+        for ch in self._claims {
+            let claim = self._claims[ch]
+            let key = claim.relation + "|" + claim.object.lower().strip()
+            if key not in obj_groups {
+                obj_groups[key] = {"relation": claim.relation, "object": claim.object.lower().strip(), "subjects": []}
+            }
+            obj_groups[key]["subjects"].append(claim.subject)
+        }
+
+        for key in obj_groups {
+            let group = obj_groups[key]
+            let subjects = group["subjects"]
+            if len(subjects) < 3 { continue }
+            let relation = group["relation"]
+            let obj = group["object"]
+
+            let already_exists = false
+            for g in self._generalizations {
+                if g["relation"] == relation and g.get("shared_object") == obj {
+                    already_exists = true
+                    break
+                }
+            }
+            if already_exists { continue }
+
+            let gen = {
+                "relation": relation,
+                "shared_object": obj,
+                "subjects": subjects,
+                "count": len(subjects),
+                "rule": "Multiple agents (" + str(len(subjects)) + ") " + relation + " " + obj,
+                "formed_at": time.time()
+            }
+            self._generalizations.append(gen)
+            new_generalizations.append(gen)
+        }
+
+        let subj_groups = {}
+        for ch in self._claims {
+            let claim = self._claims[ch]
+            let key = claim.relation + "|" + claim.subject.lower().strip()
+            if key not in subj_groups {
+                subj_groups[key] = {"relation": claim.relation, "subject": claim.subject.lower().strip(), "objects": []}
+            }
+            subj_groups[key]["objects"].append(claim.object)
+        }
+
+        for key in subj_groups {
+            let group = subj_groups[key]
+            let objects = group["objects"]
+            if len(objects) < 3 { continue }
+            let relation = group["relation"]
+            let subj = group["subject"]
+
+            let already_exists = false
+            for g in self._generalizations {
+                if g["relation"] == relation and g.get("shared_subject") == subj {
+                    already_exists = true
+                    break
+                }
+            }
+            if already_exists { continue }
+
+            let gen = {
+                "relation": relation,
+                "shared_subject": subj,
+                "objects": objects,
+                "count": len(objects),
+                "rule": subj + " " + relation + " multiple targets (" + str(len(objects)) + ")",
+                "formed_at": time.time()
+            }
+            self._generalizations.append(gen)
+            new_generalizations.append(gen)
+        }
+
+        return new_generalizations
+    }
+
+    fn get_claims_for_query(self, query: string, top_k: int) -> List[any] {
+        if self._semantic != None {
+            try {
+                let scored = []
+                for claim_hash in self._claims {
+                    let claim = self._claims[claim_hash]
+                    let claim_text = claim.subject + " " + claim.relation + " " + claim.object
+                    let sim = self._semantic.similarity(query, claim_text)
+                    if sim > 0.05 {
+                        scored.append([sim, claim])
+                    }
+                }
+                scored.sort(key_idx: 0, reverse: true)
+                if len(scored) > 0 {
+                    let result = []
+                    let idx = 0
+                    for pair in scored {
+                        if idx >= top_k { break }
+                        result.append(pair[1])
+                        idx += 1
+                    }
+                    return result
+                }
+            } catch(e) {
+                pass
+            }
+        }
+
+        let query_keywords = {}
+        for kw in extract_keywords(query) {
+            query_keywords[kw] = true
+        }
+        if len(query_keywords) == 0 {
+            return []
+        }
+
+        let scored = []
+        for ch in self._claims {
+            let claim = self._claims[ch]
+            let claim_kws = {}
+            for w in claim.subject.split() {
+                if len(w) > 2 { claim_kws[w.lower()] = true }
+            }
+            for w in claim.object.split() {
+                if len(w) > 2 { claim_kws[w.lower()] = true }
+            }
+            let overlap = 0
+            for kw in query_keywords {
+                if kw in claim_kws {
+                    overlap += 1
+                }
+            }
+            if overlap > 0 {
+                let qk_count = len(query_keywords)
+                if qk_count == 0 { qk_count = 1 }
+                let score = (overlap / qk_count) * claim.confidence
+                scored.append([score, claim])
+            }
+        }
+
+        scored.sort(key_idx: 0, reverse: true)
+        let result = []
+        let idx = 0
+        for pair in scored {
+            if idx >= top_k { break }
+            result.append(pair[1])
+            idx += 1
+        }
+        return result
+    }
+
+    fn save_to_redis(self, redis_client: Optional[any]) -> int {
+        let rc = redis_client
+        if rc == None {
+            rc = _get_redis()
+        }
+        if rc == None {
+            logging.warning("No Redis client available — skipping save")
+            return 0
+        }
+
+        let count = 0
+        let pipe = rc.pipeline()
+        for claim_hash in self._claims {
+            let claim = self._claims[claim_hash]
+            let key = "nrs:learning:claim:" + claim_hash
+            pipe.hset(key, mapping: {
+                "subject": claim.subject,
+                "relation": claim.relation,
+                "object": claim.object,
+                "original_text": claim.original_text[0:500],
+                "confidence": str(claim.confidence),
+                "source": claim.source,
+                "extracted_at": str(claim.extracted_at),
+                "claim_hash": claim.claim_hash
+            })
+            count += 1
+            if count % 500 == 0 {
+                pipe.execute()
+                pipe = rc.pipeline()
+            }
+        }
+        pipe.execute()
+
+        if len(self._generalizations) > 0 {
+            rc.set("nrs:learning:generalizations", json.dumps(self._generalizations))
+        }
+        if len(self._failure_log) > 0 {
+            let start = len(self._failure_log) - 1000
+            if start < 0 { start = 0 }
+            rc.set("nrs:learning:failures", json.dumps(self._failure_log[start:]))
+        }
+
+        logging.info("Saved " + str(count) + " claims to Redis")
+        return count
+    }
+
+    fn load_from_redis(self, redis_client: Optional[any]) -> int {
+        let rc = redis_client
+        if rc == None {
+            rc = _get_redis()
+        }
+        if rc == None {
+            logging.warning("No Redis client available — skipping load")
+            return 0
+        }
+
+        let count = 0
+        let cursor = 0
+        let done = false
+        while not done {
+            let scan_result = rc.scan(cursor, match: "nrs:learning:claim:*", count: 500)
+            cursor = scan_result[0]
+            let keys = scan_result[1]
+            for key in keys {
+                let data = rc.hgetall(key)
+                if data == None or len(data) == 0 {
+                    continue
+                }
+                let decoded = {}
+                for k in data {
+                    let dk = k
+                    let dv = data[k]
+                    if typeof(dk) == "bytes" { dk = dk.decode() }
+                    if typeof(dv) == "bytes" { dv = dv.decode() }
+                    decoded[dk] = dv
+                }
+                let claim = extracted_claim_from_dict(decoded)
+                if claim.claim_hash not in self._claims {
+                    self._claims[claim.claim_hash] = claim
+                    count += 1
+                }
+            }
+            if cursor == 0 {
+                done = true
+            }
+        }
+
+        let raw = rc.get("nrs:learning:generalizations")
+        if raw != None {
+            let raw_str = raw
+            if typeof(raw) == "bytes" { raw_str = raw.decode() }
+            self._generalizations = json.loads(raw_str)
+        }
+
+        let raw_fail = rc.get("nrs:learning:failures")
+        if raw_fail != None {
+            let raw_str = raw_fail
+            if typeof(raw_fail) == "bytes" { raw_str = raw_fail.decode() }
+            self._failure_log = json.loads(raw_str)
+        }
+
+        logging.info("Loaded " + str(count) + " claims from Redis")
+        return count
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        let claims_by_relation = {}
+        let claims_by_source = {}
+        for ch in self._claims {
+            let c = self._claims[ch]
+            if c.relation in claims_by_relation {
+                claims_by_relation[c.relation] += 1
+            } else {
+                claims_by_relation[c.relation] = 1
+            }
+            let src_key = c.source.split(":")[0]
+            if src_key in claims_by_source {
+                claims_by_source[src_key] += 1
+            } else {
+                claims_by_source[src_key] = 1
+            }
+        }
+
+        let extracted = self._total_claims_extracted
+        if extracted == 0 { extracted = 1 }
+
+        return {
+            "total_claims": len(self._claims),
+            "total_extracted": self._total_claims_extracted,
+            "total_accepted": self._total_claims_accepted,
+            "acceptance_rate": self._total_claims_accepted / extracted,
+            "total_interactions": self._total_interactions,
+            "failure_count": len(self._failure_log),
+            "generalizations": len(self._generalizations),
+            "learning_events": len(self._learning_log),
+            "claims_by_relation": claims_by_relation,
+            "claims_by_source": claims_by_source
+        }
+    }
+}
+
+/// ── Exports ─────────────────────────────────────────────────────────────
+
+export ExtractedClaim, extracted_claim_from_dict
+export LearningEvent, new_learning_event, learning_event_to_dict
+export ClaimExtractor, KnowledgeValidator, LearningEngine
+export extract_keywords

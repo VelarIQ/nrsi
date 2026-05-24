@@ -1,0 +1,179 @@
+/// NRSI Metacognition — Bridge to existing NRS modules.
+///
+/// Wires the metacognition subsystem into the existing runtime:
+///
+/// - Replaces the in-memory _session_history in nrs-worker/main.py
+///   with the persistent MetacognitionMemory.
+/// - Wraps the existing GenerativeEngine.chat() as the generate_fn
+///   callback consumed by MetacognitionOrchestrator.
+/// - Feeds outcome signals from the existing mode-policy / validation
+///   pipeline into the learning engine.
+/// - Connects the governance audit spine to mode_policy decision traces.
+
+module metacognition_bridge
+
+from "metacognition_types" import ConversationEpisode, CritiqueVerdict, EpisodeOutcome, GoalState, LessonRecord, ProcessingMode, ReasoningPlan, SelfAssessment, StrategyPolicySnapshot, UserModel, _now_ms
+from "metacognition_memory" import InMemoryMetaStore, MetacognitionMemory, MetaStore, RedisMetaStore
+from "metacognition_engine" import MetacognitionOrchestrator, MetacognitiveResult
+from "metacognition_learning" import OutcomeLearningEngine, OutcomeSignal, outcome_signal_new, SatisfactionDetector, StrategyAdapter
+from "metacognition_governance" import MetacognitionGovernance
+
+/// ── Active episode tracking ────────────────────────────────────────
+
+let _active_episodes: Dict[string, string] = {}
+
+/// ── Bridge ─────────────────────────────────────────────────────────
+
+class MetacognitionBridge {
+    fn __init__(self, memory: MetacognitionMemory,
+                governance: MetacognitionGovernance,
+                orchestrator: MetacognitionOrchestrator,
+                learning: OutcomeLearningEngine,
+                adapter: StrategyAdapter,
+                satisfaction: SatisfactionDetector) {
+        self.memory = memory
+        self.governance = governance
+        self.orchestrator = orchestrator
+        self.learning = learning
+        self.adapter = adapter
+        self.satisfaction = satisfaction
+        self._last_result: Optional[MetacognitiveResult] = None
+    }
+
+    fn create(redis_pool: Optional[Any]) -> MetacognitionBridge {
+        let store: MetaStore = InMemoryMetaStore()
+        if redis_pool != None {
+            store = RedisMetaStore(redis_pool)
+        }
+
+        let memory = MetacognitionMemory(store)
+        let governance = MetacognitionGovernance()
+        let orchestrator = MetacognitionOrchestrator(memory, None)
+        let learning = OutcomeLearningEngine(memory)
+        let adapter = StrategyAdapter(memory)
+        let satisfaction = SatisfactionDetector()
+
+        return MetacognitionBridge(
+            memory, governance, orchestrator,
+            learning, adapter, satisfaction
+        )
+    }
+
+    /// -- Primary entry point --
+
+    fn metacognitive_wrap(self, raw_answer: string, query: string,
+                          session_id: string, user_id: string,
+                          domain: string,
+                          generate_fn: Optional[Callable]) -> string {
+        if generate_fn != None {
+            self.orchestrator.generate_fn = generate_fn
+        }
+
+        let episode_id = _active_episodes.get(session_id)
+
+        let result = self.orchestrator.process(
+            query, session_id, user_id, domain, episode_id)
+
+        _active_episodes[session_id] = result.episode.episode_id
+        self._last_result = result
+
+        self.governance.audit.record_plan(
+            result.plan, user_id, result.episode.episode_id)
+        for assessment in result.assessments {
+            self.governance.audit.record_critique(
+                assessment, user_id, session_id, result.episode.episode_id)
+        }
+
+        if result.is_clarification {
+            return result.clarification_question
+        }
+
+        return result.final_answer
+    }
+
+    /// -- Post-response learning --
+
+    fn post_response_learn(self, session_id: string, user_id: string,
+                           next_user_message: Optional[string]) -> List[any] {
+        let result = self._last_result
+        if result == None {
+            return []
+        }
+
+        let signals: List[OutcomeSignal] = []
+
+        if next_user_message != None and next_user_message != "" {
+            let sig = self.satisfaction.detect(next_user_message)
+            signals.append(sig)
+        }
+
+        if result.processing_time_ms > self.orchestrator.MAX_LATENCY_MS {
+            signals.append(outcome_signal_new(
+                "timeout",
+                "Processing took " + str(int(result.processing_time_ms)) + "ms",
+                0.8, {}
+            ))
+        }
+
+        let lessons = self.learning.process_outcome(
+            result.episode, result.user_model, result.plan,
+            result.assessments, signals)
+
+        for lesson in lessons {
+            self.governance.audit.record_lesson(lesson)
+        }
+
+        let strategy = self.adapter.adapt(user_id, lessons)
+
+        let delta_start = len(strategy.deltas) - len(lessons)
+        if delta_start < 0 {
+            delta_start = 0
+        }
+        for i in range(delta_start, len(strategy.deltas)) {
+            self.governance.apply_delta_if_safe(
+                strategy.deltas[i], user_id, strategy)
+        }
+
+        return lessons
+    }
+
+    /// -- Convenience --
+
+    fn rollback_user_strategy(self, user_id: string,
+                              target_version: int,
+                              reason: string) -> StrategyPolicySnapshot {
+        let strategy = self.memory.get_or_create_strategy(user_id)
+        return self.governance.rollback_strategy(
+            strategy, target_version, reason)
+    }
+
+    fn get_audit_log(self, user_id: string,
+                     limit: int) -> List[any] {
+        let records = self.governance.audit.query(user_id, None, limit)
+        let result: List[Dict[string, Any]] = []
+        for r in records {
+            result.append(audit_record_to_dict(r))
+        }
+        return result
+    }
+
+    fn get_user_profile(self, user_id: string) -> Optional[Dict[string, Any]] {
+        let model = self.memory.store.load_user_model(user_id)
+        if model != None {
+            return model.to_dict()
+        }
+        return None
+    }
+
+    fn get_strategy(self, user_id: string) -> Optional[Dict[string, Any]] {
+        let snap = self.memory.store.load_latest_snapshot(user_id)
+        if snap != None {
+            return snap.to_dict()
+        }
+        return None
+    }
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export MetacognitionBridge

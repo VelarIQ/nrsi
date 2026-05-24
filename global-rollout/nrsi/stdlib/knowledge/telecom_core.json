@@ -1,0 +1,92 @@
+{
+  "domain": "telecom",
+  "version": "2026.1",
+  "source": "3GPP TS 23.501 / TS 23.002 / industry standards",
+  "source_tier": "t2_verified",
+  "facts": [
+    {
+      "id": "tc-3gpp-architecture",
+      "text": "3GPP defines the mobile network architecture in generations: 2G (GSM/GPRS), 3G (UMTS/WCDMA), 4G (LTE/EPC), and 5G (NR/5GC). Each generation introduces new radio access technology and core network architecture while maintaining backward compatibility through inter-RAT handover.",
+      "confidence": 0.98,
+      "tags": ["3gpp", "architecture", "generations", "causal"]
+    },
+    {
+      "id": "tc-lte-elements",
+      "text": "LTE network elements include: eNodeB (evolved Node B, the base station handling radio), MME (Mobility Management Entity, controls signaling), SGW (Serving Gateway, routes user data), PGW (PDN Gateway, connects to external networks), HSS (Home Subscriber Server, stores subscriber profiles), PCRF (Policy and Charging Rules Function).",
+      "confidence": 0.97,
+      "tags": ["lte", "network-elements", "architecture", "logical"]
+    },
+    {
+      "id": "tc-5g-elements",
+      "text": "5G core (5GC) uses service-based architecture with: AMF (Access and Mobility Management), SMF (Session Management), UPF (User Plane Function), AUSF (Authentication Server), UDM (Unified Data Management), PCF (Policy Control), NSSF (Network Slice Selection), NEF (Network Exposure).",
+      "confidence": 0.97,
+      "tags": ["5g", "5gc", "network-elements", "architecture", "logical"]
+    },
+    {
+      "id": "tc-cell-hierarchy",
+      "text": "Cell site hierarchy: a PLMN (Public Land Mobile Network) contains multiple tracking areas (TAC), each tracking area contains multiple cells, each cell is served by a sector antenna on a tower/site. Cell ID format varies by technology: CGI for GSM (MCC+MNC+LAC+CI), ECGI for LTE (MCC+MNC+ECI), NCGI for NR (MCC+MNC+NCI).",
+      "confidence": 0.96,
+      "tags": ["cell", "hierarchy", "tower", "logical"]
+    },
+    {
+      "id": "tc-handover-types",
+      "text": "Handover types: intra-frequency (same carrier), inter-frequency (different carrier same RAT), inter-RAT (between technologies like LTE to UMTS), X2 handover (direct eNodeB-to-eNodeB in LTE), S1 handover (via MME when X2 unavailable). Handover failures cause call drops and are a primary fault indicator.",
+      "confidence": 0.95,
+      "tags": ["handover", "mobility", "fault-indicator", "causal"]
+    },
+    {
+      "id": "tc-kpi-definitions",
+      "text": "Key telecom KPIs: RSRP (Reference Signal Received Power, signal strength in dBm), RSRQ (Reference Signal Received Quality, signal quality in dB), SINR (Signal to Interference plus Noise Ratio in dB), CQI (Channel Quality Indicator 0-15), throughput (Mbps), latency (ms), packet loss rate (%), handover success rate (%), call setup success rate (%).",
+      "confidence": 0.97,
+      "tags": ["kpi", "metrics", "mathematical", "measurement"]
+    },
+    {
+      "id": "tc-fault-categories",
+      "text": "Telecom fault categories: hardware faults (antenna, power amplifier, baseband unit failures), software faults (configuration errors, software bugs, parameter mismatches), transport faults (backhaul link failures, IP routing issues, synchronization loss), interference (co-channel, adjacent channel, external), capacity (overload, congestion, resource exhaustion).",
+      "confidence": 0.95,
+      "tags": ["faults", "categories", "causal", "diagnostic"]
+    },
+    {
+      "id": "tc-signaling-protocols",
+      "text": "Telecom signaling protocol stack: S1-AP (S1 Application Protocol between eNodeB and MME), X2-AP (X2 Application Protocol between eNodeBs), GTP-C (GPRS Tunneling Protocol Control for session management), GTP-U (User plane tunneling), NAS (Non-Access Stratum between UE and MME for mobility/session management), RRC (Radio Resource Control between UE and eNodeB).",
+      "confidence": 0.96,
+      "tags": ["signaling", "protocols", "logical", "architecture"]
+    },
+    {
+      "id": "tc-sms-delivery-chain",
+      "text": "SMS delivery chain: originating UE sends SMS via NAS to MME, MME routes to SMSC (Short Message Service Center) via SGd/MAP interface, SMSC stores and forwards to destination MME via SGd, destination MME delivers to target UE via NAS. Failures can occur at: UE-eNodeB (radio), eNodeB-MME (S1), MME-SMSC (SGd), SMSC storage, SMSC-destination MME, or final delivery.",
+      "confidence": 0.95,
+      "tags": ["sms", "delivery", "causal", "fault-chain"]
+    },
+    {
+      "id": "tc-root-cause-patterns",
+      "text": "Common root cause patterns: if multiple cells on same site show degraded KPIs simultaneously, likely hardware/power fault at site level. If cells across different sites in same area degrade, likely transport/backhaul issue. If single cell degrades while neighbors are fine, likely antenna/configuration issue. If degradation correlates with time of day, likely capacity/interference issue.",
+      "confidence": 0.93,
+      "tags": ["root-cause", "patterns", "causal", "diagnostic"]
+    },
+    {
+      "id": "tc-x2-handover-failure",
+      "text": "X2 handover failures: X2-AP uses SCTP transport between eNodeBs. IP ping may succeed while SCTP association is down or X2 setup incomplete. Symptoms include missing Handover Request on target eNodeB despite IP reachability. Root cause is typically X2-AP association failure, SCTP heartbeat timeout, or eNodeB pair misconfiguration in X2 neighbor relations. Differentiate from S1-based handover by checking X2 setup procedure and SCTP association state.",
+      "confidence": 0.95,
+      "tags": ["x2", "handover", "sctp", "fault-isolation", "causal", "diagnostic"]
+    },
+    {
+      "id": "tc-fr1-rain-fade-misattribution",
+      "text": "Rain fade misattribution: n78 (3300-3800 MHz) is FR1 sub-6 GHz band where rain attenuation is minimal (typically <0.5 dB). Heavy rain primarily affects mmWave FR2 bands (n257, n258, n260, n261) above 24 GHz. When n78 FR1 shows RLC retransmissions during rain, prioritize interference sources, transport jitter, scheduler issues, or wet antenna effects rather than rain fade. Rain fade is the primary suspect only for mmWave deployments.",
+      "confidence": 0.95,
+      "tags": ["n78", "fr1", "rain-fade", "mmwave", "misattribution", "causal", "diagnostic"]
+    },
+    {
+      "id": "tc-pim-hardware-corrosion",
+      "text": "Passive Intermodulation (PIM) from corroded connectors or jumpers generates spurious intermodulation products that fall into the receive band, degrading uplink SNR. PIM is a hardware defect where non-linear junctions (corroded connectors, loose jumpers, oxidized contacts) mix transmitted signals creating unwanted spurs. Symptoms: narrow spur pattern in receive band, degraded UL SNR, worsening with transmit power. Common in dense urban n78 deployments with aging infrastructure. Fix requires replacing corroded hardware components.",
+      "confidence": 0.94,
+      "tags": ["pim", "intermodulation", "corrosion", "hardware", "interference", "causal", "diagnostic"]
+    },
+    {
+      "id": "tc-endc-mobility",
+      "text": "EN-DC (E-UTRA NR Dual Connectivity) mobility issues: frequent SN (Secondary Node) release storms occur when NR coverage is marginal at cell edges. MN (Master Node) LTE triggers measurement gaps that cause ping-pong SN add/release cycles, collapsing throughput. Tuning dual connectivity mobility parameters, B1/B2 thresholds, and measurement gap configuration prevents excessive SN release events.",
+      "confidence": 0.94,
+      "tags": ["endc", "mobility", "dual-connectivity", "handover", "causal", "diagnostic"]
+    }
+  ]
+}

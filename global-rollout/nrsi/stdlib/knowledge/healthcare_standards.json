@@ -1,0 +1,38 @@
+{
+  "domain": "healthcare",
+  "version": "2026.1",
+  "source": "HL7 International / WHO / AMA / CMS",
+  "source_tier": "t2_verified",
+  "facts": [
+    {
+      "id": "hs-fhir-standard",
+      "text": "HL7 FHIR (Fast Healthcare Interoperability Resources) is the modern healthcare data exchange standard. Core resources: Patient, Encounter, Observation, Condition, MedicationRequest, DiagnosticReport, Procedure, AllergyIntolerance. Uses RESTful API (GET/POST/PUT/DELETE), JSON/XML formats, OAuth2 for authorization. SMART on FHIR enables third-party app integration with EHR systems.",
+      "confidence": 0.96,
+      "tags": ["fhir", "hl7", "interoperability", "standard", "logical"]
+    },
+    {
+      "id": "hs-icd-coding",
+      "text": "ICD-10 (International Classification of Diseases, 10th revision) provides standardized diagnosis codes. Structure: 3-7 characters, first character is letter (chapter), digits 2-3 are category, digit 4+ are specificity. Examples: I21.0 (acute ST-elevation MI of anterior wall), J18.9 (pneumonia, unspecified), E11.65 (type 2 diabetes with hyperglycemia). ICD-10-CM used for diagnosis in US; ICD-10-PCS for inpatient procedures.",
+      "confidence": 0.96,
+      "tags": ["icd-10", "coding", "classification", "logical"]
+    },
+    {
+      "id": "hs-cpt-coding",
+      "text": "CPT (Current Procedural Terminology) codes describe medical procedures and services for billing. Categories: I (procedures/services, 00100-99499), II (performance measures), III (emerging technology). E/M codes (99201-99499) for evaluation and management visits, based on complexity (straightforward, low, moderate, high). Modifiers indicate special circumstances (e.g., -25 significant separate E/M, -59 distinct procedural service).",
+      "confidence": 0.95,
+      "tags": ["cpt", "coding", "billing", "logical"]
+    },
+    {
+      "id": "hs-snomed-ct",
+      "text": "SNOMED CT (Systematized Nomenclature of Medicine Clinical Terms) is the most comprehensive clinical terminology with 350,000+ concepts. Organized in hierarchies: Clinical Finding, Procedure, Body Structure, Organism, Substance, Pharmaceutical Product. Each concept has a unique SCTID, descriptions (preferred/synonym), and relationships (is-a, finding site, causative agent). Used for clinical documentation, decision support, and analytics.",
+      "confidence": 0.95,
+      "tags": ["snomed", "terminology", "clinical", "logical"]
+    },
+    {
+      "id": "hs-dicom-imaging",
+      "text": "DICOM (Digital Imaging and Communications in Medicine) is the standard for medical imaging. Stores images with metadata (patient demographics, study/series/instance UIDs, modality, acquisition parameters). Modalities: CT, MRI, US (ultrasound), XR (X-ray), MG (mammography), NM (nuclear medicine), PT (PET). PACS (Picture Archiving and Communication System) stores and distributes DICOM images. Transfer syntaxes define compression (JPEG, JPEG2000, RLE).",
+      "confidence": 0.95,
+      "tags": ["dicom", "imaging", "standard", "logical"]
+    }
+  ]
+}

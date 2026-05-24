@@ -1,0 +1,511 @@
+/// NRSIP Provenance Chain — Full Forensic Trail.
+///
+/// Every NRS response carries a complete provenance chain:
+///   query_hash, neurons_fired, lobes_used, axioms_consulted,
+///   memory_layers, network_hops, processing_mode, h_score,
+///   section_labels, dilithium_signature.
+///
+/// Supports EU AI Act and NIST AI RMF compliance.
+///
+/// Patent-covered: Provenance chain, reasoning trace, Dilithium-signed provenance.
+///
+/// Ported from nrsip/provenance.py.
+
+module provenance
+
+
+import time from "std/time"
+import hashlib from "std/hashlib"
+import json from "std/json"
+/// ── Section Label ──
+
+enum SectionLabel {
+    VALIDATED = "VALIDATED",
+    CREATIVE = "CREATIVE"
+}
+
+/// ── Data Types ──
+
+type ProvenanceHop {
+    instance_id: string,
+    region: string,
+    role: string,
+    timestamp_ms: int,
+    processing_time_us: int
+}
+
+type AxiomReference {
+    axiom_id: string,
+    tier: string,
+    domain: string,
+    matched: bool,
+    confidence: float
+}
+
+type LobeActivation {
+    lobe_type: string,
+    processing_time_ms: float,
+    confidence: float,
+    crease_used: Optional[string],
+    escalated: bool
+}
+
+type MemoryAccess {
+    layer: string,
+    key: string,
+    hit: bool,
+    latency_ms: float,
+    vltip_address: Optional[string]
+}
+
+type ProvenanceSection {
+    index: int,
+    content_hash: string,
+    label: SectionLabel,
+    confidence: float,
+    h_score: float,
+    lobe: string,
+    axioms: List[string]
+}
+
+/// ── Provenance Chain ──
+
+class ProvenanceChain {
+    fn init(self, query_hash: string, response_hash: string,
+            processing_mode: string, tier: string, domain: string) {
+        self.query_hash = query_hash
+        self.response_hash = response_hash
+        self.processing_mode = processing_mode
+        self.tier = tier
+        self.domain = domain
+
+        self.neurons_fired = 0
+        self.activation_signature = ""
+
+        self.lobes_activated = []
+        self.axioms_consulted = []
+        self.memory_accesses = []
+        self.network_hops = []
+        self.sections = []
+
+        self.h_score = 0.0
+        self.h_verdict = "pending"
+        self.h_components = {}
+
+        self.confidence = 0.0
+        self.total_processing_time_ms = 0.0
+
+        self.instance_id = ""
+        self.timestamp_ms = to_int(time.time() * 1000.0)
+
+        self.dilithium_signature = nil
+        self.signature_algorithm = "CRYSTALS-Dilithium3"
+
+        self.povi_round_id = nil
+        self.povi_proof_hash = nil
+    }
+
+    fn chain_hash(self) -> string {
+        let lobes = []
+        for la in self.lobes_activated {
+            lobes.append(la.lobe_type)
+        }
+        let payload = json.dumps({
+            "query_hash": self.query_hash,
+            "response_hash": self.response_hash,
+            "processing_mode": self.processing_mode,
+            "activation_signature": self.activation_signature,
+            "h_score": to_string(self.h_score),
+            "tier": self.tier,
+            "neurons_fired": self.neurons_fired,
+            "lobes": lobes,
+            "axiom_count": self.axioms_consulted.len(),
+            "hops": self.network_hops.len(),
+            "instance_id": self.instance_id
+        }, true)
+        return hashlib.sha256(payload).hexdigest()
+    }
+
+    fn sign(self, signing_fn: Optional[any]) {
+        let chain_data = self.chain_hash()
+        if signing_fn != nil {
+            self.dilithium_signature = signing_fn(chain_data.to_bytes())
+        } else {
+            self.dilithium_signature = hashlib.sha256("dilithium-fallback:" + chain_data).hexdigest()
+        }
+    }
+
+    fn verify(self, verify_fn: Optional[any]) -> bool {
+        if self.dilithium_signature == nil {
+            return false
+        }
+        let chain_data = self.chain_hash()
+        if verify_fn != nil {
+            return verify_fn(chain_data.to_bytes(), self.dilithium_signature)
+        }
+        let expected = hashlib.sha256("dilithium-fallback:" + chain_data).hexdigest()
+        return self.dilithium_signature == expected
+    }
+
+    fn to_dict(self) -> any {
+        let lobes_list = []
+        for la in self.lobes_activated {
+            lobes_list.append({
+                "lobe": la.lobe_type, "time_ms": la.processing_time_ms,
+                "confidence": la.confidence, "crease": la.crease_used
+            })
+        }
+        let axioms_list = []
+        for ax in self.axioms_consulted {
+            axioms_list.append({
+                "id": ax.axiom_id, "tier": ax.tier, "domain": ax.domain,
+                "matched": ax.matched, "confidence": ax.confidence
+            })
+        }
+        let memory_list = []
+        for ma in self.memory_accesses {
+            memory_list.append({
+                "layer": ma.layer, "key": ma.key, "hit": ma.hit,
+                "latency_ms": ma.latency_ms, "vltip": ma.vltip_address
+            })
+        }
+        let hops_list = []
+        for nh in self.network_hops {
+            hops_list.append({
+                "instance": nh.instance_id, "region": nh.region,
+                "role": nh.role, "timestamp_ms": nh.timestamp_ms
+            })
+        }
+        let sections_list = []
+        for s in self.sections {
+            sections_list.append({
+                "index": s.index, "label": s.label.value,
+                "confidence": s.confidence, "h_score": s.h_score, "lobe": s.lobe
+            })
+        }
+        return {
+            "query_hash": self.query_hash,
+            "response_hash": self.response_hash,
+            "chain_hash": self.chain_hash(),
+            "processing_mode": self.processing_mode,
+            "tier": self.tier,
+            "domain": self.domain,
+            "neurons_fired": self.neurons_fired,
+            "activation_signature": self.activation_signature,
+            "lobes_activated": lobes_list,
+            "axioms_consulted": axioms_list,
+            "memory_accesses": memory_list,
+            "network_hops": hops_list,
+            "sections": sections_list,
+            "h_score": self.h_score,
+            "h_verdict": self.h_verdict,
+            "h_components": self.h_components,
+            "confidence": self.confidence,
+            "total_processing_time_ms": self.total_processing_time_ms,
+            "instance_id": self.instance_id,
+            "timestamp_ms": self.timestamp_ms,
+            "dilithium_signature": self.dilithium_signature,
+            "signature_algorithm": self.signature_algorithm,
+            "povi_round_id": self.povi_round_id,
+            "povi_proof_hash": self.povi_proof_hash
+        }
+    }
+
+    fn reasoning_trace(self) -> string {
+        let lines = []
+        lines.append("Query: " + self.query_hash.slice(0, 16) + "...")
+        lines.append("Mode: " + self.processing_mode + " | Tier: " + self.tier + " | Domain: " + self.domain)
+        lines.append("Neurons fired: " + to_string(self.neurons_fired) + " | Activation: " + self.activation_signature.slice(0, 16) + "...")
+        if self.lobes_activated.len() > 0 {
+            let lobe_parts = []
+            for la in self.lobes_activated {
+                lobe_parts.append(la.lobe_type + "(" + to_string(la.confidence) + ")")
+            }
+            lines.append("Lobes: " + lobe_parts.join(", "))
+        }
+        if self.axioms_consulted.len() > 0 {
+            let matched_count = 0
+            for ax in self.axioms_consulted {
+                if ax.matched {
+                    matched_count += 1
+                }
+            }
+            lines.append("Axioms: " + to_string(matched_count) + "/" + to_string(self.axioms_consulted.len()) + " matched")
+        }
+        if self.memory_accesses.len() > 0 {
+            let hits = 0
+            for ma in self.memory_accesses {
+                if ma.hit {
+                    hits += 1
+                }
+            }
+            lines.append("Memory: " + to_string(hits) + "/" + to_string(self.memory_accesses.len()) + " cache hits")
+        }
+        lines.append("H_score: " + to_string(self.h_score) + " (" + self.h_verdict + ")")
+        lines.append("Confidence: " + to_string(self.confidence))
+        for s in self.sections {
+            lines.append("  Section " + to_string(s.index) + ": [" + s.label.value + "] conf=" + to_string(s.confidence))
+        }
+        lines.append("Processing: " + to_string(self.total_processing_time_ms) + "ms | Hops: " + to_string(self.network_hops.len()))
+        if self.dilithium_signature != nil {
+            lines.append("Signed: " + self.signature_algorithm + " (" + self.dilithium_signature.slice(0, 16) + "...)")
+        }
+        return lines.join("\n")
+    }
+}
+
+/// ── Provenance Event (append-only chain) ──
+
+type ProvenanceEvent {
+    event_index: int,
+    event_type: string,
+    data: Map[string, any],
+    timestamp_ms: int,
+    prev_hash: string,
+    event_hash: string
+}
+
+fn provenance_event_compute_hash(e: ProvenanceEvent) -> string {
+    let payload = json.dumps({
+        "event_index": e.event_index,
+        "event_type": e.event_type,
+        "data": e.data,
+        "timestamp_ms": e.timestamp_ms,
+        "prev_hash": e.prev_hash
+    }, true)
+    return hashlib.sha256(payload).hexdigest()
+}
+
+fn provenance_event_seal(e: ProvenanceEvent) {
+    e.event_hash = provenance_event_compute_hash(e)
+}
+
+fn provenance_event_verify(e: ProvenanceEvent) -> bool {
+    return e.event_hash == provenance_event_compute_hash(e)
+}
+
+/// ── Append-Only Provenance Log ──
+
+class AppendOnlyProvenanceLog {
+    fn init(self) {
+        self._events = []
+    }
+
+    fn append(self, event_type: string, data: Map[string, any]) -> ProvenanceEvent {
+        let prev_hash = ""
+        if self._events.len() > 0 {
+            prev_hash = self._events[self._events.len() - 1].event_hash
+        }
+        let event = ProvenanceEvent {
+            event_index: self._events.len(),
+            event_type: event_type,
+            data: data,
+            timestamp_ms: to_int(time.time() * 1000.0),
+            prev_hash: prev_hash,
+            event_hash: ""
+        }
+        provenance_event_seal(event)
+        self._events.append(event)
+        return event
+    }
+
+    fn verify_chain(self) -> Tuple[bool, string] {
+        if self._events.len() == 0 {
+            return Tuple(true, "empty chain")
+        }
+        if self._events[0].prev_hash != "" {
+            return Tuple(false, "first event must have empty prev_hash")
+        }
+        for i in range(0, self._events.len()) {
+            let event = self._events[i]
+            if !provenance_event_verify(event) {
+                return Tuple(false, "event " + to_string(i) + " hash mismatch")
+            }
+            if i > 0 {
+                if event.prev_hash != self._events[i - 1].event_hash {
+                    return Tuple(false, "event " + to_string(i) + " prev_hash linkage broken")
+                }
+            }
+        }
+        return Tuple(true, "chain integrity verified")
+    }
+
+    fn query(self, event_type: Optional[string], start_index: int, limit: int) -> List[any] {
+        let end = start_index + limit
+        if end > self._events.len() {
+            end = self._events.len()
+        }
+        let result = []
+        for i in range(start_index, end) {
+            let e = self._events[i]
+            if event_type != nil {
+                if e.event_type != event_type {
+                    continue
+                }
+            }
+            result.append(e)
+        }
+        return result
+    }
+
+    fn events(self) -> List[any] {
+        return self._events.copy()
+    }
+
+    fn chain_hash(self) -> string {
+        if self._events.len() == 0 {
+            return ""
+        }
+        return self._events[self._events.len() - 1].event_hash
+    }
+
+    fn length(self) -> int {
+        return self._events.len()
+    }
+
+    fn to_dict(self) -> any {
+        let events_list = []
+        for e in self._events {
+            events_list.append({
+                "index": e.event_index,
+                "type": e.event_type,
+                "hash": e.event_hash.slice(0, 16),
+                "prev": e.prev_hash.slice(0, 16)
+            })
+        }
+        return {
+            "length": self._events.len(),
+            "chain_hash": self.chain_hash(),
+            "events": events_list
+        }
+    }
+}
+
+/// ── Provenance Builder ──
+
+class ProvenanceBuilder {
+    fn init(self, query: string, instance_id: string) {
+        self._chain = ProvenanceChain()
+        self._chain.init(hashlib.sha256(query).hexdigest(), "", "", "", "")
+        self._chain.instance_id = instance_id
+        self._start_ms = time.monotonic() * 1000.0
+        self._event_log = AppendOnlyProvenanceLog()
+        self._event_log.init()
+        self._event_log.append("query_ingested",
+            { "query_hash": self._chain.query_hash })
+    }
+
+    fn set_mode(self, mode: string, tier: string, domain: string) -> ProvenanceBuilder {
+        self._chain.processing_mode = mode
+        self._chain.tier = tier
+        self._chain.domain = domain
+        self._event_log.append("mode_set",
+            { "mode": mode, "tier": tier, "domain": domain })
+        return self
+    }
+
+    fn set_neurons(self, count: int, signature: string) -> ProvenanceBuilder {
+        self._chain.neurons_fired = count
+        self._chain.activation_signature = signature
+        self._event_log.append("neurons_fired",
+            { "count": count, "sig": signature.slice(0, 16) })
+        return self
+    }
+
+    fn add_lobe(self, lobe_type: string, time_ms: float, confidence: float,
+                crease: Optional[string], escalated: bool) -> ProvenanceBuilder {
+        self._chain.lobes_activated.append(LobeActivation {
+            lobe_type: lobe_type, processing_time_ms: time_ms,
+            confidence: confidence, crease_used: crease, escalated: escalated
+        })
+        return self
+    }
+
+    fn add_axiom(self, axiom_id: string, tier: string, domain: string,
+                 matched: bool, confidence: float) -> ProvenanceBuilder {
+        self._chain.axioms_consulted.append(AxiomReference {
+            axiom_id: axiom_id, tier: tier, domain: domain,
+            matched: matched, confidence: confidence
+        })
+        return self
+    }
+
+    fn add_memory_access(self, layer: string, key: string, hit: bool,
+                         latency_ms: float, vltip: Optional[string]) -> ProvenanceBuilder {
+        self._chain.memory_accesses.append(MemoryAccess {
+            layer: layer, key: key, hit: hit,
+            latency_ms: latency_ms, vltip_address: vltip
+        })
+        return self
+    }
+
+    fn add_hop(self, instance_id: string, region: string, role: string,
+               processing_us: int) -> ProvenanceBuilder {
+        self._chain.network_hops.append(ProvenanceHop {
+            instance_id: instance_id, region: region, role: role,
+            timestamp_ms: to_int(time.time() * 1000.0),
+            processing_time_us: processing_us
+        })
+        return self
+    }
+
+    fn add_section(self, index: int, content: string, label: SectionLabel,
+                   confidence: float, h_score: float, lobe: string,
+                   axioms: Optional[List[string]]) -> ProvenanceBuilder {
+        let ax = axioms
+        if ax == nil {
+            ax = []
+        }
+        self._chain.sections.append(ProvenanceSection {
+            index: index,
+            content_hash: hashlib.sha256(content).hexdigest().slice(0, 16),
+            label: label,
+            confidence: confidence,
+            h_score: h_score,
+            lobe: lobe,
+            axioms: ax
+        })
+        return self
+    }
+
+    fn set_h_score(self, score: float, verdict: string,
+                   components: Optional[Map[string, float]]) -> ProvenanceBuilder {
+        self._chain.h_score = score
+        self._chain.h_verdict = verdict
+        if components != nil {
+            self._chain.h_components = components
+        }
+        return self
+    }
+
+    fn set_confidence(self, confidence: float) -> ProvenanceBuilder {
+        self._chain.confidence = confidence
+        return self
+    }
+
+    fn event_log(self) -> AppendOnlyProvenanceLog {
+        return self._event_log
+    }
+
+    fn finalize(self, response: string, signing_fn: Optional[any]) -> ProvenanceChain {
+        self._chain.response_hash = hashlib.sha256(response).hexdigest()
+        self._chain.total_processing_time_ms = round(time.monotonic() * 1000.0 - self._start_ms, 2)
+        self._event_log.append("response_finalized", {
+            "response_hash": self._chain.response_hash.slice(0, 16),
+            "elapsed_ms": self._chain.total_processing_time_ms
+        })
+        self._chain.sign(signing_fn)
+        self._event_log.append("chain_signed", {
+            "algorithm": self._chain.signature_algorithm,
+            "chain_hash": self._chain.chain_hash().slice(0, 16)
+        })
+        return self._chain
+    }
+}
+
+export SectionLabel
+export ProvenanceHop, AxiomReference, LobeActivation, MemoryAccess, ProvenanceSection
+export ProvenanceChain
+export ProvenanceEvent, provenance_event_compute_hash, provenance_event_seal, provenance_event_verify
+export AppendOnlyProvenanceLog
+export ProvenanceBuilder

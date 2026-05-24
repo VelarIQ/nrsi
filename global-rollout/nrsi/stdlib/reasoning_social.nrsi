@@ -1,0 +1,412 @@
+/// NRSI Reasoning — Theory of Mind & Social Cognition.
+///
+/// Belief-state tracking, perspective-taking, intent inference,
+/// nested mental state reasoning ("Alice thinks Bob knows X"),
+/// and emotional state modeling.
+///
+/// All transformer-free.  No external ML dependencies.
+
+module reasoning_social
+
+
+import time from "std/time"
+import re from "std/re"
+/// ── Mental State Types ─────────────────────────────────────────────
+
+enum BeliefState {
+    BELIEVES_TRUE = "believes_true",
+    BELIEVES_FALSE = "believes_false",
+    UNCERTAIN = "uncertain",
+    UNAWARE = "unaware"
+}
+
+enum IntentType {
+    INFORM = "inform",
+    REQUEST = "request",
+    CHALLENGE = "challenge",
+    CLARIFY = "clarify",
+    EXPLORE = "explore",
+    PERSUADE = "persuade",
+    CONFIRM = "confirm",
+    UNKNOWN = "unknown"
+}
+
+enum EmotionalValence {
+    POSITIVE = "positive",
+    NEGATIVE = "negative",
+    NEUTRAL = "neutral",
+    MIXED = "mixed"
+}
+
+type MentalState {
+    agent: string,
+    proposition: string,
+    belief: BeliefState,
+    confidence: float,
+    source: string,
+    timestamp: float
+}
+
+type AgentModel {
+    agent_id: string,
+    beliefs: Dict[string, MentalState],
+    goals: List[string],
+    emotional_state: EmotionalValence,
+    knowledge_level: string,
+    interaction_count: int,
+    trust_score: float
+}
+
+/// ── Belief Tracker ─────────────────────────────────────────────────
+
+class BeliefTracker {
+    fn __init__(self) {
+        self._agents: Dict[string, AgentModel] = {}
+    }
+
+    fn get_or_create_agent(self, agent_id: string) -> AgentModel {
+        if agent_id not in self._agents {
+            self._agents[agent_id] = AgentModel {
+                agent_id: agent_id,
+                beliefs: {},
+                goals: [],
+                emotional_state: EmotionalValence.NEUTRAL,
+                knowledge_level: "unknown",
+                interaction_count: 0,
+                trust_score: 0.5
+            }
+        }
+        return self._agents[agent_id]
+    }
+
+    fn set_belief(self, agent: string, proposition: string,
+                  belief: BeliefState, confidence: float,
+                  source: string) {
+        let model = self.get_or_create_agent(agent)
+        model.beliefs[proposition] = MentalState {
+            agent: agent, proposition: proposition,
+            belief: belief, confidence: confidence,
+            source: source, timestamp: time.time()
+        }
+    }
+
+    fn get_belief(self, agent: string,
+                  proposition: string) -> Optional[MentalState] {
+        let model = self._agents.get(agent)
+        if model == None {
+            return None
+        }
+        return model.beliefs.get(proposition)
+    }
+
+    fn set_nested_belief(self, agent_a: string, agent_b: string,
+                         proposition: string, belief: BeliefState,
+                         confidence: float) {
+        let nested_prop = agent_b + ".believes." + proposition
+        self.set_belief(agent_a, nested_prop, belief, confidence,
+                        "inference about " + agent_b)
+    }
+
+    fn get_nested_belief(self, agent_a: string, agent_b: string,
+                         proposition: string) -> Optional[MentalState] {
+        let nested_prop = agent_b + ".believes." + proposition
+        return self.get_belief(agent_a, nested_prop)
+    }
+
+    fn common_ground(self, agent_a: string,
+                     agent_b: string) -> List[any] {
+        let model_a = self._agents.get(agent_a)
+        let model_b = self._agents.get(agent_b)
+        if model_a == None or model_b == None {
+            return []
+        }
+
+        let shared: List[string] = []
+        for prop in model_a.beliefs {
+            let state_a = model_a.beliefs[prop]
+            let state_b = model_b.beliefs.get(prop)
+            if state_b != None {
+                if state_a.belief == BeliefState.BELIEVES_TRUE and state_b.belief == BeliefState.BELIEVES_TRUE {
+                    shared.append(prop)
+                }
+            }
+        }
+        return shared
+    }
+
+    fn disagreements(self, agent_a: string,
+                     agent_b: string) -> List[any] {
+        let model_a = self._agents.get(agent_a)
+        let model_b = self._agents.get(agent_b)
+        if model_a == None or model_b == None {
+            return []
+        }
+
+        let conflicts: List[Tuple[string, BeliefState, BeliefState]] = []
+        for prop in model_a.beliefs {
+            let state_a = model_a.beliefs[prop]
+            let state_b = model_b.beliefs.get(prop)
+            if state_b != None and state_a.belief != state_b.belief {
+                let a_strong = (state_a.belief == BeliefState.BELIEVES_TRUE or
+                                state_a.belief == BeliefState.BELIEVES_FALSE)
+                let b_strong = (state_b.belief == BeliefState.BELIEVES_TRUE or
+                                state_b.belief == BeliefState.BELIEVES_FALSE)
+                if a_strong and b_strong {
+                    conflicts.append((prop, state_a.belief, state_b.belief))
+                }
+            }
+        }
+        return conflicts
+    }
+}
+
+/// ── Intent Inference ───────────────────────────────────────────────
+
+let _INTENT_PATTERNS: List[Tuple[string, IntentType]] = [
+    ("^(?:can you|could you|please|would you|I need|I want)", IntentType.REQUEST),
+    ("\\?$", IntentType.REQUEST),
+    ("^(?:why|how come|but what about)", IntentType.CHALLENGE),
+    ("^(?:what do you mean|I don't understand|clarify)", IntentType.CLARIFY),
+    ("^(?:what if|suppose|imagine|consider)", IntentType.EXPLORE),
+    ("^(?:actually|in fact|did you know|FYI)", IntentType.INFORM),
+    ("^(?:don't you think|surely|isn't it true)", IntentType.PERSUADE),
+    ("^(?:right|correct|exactly|yes|so basically)", IntentType.CONFIRM)
+]
+
+class IntentInferrer {
+    fn infer(self, text: string) -> Tuple[IntentType, float] {
+        let text_stripped = text.strip()
+        for entry in _INTENT_PATTERNS {
+            let pattern = entry[0]
+            let intent = entry[1]
+            if re.search(pattern, text_stripped, re.IGNORECASE) {
+                return (intent, 0.7)
+            }
+        }
+
+        if "?" in text {
+            return (IntentType.REQUEST, 0.6)
+        }
+
+        let word_count = len(text.split())
+        if word_count > 20 {
+            return (IntentType.INFORM, 0.5)
+        }
+        if word_count < 5 {
+            return (IntentType.CONFIRM, 0.4)
+        }
+
+        return (IntentType.UNKNOWN, 0.3)
+    }
+}
+
+/// ── Emotional State Detector ───────────────────────────────────────
+
+let _POSITIVE_SIGNALS: Set[string] = {
+    "thanks", "great", "awesome", "perfect", "excellent", "love",
+    "helpful", "amazing", "wonderful", "good", "nice", "cool",
+    "fantastic", "brilliant", "yes", "exactly", "right"
+}
+
+let _NEGATIVE_SIGNALS: Set[string] = {
+    "wrong", "bad", "terrible", "awful", "hate", "stupid",
+    "useless", "frustrated", "annoying", "confused", "disappointing",
+    "no", "incorrect", "mistake", "fail", "broken"
+}
+
+let _URGENCY_SIGNALS: Set[string] = {
+    "urgent", "asap", "immediately", "critical", "emergency",
+    "hurry", "deadline", "now", "quickly"
+}
+
+class EmotionalDetector {
+    fn detect(self, text: string) -> Tuple[EmotionalValence, float, bool] {
+        let tokens: Set[string] = set()
+        for w in text.lower().split() {
+            tokens.add(w)
+        }
+        let pos = 0
+        for w in tokens {
+            if w in _POSITIVE_SIGNALS {
+                pos += 1
+            }
+        }
+        let neg = 0
+        for w in tokens {
+            if w in _NEGATIVE_SIGNALS {
+                neg += 1
+            }
+        }
+        let urgent = false
+        for w in tokens {
+            if w in _URGENCY_SIGNALS {
+                urgent = true
+                break
+            }
+        }
+
+        if pos > neg {
+            return (EmotionalValence.POSITIVE, min(pos / 3.0, 1.0), urgent)
+        } else if neg > pos {
+            return (EmotionalValence.NEGATIVE, min(neg / 3.0, 1.0), urgent)
+        } else if pos > 0 and neg > 0 {
+            return (EmotionalValence.MIXED, 0.5, urgent)
+        }
+        return (EmotionalValence.NEUTRAL, 0.3, urgent)
+    }
+}
+
+/// ── Perspective-Taking Engine ───────────────────────────────────────
+
+class PerspectiveEngine {
+    fn __init__(self, tracker: BeliefTracker) {
+        self._tracker = tracker
+    }
+
+    fn what_would_they_think(self, agent: string,
+                             proposition: string) -> Dict[string, Any] {
+        let model = self._tracker._agents.get(agent)
+        if model == None {
+            return {
+                "agent": agent,
+                "proposition": proposition,
+                "assessment": "unknown",
+                "reason": "No model for this agent"
+            }
+        }
+
+        let belief = model.beliefs.get(proposition)
+        if belief != None {
+            return {
+                "agent": agent,
+                "proposition": proposition,
+                "assessment": belief.belief.value,
+                "confidence": belief.confidence,
+                "reason": "Explicit belief recorded (source: " + belief.source + ")"
+            }
+        }
+
+        let related: List[Tuple[string, MentalState]] = []
+        let prop_words: Set[string] = set()
+        for w in proposition.lower().split() {
+            prop_words.add(w)
+        }
+        for p in model.beliefs {
+            let state = model.beliefs[p]
+            let p_words: Set[string] = set()
+            for w in p.lower().split() {
+                p_words.add(w)
+            }
+            let has_overlap = false
+            for w in prop_words {
+                if w in p_words {
+                    has_overlap = true
+                    break
+                }
+            }
+            if has_overlap {
+                related.append((p, state))
+            }
+        }
+
+        if len(related) > 0 {
+            let rel_names: List[string] = []
+            let rel_beliefs: List[Dict[string, Any]] = []
+            for i in range(min(3, len(related))) {
+                rel_names.append(related[i][0])
+                rel_beliefs.append({
+                    "prop": related[i][0],
+                    "belief": related[i][1].belief.value
+                })
+            }
+            return {
+                "agent": agent,
+                "proposition": proposition,
+                "assessment": "inferred_uncertain",
+                "confidence": 0.3,
+                "reason": "No direct belief, but related beliefs: " + str(rel_names),
+                "related_beliefs": rel_beliefs
+            }
+        }
+
+        return {
+            "agent": agent,
+            "proposition": proposition,
+            "assessment": "unaware",
+            "reason": agent + " has no knowledge related to this proposition"
+        }
+    }
+
+    fn false_belief_check(self, agent: string, proposition: string,
+                          ground_truth: BeliefState) -> Dict[string, Any] {
+        let belief = self._tracker.get_belief(agent, proposition)
+        if belief == None {
+            return {"has_false_belief": false, "reason": "No belief recorded"}
+        }
+
+        if belief.belief != ground_truth {
+            return {
+                "has_false_belief": true,
+                "agent": agent,
+                "proposition": proposition,
+                "agent_believes": belief.belief.value,
+                "ground_truth": ground_truth.value,
+                "reason": agent + " believes " + proposition + " is " +
+                    belief.belief.value + " but it is actually " +
+                    ground_truth.value
+            }
+        }
+        return {"has_false_belief": false, "reason": "Belief matches ground truth"}
+    }
+}
+
+/// ── Unified Social Cognition ───────────────────────────────────────
+
+class SocialCognition {
+    fn __init__(self) {
+        self.beliefs = BeliefTracker()
+        self.intents = IntentInferrer()
+        self.emotions = EmotionalDetector()
+        self.perspectives = PerspectiveEngine(self.beliefs)
+    }
+
+    fn process_utterance(self, agent: string,
+                         text: string) -> Dict[string, Any] {
+        let intent_result = self.intents.infer(text)
+        let intent = intent_result[0]
+        let intent_conf = intent_result[1]
+        let emotion_result = self.emotions.detect(text)
+        let emotion = emotion_result[0]
+        let emotion_strength = emotion_result[1]
+        let urgent = emotion_result[2]
+
+        let model = self.beliefs.get_or_create_agent(agent)
+        model.interaction_count += 1
+        model.emotional_state = emotion
+
+        return {
+            "agent": agent,
+            "intent": intent.value,
+            "intent_confidence": intent_conf,
+            "emotion": emotion.value,
+            "emotion_strength": emotion_strength,
+            "urgent": urgent,
+            "interaction_count": model.interaction_count
+        }
+    }
+}
+
+/// ── Gate ────────────────────────────────────────────────────────────
+
+gate social_gate(data: raw[Any]) -> validated[Any] {
+    require confidence >= 0.5
+    validate coherence_check
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export BeliefState, IntentType, EmotionalValence
+export MentalState, AgentModel
+export BeliefTracker, IntentInferrer, EmotionalDetector
+export PerspectiveEngine, SocialCognition
+export social_gate

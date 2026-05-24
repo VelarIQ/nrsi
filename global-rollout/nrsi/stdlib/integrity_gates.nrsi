@@ -1,0 +1,535 @@
+/// NRSIP transport integrity gates: pre-handler checks enforced before business logic.
+///
+/// Full implementation of `nrsip/integrity_gates.py`.
+/// Each gate is a standalone validator composable into an ordered chain.
+/// The chain short-circuits on first failure with full rejection context.
+
+module integrity_gates
+
+
+import time from "std/time"
+import compute_hop_hash from "nrsip_signing"
+import HopRecord from "nrsip_messages"
+
+/// ---------- Enumerations ----------
+
+enum GateVerdict {
+    PASS,
+    REJECT
+}
+
+/// ---------- Data records ----------
+
+type GateResult {
+    gate_name: string,
+    verdict: GateVerdict,
+    reason: string,
+    evidence: Dict[string, Any],
+    elapsed_us: int
+}
+
+type PacketContext {
+    source: string,
+    destination: string,
+    sequence: int,
+    nonce: string,
+    issued_at_ms: int,
+    ttl_hops: int,
+    validation_tier: string,
+    packet_type: string,
+    session_id: string,
+    key_id: string,
+    hop_chain: List[Dict[string, string]],
+    security_profile: Dict[string, string]
+}
+
+type ChainResult {
+    passed: bool,
+    results: List[GateResult],
+    total_elapsed_us: int,
+    rejected_by: Optional[string],
+    rejection_reason: string
+}
+
+fn chain_result_to_audit_dict(cr: ChainResult) -> Dict[string, Any] {
+    let gate_entries = []
+    for r in cr.results {
+        append(gate_entries, {
+            "gate": r.gate_name,
+            "verdict": enum_value(r.verdict),
+            "reason": r.reason,
+            "elapsed_us": r.elapsed_us
+        })
+    }
+    return {
+        "passed": cr.passed,
+        "rejected_by": cr.rejected_by,
+        "rejection_reason": cr.rejection_reason,
+        "total_elapsed_us": cr.total_elapsed_us,
+        "gates": gate_entries
+    }
+}
+
+/// ---------- IntegrityGate (abstract base) ----------
+
+class IntegrityGate {
+    fn name(self) -> string {
+        raise NotImplementedError("abstract property")
+    }
+
+    fn check(self, ctx: PacketContext) -> GateResult {
+        raise NotImplementedError("abstract method")
+    }
+}
+
+/// ---------- ReplayGate ----------
+
+class ReplayGate(IntegrityGate) {
+    fn new(self, ttl_seconds: float, store: Optional[Any]) {
+        self._name = "replay"
+        self._ttl = ttl_seconds
+        self._store = store
+        self._memory = {}
+    }
+
+    fn name(self) -> string {
+        return self._name
+    }
+
+    fn _purge_memory(self, now: float) {
+        let expired = []
+        for k in keys(self._memory) {
+            if now - self._memory[k] > self._ttl {
+                append(expired, k)
+            }
+        }
+        for k in expired {
+            delete(self._memory, k)
+        }
+    }
+
+    fn check(self, ctx: PacketContext) -> GateResult {
+        let start = monotonic_now()
+        let nonce = ctx.nonce
+        if nonce == "" {
+            return GateResult {
+                gate_name: self._name,
+                verdict: GateVerdict.REJECT,
+                reason: "missing nonce",
+                evidence: {},
+                elapsed_us: int((monotonic_now() - start) * 1000000)
+            }
+        }
+
+        let registered = false
+        if self._store != None {
+            registered = self._store.register(
+                encode_utf8(nonce), time.time(), self._ttl
+            )
+        } else {
+            let now = time.time()
+            self._purge_memory(now)
+            if nonce in self._memory {
+                registered = false
+            } else {
+                self._memory[nonce] = now
+                registered = true
+            }
+        }
+
+        let verdict = GateVerdict.PASS
+        let reason = ""
+        if !registered {
+            verdict = GateVerdict.REJECT
+            reason = "replay detected"
+        }
+        return GateResult {
+            gate_name: self._name,
+            verdict: verdict,
+            reason: reason,
+            evidence: {"nonce": slice_string(nonce, 0, 16) + "..."},
+            elapsed_us: int((monotonic_now() - start) * 1000000)
+        }
+    }
+}
+
+/// ---------- SequenceGate ----------
+
+class SequenceGate(IntegrityGate) {
+    fn new(self, window: int) {
+        self._name = "sequence"
+        self._window = window
+        self._max_seq = {}
+        self._seen = {}
+    }
+
+    fn name(self) -> string {
+        return self._name
+    }
+
+    fn check(self, ctx: PacketContext) -> GateResult {
+        let start = monotonic_now()
+        let peer = ctx.source
+        let seq = ctx.sequence
+
+        let mx = get_or_default(self._max_seq, peer, -1)
+        if peer not in self._seen {
+            self._seen[peer] = {}
+        }
+        let bucket = self._seen[peer]
+
+        if seq in bucket {
+            return GateResult {
+                gate_name: self._name,
+                verdict: GateVerdict.REJECT,
+                reason: "duplicate sequence",
+                evidence: {"peer": peer, "sequence": seq},
+                elapsed_us: int((monotonic_now() - start) * 1000000)
+            }
+        }
+        if mx >= 0 and seq + self._window < mx {
+            return GateResult {
+                gate_name: self._name,
+                verdict: GateVerdict.REJECT,
+                reason: "sequence rollback beyond window",
+                evidence: {"peer": peer, "sequence": seq, "max_seen": mx, "window": self._window},
+                elapsed_us: int((monotonic_now() - start) * 1000000)
+            }
+        }
+
+        bucket[seq] = true
+        if seq > mx {
+            self._max_seq[peer] = seq
+            let floor = seq - self._window
+            let to_remove = []
+            for s in keys(bucket) {
+                if s < floor {
+                    append(to_remove, s)
+                }
+            }
+            for s in to_remove {
+                delete(bucket, s)
+            }
+        }
+
+        return GateResult {
+            gate_name: self._name,
+            verdict: GateVerdict.PASS,
+            reason: "",
+            evidence: {"peer": peer, "sequence": seq},
+            elapsed_us: int((monotonic_now() - start) * 1000000)
+        }
+    }
+}
+
+/// ---------- TTLGate ----------
+
+class TTLGate(IntegrityGate) {
+    fn new(self, min_ttl: int) {
+        self._name = "ttl"
+        self._min_ttl = min_ttl
+    }
+
+    fn name(self) -> string {
+        return self._name
+    }
+
+    fn check(self, ctx: PacketContext) -> GateResult {
+        let start = monotonic_now()
+        if ctx.ttl_hops < self._min_ttl {
+            return GateResult {
+                gate_name: self._name,
+                verdict: GateVerdict.REJECT,
+                reason: "TTL " + str(ctx.ttl_hops) + " below minimum " + str(self._min_ttl),
+                evidence: {"ttl_hops": ctx.ttl_hops, "min_ttl": self._min_ttl},
+                elapsed_us: int((monotonic_now() - start) * 1000000)
+            }
+        }
+        return GateResult {
+            gate_name: self._name,
+            verdict: GateVerdict.PASS,
+            reason: "",
+            evidence: {"ttl_hops": ctx.ttl_hops},
+            elapsed_us: int((monotonic_now() - start) * 1000000)
+        }
+    }
+}
+
+/// ---------- HopChainGate ----------
+
+class HopChainGate(IntegrityGate) {
+    fn new(self) {
+        self._name = "hop_chain"
+    }
+
+    fn name(self) -> string {
+        return self._name
+    }
+
+    fn check(self, ctx: PacketContext) -> GateResult {
+        let start = monotonic_now()
+
+        for i in range(len(ctx.hop_chain)) {
+            let hop = ctx.hop_chain[i]
+            let hop_record = HopRecord {
+                hop_index: i,
+                node_id: get_or_default(hop, "hop", get_or_default(hop, "node_id", "")),
+                key_id: get_or_default(hop, "signer", get_or_default(hop, "key_id", "")),
+                prev_hop_hash: get_or_default(hop, "prev_hash", get_or_default(hop, "prev_hop_hash", "")),
+                message_id: get_or_default(hop, "message_id", ""),
+                decision: get_or_default(hop, "decision", "recv"),
+                confidence: get_or_default(hop, "confidence", None),
+                latency_ms: get_or_default(hop, "latency_ms", None),
+                hop_hash: get_or_default(hop, "hash", get_or_default(hop, "hop_hash", "")),
+                signature: ""
+            }
+            let expected_hash = compute_hop_hash(hop_record)
+            if hop_record.hop_hash != "" and hop_record.hop_hash != expected_hash {
+                return GateResult {
+                    gate_name: self._name,
+                    verdict: GateVerdict.REJECT,
+                    reason: "hop-chain hash mismatch at index " + str(i),
+                    evidence: {
+                        "hop_index": i,
+                        "hop": hop_record.node_id,
+                        "expected": slice_string(expected_hash, 0, 16),
+                        "got": slice_string(hop_record.hop_hash, 0, 16)
+                    },
+                    elapsed_us: int((monotonic_now() - start) * 1000000)
+                }
+            }
+        }
+
+        return GateResult {
+            gate_name: self._name,
+            verdict: GateVerdict.PASS,
+            reason: "",
+            evidence: {"hop_count": len(ctx.hop_chain)},
+            elapsed_us: int((monotonic_now() - start) * 1000000)
+        }
+    }
+}
+
+/// ---------- TierGate ----------
+
+class TierGate(IntegrityGate) {
+    let TIER_ORDER = {"T0": 0, "T1": 1, "T2": 2, "T3": 3, "T4": 4}
+
+    fn new(self, required_tier: string) {
+        self._name = "tier"
+        self._required = required_tier
+    }
+
+    fn name(self) -> string {
+        return self._name
+    }
+
+    fn check(self, ctx: PacketContext) -> GateResult {
+        let start = monotonic_now()
+        let packet_rank = get_or_default(TierGate.TIER_ORDER, ctx.validation_tier, 0)
+        let required_rank = get_or_default(TierGate.TIER_ORDER, self._required, 1)
+
+        if packet_rank < required_rank {
+            return GateResult {
+                gate_name: self._name,
+                verdict: GateVerdict.REJECT,
+                reason: "tier " + ctx.validation_tier + " below required " + self._required,
+                evidence: {"packet_tier": ctx.validation_tier, "required_tier": self._required},
+                elapsed_us: int((monotonic_now() - start) * 1000000)
+            }
+        }
+        return GateResult {
+            gate_name: self._name,
+            verdict: GateVerdict.PASS,
+            reason: "",
+            evidence: {"packet_tier": ctx.validation_tier},
+            elapsed_us: int((monotonic_now() - start) * 1000000)
+        }
+    }
+}
+
+/// ---------- FreshnessGate ----------
+
+class FreshnessGate(IntegrityGate) {
+    fn new(self, max_age_ms: int) {
+        self._name = "freshness"
+        self._max_age_ms = max_age_ms
+    }
+
+    fn name(self) -> string {
+        return self._name
+    }
+
+    fn check(self, ctx: PacketContext) -> GateResult {
+        let start = monotonic_now()
+        let now_ms = int(time.time() * 1000)
+        let age_ms = now_ms - ctx.issued_at_ms
+
+        if age_ms > self._max_age_ms {
+            return GateResult {
+                gate_name: self._name,
+                verdict: GateVerdict.REJECT,
+                reason: "packet age " + str(age_ms) + "ms exceeds max " + str(self._max_age_ms) + "ms",
+                evidence: {"age_ms": age_ms, "max_age_ms": self._max_age_ms},
+                elapsed_us: int((monotonic_now() - start) * 1000000)
+            }
+        }
+        if age_ms < -self._max_age_ms {
+            return GateResult {
+                gate_name: self._name,
+                verdict: GateVerdict.REJECT,
+                reason: "packet from future (" + str(-age_ms) + "ms ahead)",
+                evidence: {"age_ms": age_ms},
+                elapsed_us: int((monotonic_now() - start) * 1000000)
+            }
+        }
+        return GateResult {
+            gate_name: self._name,
+            verdict: GateVerdict.PASS,
+            reason: "",
+            evidence: {"age_ms": age_ms},
+            elapsed_us: int((monotonic_now() - start) * 1000000)
+        }
+    }
+}
+
+/// ---------- SecurityProfileGate ----------
+
+class SecurityProfileGate(IntegrityGate) {
+    let REQUIRED_FIELDS = ["algorithm_bundle", "kem_provider", "signature_provider", "transcript_hash"]
+
+    fn new(self, require_oqs: bool) {
+        self._name = "security_profile"
+        self._require_oqs = require_oqs
+    }
+
+    fn name(self) -> string {
+        return self._name
+    }
+
+    fn check(self, ctx: PacketContext) -> GateResult {
+        let start = monotonic_now()
+
+        if ctx.session_id == "" and len(ctx.security_profile) == 0 {
+            return GateResult {
+                gate_name: self._name,
+                verdict: GateVerdict.PASS,
+                reason: "unencrypted packet (no session)",
+                evidence: {},
+                elapsed_us: int((monotonic_now() - start) * 1000000)
+            }
+        }
+
+        let missing = []
+        for f in SecurityProfileGate.REQUIRED_FIELDS {
+            if get_or_default(ctx.security_profile, f, "") == "" {
+                append(missing, f)
+            }
+        }
+        if len(missing) > 0 {
+            return GateResult {
+                gate_name: self._name,
+                verdict: GateVerdict.REJECT,
+                reason: "missing security_profile fields: " + join(missing, ","),
+                evidence: {"missing": missing},
+                elapsed_us: int((monotonic_now() - start) * 1000000)
+            }
+        }
+
+        let bundle = get_or_default(ctx.security_profile, "algorithm_bundle", "")
+        if self._require_oqs and !starts_with(bundle, "MLKEM") {
+            return GateResult {
+                gate_name: self._name,
+                verdict: GateVerdict.REJECT,
+                reason: "OQS strict: bundle " + bundle + " is not MLKEM-based",
+                evidence: {"bundle": bundle},
+                elapsed_us: int((monotonic_now() - start) * 1000000)
+            }
+        }
+
+        return GateResult {
+            gate_name: self._name,
+            verdict: GateVerdict.PASS,
+            reason: "",
+            evidence: {"bundle": bundle},
+            elapsed_us: int((monotonic_now() - start) * 1000000)
+        }
+    }
+}
+
+/// ---------- IntegrityGateChain ----------
+
+class IntegrityGateChain {
+    fn new(self, gates: Optional[List[IntegrityGate]]) {
+        if gates != None {
+            self._gates = gates
+        } else {
+            self._gates = []
+        }
+    }
+
+    fn add(self, gate: IntegrityGate) -> IntegrityGateChain {
+        append(self._gates, gate)
+        return self
+    }
+
+    fn enforce(self, ctx: PacketContext) -> ChainResult {
+        let results = []
+        let total_us = 0
+
+        for gate in self._gates {
+            let result = gate.check(ctx)
+            append(results, result)
+            total_us += result.elapsed_us
+
+            if result.verdict == GateVerdict.REJECT {
+                log_warning((
+                    "Integrity gate REJECT: gate=" + gate.name()
+                    + " reason=" + result.reason
+                    + " source=" + ctx.source
+                    + " seq=" + str(ctx.sequence)
+                ))
+                return ChainResult {
+                    passed: false,
+                    results: results,
+                    total_elapsed_us: total_us,
+                    rejected_by: gate.name(),
+                    rejection_reason: result.reason
+                }
+            }
+        }
+
+        return ChainResult {
+            passed: true,
+            results: results,
+            total_elapsed_us: total_us,
+            rejected_by: None,
+            rejection_reason: ""
+        }
+    }
+}
+
+/// ---------- Production chain builder ----------
+
+fn build_production_gate_chain(
+    replay_ttl: float, sequence_window: int,
+    max_age_ms: int, required_tier: string,
+    require_oqs: bool, replay_store: Optional[Any]
+) -> IntegrityGateChain {
+    return IntegrityGateChain.new([
+        ReplayGate.new(replay_ttl, replay_store),
+        SequenceGate.new(sequence_window),
+        FreshnessGate.new(max_age_ms),
+        TTLGate.new(1),
+        HopChainGate.new(),
+        TierGate.new(required_tier),
+        SecurityProfileGate.new(require_oqs)
+    ])
+}
+
+export GateVerdict, GateResult, PacketContext, ChainResult
+export chain_result_to_audit_dict
+export IntegrityGate
+export ReplayGate, SequenceGate, TTLGate, HopChainGate
+export TierGate, FreshnessGate, SecurityProfileGate
+export IntegrityGateChain, build_production_gate_chain

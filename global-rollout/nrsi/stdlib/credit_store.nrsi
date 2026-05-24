@@ -1,0 +1,167 @@
+/// Persistent storage backend for IP Credit Score ledgers.
+///
+/// Two backends: RedisStore (production) and MemoryStore (tests/dev).
+/// Ledgers serialized as JSON, keyed by entity_id.
+/// Score history capped to 1000 entries.
+///
+/// Ported from nrsip/credit_store.py.
+
+module credit_store
+
+import log from "logging"
+import json from "std/json"
+import time from "std/time"
+let HISTORY_CAP = 1000
+
+/// ── Ledger Serialization ──
+
+fn _ledger_to_dict(ledger: any) -> any {
+    let incidents_list = []
+    for inc in ledger.incidents {
+        incidents_list.append({
+            "timestamp_ms": inc.timestamp_ms,
+            "incident_type": inc.incident_type.value,
+            "severity": inc.severity,
+            "description": inc.description,
+            "resolved": inc.resolved
+        })
+    }
+    let history = ledger.score_history
+    if history.len() > HISTORY_CAP {
+        history = history.slice(history.len() - HISTORY_CAP, history.len())
+    }
+    return {
+        "entity_id": ledger.entity_id,
+        "entity_type": ledger.entity_type.value,
+        "nrsip_address": ledger.nrsip_address,
+        "trust_level": ledger.trust_level.value,
+        "enrolled_at_ms": ledger.enrolled_at_ms,
+        "last_seen_ms": ledger.last_seen_ms,
+        "uptime_pct": ledger.uptime_pct,
+        "total_interactions": ledger.total_interactions,
+        "validated_interactions": ledger.validated_interactions,
+        "positive_feedback_count": ledger.positive_feedback_count,
+        "prism_score_sum": ledger.prism_score_sum,
+        "prism_score_count": ledger.prism_score_count,
+        "incidents": incidents_list,
+        "domain_certifications": ledger.domain_certifications,
+        "current_score": ledger.current_score,
+        "current_tier": ledger.current_tier.value,
+        "factor_scores": {
+            "response_quality": ledger.factor_scores.response_quality,
+            "incident_rate": ledger.factor_scores.incident_rate,
+            "interaction_count": ledger.factor_scores.interaction_count,
+            "node_liveness": ledger.factor_scores.node_liveness,
+            "verification_level": ledger.factor_scores.verification_level
+        },
+        "suspended": ledger.suspended,
+        "banned": ledger.banned,
+        "score_history": history
+    }
+}
+
+fn _dict_to_ledger(data: Map[string, any], make_ledger_fn: any,
+                   make_incident_fn: any, make_factors_fn: any) -> any {
+    let incidents = []
+    for inc in data.get("incidents", []) {
+        incidents.append(make_incident_fn(
+            inc["timestamp_ms"],
+            inc["incident_type"],
+            inc["severity"],
+            inc.get("description", ""),
+            inc.get("resolved", false)
+        ))
+    }
+    let fs = data.get("factor_scores", {})
+    let factors = make_factors_fn(
+        fs.get("response_quality", 0.0),
+        fs.get("incident_rate", 1.0),
+        fs.get("interaction_count", 0.0),
+        fs.get("node_liveness", 0.0),
+        fs.get("verification_level", 0.0)
+    )
+    let history = data.get("score_history", [])
+    if history.len() > HISTORY_CAP {
+        history = history.slice(history.len() - HISTORY_CAP, history.len())
+    }
+    return make_ledger_fn(data, incidents, factors, history)
+}
+
+/// ── Memory Store ──
+
+class MemoryStore {
+    fn init(self) {
+        self._data = {}
+    }
+
+    fn save(self, ledger: any) {
+        self._data[ledger.entity_id] = _ledger_to_dict(ledger)
+    }
+
+    fn load(self, entity_id: string) -> Optional[Map[string, any]] {
+        return self._data.get(entity_id, nil)
+    }
+
+    fn delete(self, entity_id: string) {
+        self._data.remove(entity_id)
+    }
+
+    fn list_entities(self) -> List[any] {
+        return self._data.keys()
+    }
+
+    fn count(self) -> int {
+        return self._data.len()
+    }
+}
+
+/// ── Redis Store ──
+
+class RedisStore {
+    fn init(self, redis_client: any, ttl: int) {
+        self._redis = redis_client
+        self._ttl = ttl
+        self.KEY_PREFIX = "nrsip:credit:"
+    }
+
+    fn _key(self, entity_id: string) -> string {
+        return self.KEY_PREFIX + entity_id
+    }
+
+    fn save(self, ledger: any) {
+        let data = _ledger_to_dict(ledger)
+        self._redis.setex(self._key(ledger.entity_id), self._ttl,
+                          json.dumps(data, false))
+    }
+
+    fn load(self, entity_id: string) -> Optional[Map[string, any]] {
+        let raw = self._redis.get(self._key(entity_id))
+        if raw == nil {
+            return nil
+        }
+        return json.loads(raw)
+    }
+
+    fn delete(self, entity_id: string) {
+        self._redis.delete(self._key(entity_id))
+    }
+
+    fn list_entities(self) -> List[any] {
+        let prefix = self.KEY_PREFIX
+        let keys = self._redis.keys(prefix + "*")
+        let result = []
+        for k in keys {
+            let key_str = to_string(k)
+            result.append(key_str.slice(prefix.len(), key_str.len()))
+        }
+        return result
+    }
+
+    fn count(self) -> int {
+        return self._redis.keys(self.KEY_PREFIX + "*").len()
+    }
+}
+
+export HISTORY_CAP
+export MemoryStore, RedisStore
+export _ledger_to_dict, _dict_to_ledger

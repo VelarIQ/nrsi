@@ -1,0 +1,60 @@
+/// NRSI Uncertainty — Decomposition Types and Disclosure Norms
+///
+/// Classifies uncertainty by source so the system can communicate
+/// what it knows vs what it's unsure about.
+
+module uncertainty
+
+import NRSIData from "types"
+
+/// ---------- Uncertainty Types ----------
+
+enum UncertaintySource {
+    ALEATORIC,
+    EPISTEMIC,
+    MODEL,
+    DATA,
+    TEMPORAL,
+    LINGUISTIC
+}
+
+type UncertaintyProfile {
+    source: UncertaintySource,
+    magnitude: Float,
+    reducible: Bool,
+    disclosure_text: String
+}
+
+/// ---------- Uncertainty Norms ----------
+
+norm disclose_epistemic_uncertainty {
+    type: obligation,
+    scope: global,
+    action: "disclose_uncertainty_source",
+    priority: 80,
+    condition: source == UncertaintySource.EPISTEMIC and magnitude >= 0.3
+}
+
+norm disclose_temporal_staleness {
+    type: obligation,
+    scope: global,
+    action: "flag_temporal_uncertainty",
+    priority: 75,
+    condition: source == UncertaintySource.TEMPORAL
+}
+
+norm no_false_certainty {
+    type: prohibition,
+    scope: global,
+    action: "claim_certainty_when_uncertain",
+    priority: 95,
+    condition: magnitude >= 0.5
+}
+
+/// ---------- Uncertainty Gate ----------
+
+gate uncertainty_assessment(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.0
+    validate uncertainty_decomposed
+    validate disclosure_attached
+}

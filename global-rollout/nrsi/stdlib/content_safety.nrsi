@@ -1,0 +1,411 @@
+/// NRSIP content safety engine: deterministic phrase-based classification,
+/// abuse reporting, and quarantine.
+///
+/// Full implementation of `nrsip/content_safety.py`.
+/// Patent Continuation E, Claims 1-7 — Content Safety Pipeline.
+
+module content_safety
+
+
+import time from "std/time"
+/// ---------- Enumerations ----------
+
+enum SafetyCategory {
+    VIOLENCE,
+    HATE_SPEECH,
+    SELF_HARM,
+    SEXUAL,
+    ILLEGAL_ACTIVITY,
+    PII_EXPOSURE,
+    MISINFORMATION,
+    CLEAN
+}
+
+enum PolicyAction {
+    BLOCK,
+    DISCLAIMER,
+    PASS
+}
+
+enum Severity {
+    LOW = 1,
+    MEDIUM = 2,
+    HIGH = 3,
+    CRITICAL = 4
+}
+
+/// ---------- Severity → PolicyAction mapping ----------
+
+let _SEVERITY_TO_ACTION = {
+    Severity.LOW: PolicyAction.DISCLAIMER,
+    Severity.MEDIUM: PolicyAction.DISCLAIMER,
+    Severity.HIGH: PolicyAction.BLOCK,
+    Severity.CRITICAL: PolicyAction.BLOCK
+}
+
+/// ---------- Data records ----------
+
+type SafetyVerdict {
+    content_hash: string,
+    categories: List[SafetyCategory],
+    severity: Severity,
+    action: PolicyAction,
+    matched_rules: List[string],
+    timestamp_ns: int
+}
+
+fn safety_verdict_to_dict(v: SafetyVerdict) -> Dict[string, Any] {
+    let cat_values = []
+    for c in v.categories {
+        append(cat_values, enum_value(c))
+    }
+    return {
+        "content_hash": v.content_hash,
+        "categories": cat_values,
+        "severity": enum_name(v.severity),
+        "action": enum_value(v.action),
+        "matched_rules": list_copy(v.matched_rules),
+        "timestamp_ns": v.timestamp_ns
+    }
+}
+
+type AbuseReport {
+    report_id: string,
+    content_hash: string,
+    categories: List[SafetyCategory],
+    severity: Severity,
+    action_taken: PolicyAction,
+    reporter: string,
+    timestamp_ns: int,
+    evidence_summary: string
+}
+
+fn abuse_report_to_dict(r: AbuseReport) -> Dict[string, Any] {
+    let cat_values = []
+    for c in r.categories {
+        append(cat_values, enum_value(c))
+    }
+    return {
+        "report_id": r.report_id,
+        "content_hash": r.content_hash,
+        "categories": cat_values,
+        "severity": enum_name(r.severity),
+        "action_taken": enum_value(r.action_taken),
+        "reporter": r.reporter,
+        "timestamp_ns": r.timestamp_ns,
+        "evidence_summary": r.evidence_summary
+    }
+}
+
+type QuarantineRecord {
+    subject_id: string,
+    subject_type: string,
+    reason: string,
+    severity: Severity,
+    quarantined_at_ns: int,
+    released_at_ns: Optional[int]
+}
+
+fn quarantine_record_is_active(qr: QuarantineRecord) -> bool {
+    return qr.released_at_ns == None
+}
+
+/// ---------- Phrase rules ----------
+
+type _PhraseRule {
+    rule_id: string,
+    category: SafetyCategory,
+    severity: Severity,
+    phrases: FrozenSet[string]
+}
+
+let _DEFAULT_RULES = [
+    _PhraseRule {
+        rule_id: "VIOLENCE_01",
+        category: SafetyCategory.VIOLENCE,
+        severity: Severity.HIGH,
+        phrases: frozenset([
+            "kill them all", "murder instructions", "make a weapon",
+            "bomb recipe", "how to hurt", "bomb threat", "mass shooting"
+        ])
+    },
+    _PhraseRule {
+        rule_id: "HATE_01",
+        category: SafetyCategory.HATE_SPEECH,
+        severity: Severity.HIGH,
+        phrases: frozenset([
+            "racial slur", "ethnic cleansing", "hate group recruitment",
+            "supremacist ideology", "dehumanize group"
+        ])
+    },
+    _PhraseRule {
+        rule_id: "SELF_HARM_01",
+        category: SafetyCategory.SELF_HARM,
+        severity: Severity.CRITICAL,
+        phrases: frozenset([
+            "how to end my life", "suicide method", "self-harm guide",
+            "cutting instructions", "overdose guide"
+        ])
+    },
+    _PhraseRule {
+        rule_id: "SEXUAL_01",
+        category: SafetyCategory.SEXUAL,
+        severity: Severity.HIGH,
+        phrases: frozenset([
+            "explicit content", "sexual exploitation", "child abuse material",
+            "non-consensual imagery", "revenge porn"
+        ])
+    },
+    _PhraseRule {
+        rule_id: "ILLEGAL_01",
+        category: SafetyCategory.ILLEGAL_ACTIVITY,
+        severity: Severity.HIGH,
+        phrases: frozenset([
+            "how to hack into", "credit card fraud", "money laundering steps",
+            "drug manufacturing", "counterfeit documents", "make a bomb",
+            "synthesize drugs", "hack into"
+        ])
+    },
+    _PhraseRule {
+        rule_id: "PII_01",
+        category: SafetyCategory.PII_EXPOSURE,
+        severity: Severity.MEDIUM,
+        phrases: frozenset([
+            "social security number", "passport number", "credit card number",
+            "bank account details", "medical record id"
+        ])
+    },
+    _PhraseRule {
+        rule_id: "MISINFO_01",
+        category: SafetyCategory.MISINFORMATION,
+        severity: Severity.MEDIUM,
+        phrases: frozenset([
+            "fake cure for cancer", "election fraud proof", "vaccine microchip",
+            "flat earth evidence", "government mind control"
+        ])
+    }
+]
+
+/// ---------- ContentSafetyEngine ----------
+
+class ContentSafetyEngine {
+    fn new(self, rules: Optional[List[_PhraseRule]]) {
+        if rules != None {
+            self._rules = rules
+        } else {
+            self._rules = _DEFAULT_RULES
+        }
+        self._reports = {}
+        self._acknowledged = {}
+        self._quarantines = {}
+        self._stats_classified = 0
+        self._stats_blocked = 0
+        self._stats_disclaimed = 0
+        self._stats_passed = 0
+    }
+
+    fn classify(self, content: string) -> SafetyVerdict {
+        let content_lower = to_lower(content)
+        let content_hash = sha256_hex(content)
+
+        let matched_categories = []
+        let matched_rule_ids = []
+        let worst_severity = Severity.LOW
+        let any_match = false
+
+        for rule in self._rules {
+            for phrase in rule.phrases {
+                if contains(content_lower, phrase) {
+                    any_match = true
+                    if rule.category not in matched_categories {
+                        append(matched_categories, rule.category)
+                    }
+                    if rule.rule_id not in matched_rule_ids {
+                        append(matched_rule_ids, rule.rule_id)
+                    }
+                    if int(rule.severity) > int(worst_severity) {
+                        worst_severity = rule.severity
+                    }
+                    break
+                }
+            }
+        }
+
+        let verdict = None
+        if !any_match {
+            verdict = SafetyVerdict {
+                content_hash: content_hash,
+                categories: [SafetyCategory.CLEAN],
+                severity: Severity.LOW,
+                action: PolicyAction.PASS,
+                matched_rules: [],
+                timestamp_ns: time.time_ns()
+            }
+        } else {
+            let action = _SEVERITY_TO_ACTION[worst_severity]
+            verdict = SafetyVerdict {
+                content_hash: content_hash,
+                categories: matched_categories,
+                severity: worst_severity,
+                action: action,
+                matched_rules: matched_rule_ids,
+                timestamp_ns: time.time_ns()
+            }
+        }
+
+        self._stats_classified += 1
+        if verdict.action == PolicyAction.BLOCK {
+            self._stats_blocked += 1
+        } else if verdict.action == PolicyAction.DISCLAIMER {
+            self._stats_disclaimed += 1
+        } else {
+            self._stats_passed += 1
+        }
+
+        return verdict
+    }
+
+    fn generate_abuse_report(self, verdict: SafetyVerdict,
+                             reporter: string) -> AbuseReport {
+        let report_id = slice_string(
+            sha256_hex(verdict.content_hash), 0, 24
+        )
+
+        let cat_values = []
+        for c in verdict.categories {
+            append(cat_values, enum_value(c))
+        }
+        let evidence = ("categories=" + str(cat_values)
+            + "; rules=" + str(list_copy(verdict.matched_rules))
+            + "; severity=" + enum_name(verdict.severity))
+
+        let report = AbuseReport {
+            report_id: report_id,
+            content_hash: verdict.content_hash,
+            categories: verdict.categories,
+            severity: verdict.severity,
+            action_taken: verdict.action,
+            reporter: reporter,
+            timestamp_ns: time.time_ns(),
+            evidence_summary: evidence
+        }
+
+        self._reports[report_id] = report
+        return report
+    }
+
+    fn get_review_queue(self, limit: int) -> List[any] {
+        let pending = []
+        for rid in keys(self._reports) {
+            if rid not in self._acknowledged {
+                append(pending, self._reports[rid])
+            }
+        }
+        sort_by(pending, fn(r: AbuseReport) -> Tuple[int, int] {
+            return (-int(r.severity), r.timestamp_ns)
+        })
+        if len(pending) > limit {
+            return slice_list(pending, 0, limit)
+        }
+        return pending
+    }
+
+    fn acknowledge_report(self, report_id: string) -> bool {
+        if report_id not in self._reports {
+            return false
+        }
+        if report_id in self._acknowledged {
+            return false
+        }
+        self._acknowledged[report_id] = true
+        return true
+    }
+
+    fn quarantine(self, subject_id: string, subject_type: string,
+                  reason: string, severity: Severity) -> QuarantineRecord {
+        let record = QuarantineRecord {
+            subject_id: subject_id,
+            subject_type: subject_type,
+            reason: reason,
+            severity: severity,
+            quarantined_at_ns: time.time_ns(),
+            released_at_ns: None
+        }
+        self._quarantines[subject_id] = record
+        log_info(("QUARANTINE  subject=" + subject_id
+            + "  type=" + subject_type
+            + "  severity=" + enum_name(severity)
+            + "  reason=" + reason))
+        return record
+    }
+
+    fn release_quarantine(self, subject_id: string) -> bool {
+        let record = get_or_default(self._quarantines, subject_id, None)
+        if record == None or !quarantine_record_is_active(record) {
+            return false
+        }
+        record.released_at_ns = time.time_ns()
+        log_info("RELEASE  subject=" + subject_id)
+        return true
+    }
+
+    fn is_quarantined(self, subject_id: string) -> bool {
+        let record = get_or_default(self._quarantines, subject_id, None)
+        return record != None and quarantine_record_is_active(record)
+    }
+
+    fn evaluate_and_enforce(self, content: string, source_id: string,
+                            source_type: string,
+                            reporter: string) -> Tuple[SafetyVerdict, Optional[AbuseReport], Optional[QuarantineRecord]] {
+        let verdict = self.classify(content)
+        let report = None
+        let qrec = None
+
+        if verdict.action != PolicyAction.PASS {
+            report = self.generate_abuse_report(verdict, reporter)
+        }
+
+        if int(verdict.severity) >= int(Severity.HIGH) {
+            let cat_values = []
+            for c in verdict.categories {
+                append(cat_values, enum_value(c))
+            }
+            qrec = self.quarantine(
+                source_id, source_type,
+                ("Auto-quarantine: severity=" + enum_name(verdict.severity)
+                    + ", categories=" + str(cat_values)),
+                verdict.severity
+            )
+            log_warning(("AUTO-QUARANTINE  source=" + source_id
+                + "  severity=" + enum_name(verdict.severity)))
+        }
+
+        return (verdict, report, qrec)
+    }
+
+    fn get_stats(self) -> Dict[string, Any] {
+        let active_quarantines = 0
+        for qid in keys(self._quarantines) {
+            if quarantine_record_is_active(self._quarantines[qid]) {
+                active_quarantines += 1
+            }
+        }
+        return {
+            "total_classified": self._stats_classified,
+            "total_blocked": self._stats_blocked,
+            "total_disclaimed": self._stats_disclaimed,
+            "total_passed": self._stats_passed,
+            "pending_reports": len(self._reports) - len(self._acknowledged),
+            "acknowledged_reports": len(self._acknowledged),
+            "active_quarantines": active_quarantines,
+            "total_quarantines": len(self._quarantines),
+            "rule_count": len(self._rules)
+        }
+    }
+}
+
+export SafetyCategory, PolicyAction, Severity
+export SafetyVerdict, safety_verdict_to_dict
+export AbuseReport, abuse_report_to_dict
+export QuarantineRecord, quarantine_record_is_active
+export ContentSafetyEngine

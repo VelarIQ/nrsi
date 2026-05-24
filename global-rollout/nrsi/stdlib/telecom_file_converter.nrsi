@@ -1,0 +1,1662 @@
+/// NRS Universal File Converter.
+///
+/// Converts ANY file format into clean, parser-ready CSV/JSON text
+/// that the AdaptiveParser can consume. Handles:
+///
+///   Structured Data
+///   ───────────────
+///   .csv, .tsv, .txt         → pass-through (already text)
+///   .json, .jsonl, .ndjson   → pass-through
+///   .xml                     → pass-through
+///   .xlsx, .xls              → Excel → CSV
+///   .ods                     → OpenDocument Spreadsheet → CSV
+///   .parquet                 → Apache Parquet → CSV
+///   .avro                    → Apache Avro → JSON lines
+///   .sqlite, .db             → SQLite → CSV (all tables)
+///   .mdb, .accdb             → Access DB → CSV (via mdbtools)
+///
+///   Documents
+///   ─────────
+///   .pdf                     → PDF text extraction → structured CSV
+///   .doc, .docx              → Word → text → structured CSV
+///   .rtf                     → RTF → text → structured CSV
+///   .html, .htm              → HTML table extraction → CSV
+///
+///   Binary / Telecom-Specific
+///   ─────────────────────────
+///   .pcap, .pcapng           → Packet capture → signaling CSV
+///   .asn1, .ber, .der        → ASN.1 → JSON
+///   .3gpp                    → 3GPP CDR → CSV
+///   .erl                     → Ericsson OSS export → CSV
+///   .nmon, .sar              → Performance logs → CSV
+///
+///   Compressed / Archive
+///   ────────────────────
+///   .gz, .bz2, .xz           → Decompress → re-detect inner format
+///   .zip, .tar, .tar.gz      → Extract → process each file
+///   .7z, .rar                → Extract → process each file
+///
+///   Fixed-Width / Legacy
+///   ────────────────────
+///   Fixed-width columns      → Auto-detect column boundaries → CSV
+///   EBCDIC                   → Transcode to UTF-8 → re-detect
+///   Syslog / freeform logs   → Regex extraction → CSV
+///
+/// ═══════════════════════════════════════════════════════════════════
+
+module telecom_file_converter
+
+import os from "std/os"
+import json from "std/json"
+import re from "std/re"
+import io from "std/io"
+import hashlib from "std/hashlib"
+import datetime from "std/datetime"
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  TYPES
+// ═══════════════════════════════════════════════════════════════════
+
+type ConversionResult {
+    success: bool,
+    format_detected: string,
+    original_path: string,
+    output_text: string,
+    output_format: string,
+    records_estimated: int,
+    warnings: List[string],
+    sub_files: List[string],
+    elapsed_ms: float
+}
+
+type ColumnBoundary {
+    start: int,
+    end: int,
+    name: string
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  FORMAT REGISTRY
+// ═══════════════════════════════════════════════════════════════════
+
+let _TEXT_PASSTHROUGH = [".csv", ".tsv", ".txt", ".log", ".json", ".jsonl",
+                         ".ndjson", ".xml", ".dat"]
+
+let _EXCEL_FORMATS = [".xlsx", ".xls", ".ods"]
+
+let _DOCUMENT_FORMATS = [".pdf", ".doc", ".docx", ".rtf"]
+
+let _HTML_FORMATS = [".html", ".htm", ".mhtml"]
+
+let _BINARY_DATA = [".parquet", ".avro", ".orc", ".feather", ".arrow"]
+
+let _DATABASE_FORMATS = [".sqlite", ".db", ".sqlite3", ".mdb", ".accdb"]
+
+let _TELECOM_BINARY = [".pcap", ".pcapng", ".asn1", ".ber", ".der",
+                        ".3gpp", ".cdr", ".erl", ".nmon", ".sar"]
+
+let _COMPRESSED = [".gz", ".bz2", ".xz", ".lz4", ".zst", ".lzma"]
+
+let _ARCHIVES = [".zip", ".tar", ".tgz", ".tar.gz", ".tar.bz2",
+                  ".tar.xz", ".7z", ".rar"]
+
+let _IMAGE_FORMATS = [".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]
+
+fn _all_supported_extensions() -> List[string] {
+    let all: List[string] = []
+    for e in _TEXT_PASSTHROUGH { append(all, e) }
+    for e in _EXCEL_FORMATS { append(all, e) }
+    for e in _DOCUMENT_FORMATS { append(all, e) }
+    for e in _HTML_FORMATS { append(all, e) }
+    for e in _BINARY_DATA { append(all, e) }
+    for e in _DATABASE_FORMATS { append(all, e) }
+    for e in _TELECOM_BINARY { append(all, e) }
+    for e in _COMPRESSED { append(all, e) }
+    for e in _ARCHIVES { append(all, e) }
+    for e in _IMAGE_FORMATS { append(all, e) }
+    return all
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN CONVERTER
+// ═══════════════════════════════════════════════════════════════════
+
+class UniversalFileConverter {
+
+    fn init(self) {
+        self._warnings: List[string] = []
+        self._temp_dir = ""
+    }
+
+    /// Convert any file to parser-ready text.
+    fn convert(self, file_path: string) -> ConversionResult {
+        import time from "std/time"
+        let t0 = time.time()
+        self._warnings = []
+
+        let result = ConversionResult {
+            success: false,
+            format_detected: "unknown",
+            original_path: file_path,
+            output_text: "",
+            output_format: "csv",
+            records_estimated: 0,
+            warnings: [],
+            sub_files: [],
+            elapsed_ms: 0.0
+        }
+
+        if !os.path.isfile(file_path) {
+            result.warnings = ["File not found: " + file_path]
+            result.elapsed_ms = (time.time() - t0) * 1000.0
+            return result
+        }
+
+        let ext = self._get_extension(file_path)
+
+        // Compressed: decompress first, then recurse
+        if self._in_list(ext, _COMPRESSED) {
+            return self._handle_compressed(file_path, ext, t0)
+        }
+
+        // Archives: extract and process each file
+        if self._in_list(ext, _ARCHIVES) {
+            return self._handle_archive(file_path, ext, t0)
+        }
+
+        // Text pass-through
+        if self._in_list(ext, _TEXT_PASSTHROUGH) {
+            return self._handle_text(file_path, ext, t0)
+        }
+
+        // Excel / ODS
+        if self._in_list(ext, _EXCEL_FORMATS) {
+            return self._handle_excel(file_path, ext, t0)
+        }
+
+        // PDF
+        if ext == ".pdf" {
+            return self._handle_pdf(file_path, t0)
+        }
+
+        // Word documents
+        if ext == ".docx" {
+            return self._handle_docx(file_path, t0)
+        }
+        if ext == ".doc" {
+            return self._handle_doc_legacy(file_path, t0)
+        }
+        if ext == ".rtf" {
+            return self._handle_rtf(file_path, t0)
+        }
+
+        // HTML
+        if self._in_list(ext, _HTML_FORMATS) {
+            return self._handle_html(file_path, t0)
+        }
+
+        // Binary data formats
+        if ext == ".parquet" {
+            return self._handle_parquet(file_path, t0)
+        }
+        if ext == ".avro" {
+            return self._handle_avro(file_path, t0)
+        }
+        if ext == ".orc" or ext == ".feather" or ext == ".arrow" {
+            return self._handle_arrow_family(file_path, ext, t0)
+        }
+
+        // Database
+        if self._in_list(ext, _DATABASE_FORMATS) {
+            return self._handle_database(file_path, ext, t0)
+        }
+
+        // Telecom binary
+        if ext == ".pcap" or ext == ".pcapng" {
+            return self._handle_pcap(file_path, t0)
+        }
+        if ext == ".asn1" or ext == ".ber" or ext == ".der" {
+            return self._handle_asn1(file_path, t0)
+        }
+        if ext == ".3gpp" or ext == ".cdr" {
+            return self._handle_3gpp_cdr(file_path, t0)
+        }
+        if ext == ".erl" {
+            return self._handle_ericsson_export(file_path, t0)
+        }
+        if ext == ".nmon" or ext == ".sar" {
+            return self._handle_perf_log(file_path, ext, t0)
+        }
+
+        // Images (OCR)
+        if self._in_list(ext, _IMAGE_FORMATS) {
+            return self._handle_image_ocr(file_path, t0)
+        }
+
+        // Fallback: try to read as text and auto-detect structure
+        return self._handle_unknown(file_path, t0)
+    }
+
+    /// Convert raw bytes (from HTTP push) with a filename hint.
+    fn convert_bytes(self, data: bytes, filename: string) -> ConversionResult {
+        import time from "std/time"
+        import tempfile from "std/tempfile"
+
+        let tmp = tempfile.NamedTemporaryFile(delete=false, suffix="_" + filename)
+        tmp.write(data)
+        tmp.close()
+
+        let result = self.convert(tmp.name)
+        result.original_path = filename
+
+        try { os.unlink(tmp.name) } catch {}
+        return result
+    }
+
+    /// Convert a text string with format hint.
+    fn convert_text(self, text: string, format_hint: string) -> ConversionResult {
+        import time from "std/time"
+        let t0 = time.time()
+
+        let result = ConversionResult {
+            success: true,
+            format_detected: format_hint,
+            original_path: "<text_input>",
+            output_text: text,
+            output_format: "auto",
+            records_estimated: self._estimate_records(text),
+            warnings: [],
+            sub_files: [],
+            elapsed_ms: 0.0
+        }
+
+        // If it looks like fixed-width, convert it
+        if format_hint == "fixed" or self._looks_fixed_width(text) {
+            let csv_text = self._fixed_width_to_csv(text)
+            result.output_text = csv_text
+            result.output_format = "csv"
+            result.format_detected = "fixed_width"
+            result.records_estimated = self._estimate_records(csv_text)
+        }
+
+        // If it looks like syslog / freeform, extract structured fields
+        if format_hint == "syslog" or format_hint == "log" {
+            let csv_text = self._syslog_to_csv(text)
+            result.output_text = csv_text
+            result.output_format = "csv"
+            result.format_detected = "syslog"
+            result.records_estimated = self._estimate_records(csv_text)
+        }
+
+        result.elapsed_ms = (time.time() - t0) * 1000.0
+        return result
+    }
+
+    // ─── Helpers ─────────────────────────────────────────────────
+
+    fn _get_extension(self, path: string) -> string {
+        let lower = path.lower()
+        // Handle double extensions like .tar.gz
+        if lower.endswith(".tar.gz") { return ".tar.gz" }
+        if lower.endswith(".tar.bz2") { return ".tar.bz2" }
+        if lower.endswith(".tar.xz") { return ".tar.xz" }
+        let parts = lower.split(".")
+        if len(parts) < 2 { return "" }
+        return "." + parts[-1]
+    }
+
+    fn _in_list(self, item: string, lst: List[string]) -> bool {
+        for x in lst {
+            if x == item { return true }
+        }
+        return false
+    }
+
+    fn _estimate_records(self, text: string) -> int {
+        let lines = text.strip().split("\n")
+        let count = len(lines)
+        if count > 1 { return count - 1 }
+        return count
+    }
+
+    fn _make_result(self, fmt: string, text: string, out_fmt: string,
+                    path: string, t0: float) -> ConversionResult {
+        import time from "std/time"
+        return ConversionResult {
+            success: len(text.strip()) > 0,
+            format_detected: fmt,
+            original_path: path,
+            output_text: text,
+            output_format: out_fmt,
+            records_estimated: self._estimate_records(text),
+            warnings: self._warnings,
+            sub_files: [],
+            elapsed_ms: (time.time() - t0) * 1000.0
+        }
+    }
+
+    fn _warn(self, msg: string) {
+        append(self._warnings, msg)
+    }
+
+    // ─── TEXT PASS-THROUGH ───────────────────────────────────────
+
+    fn _handle_text(self, path: string, ext: string, t0: float) -> ConversionResult {
+        let f = open(path, "r", encoding="utf-8", errors="replace")
+        let text = f.read()
+        f.close()
+
+        let out_fmt = "auto"
+        if ext == ".csv" { out_fmt = "csv" }
+        if ext == ".tsv" { out_fmt = "tsv" }
+        if ext == ".json" or ext == ".jsonl" or ext == ".ndjson" { out_fmt = "json" }
+        if ext == ".xml" { out_fmt = "xml" }
+
+        // Check if it's actually fixed-width disguised as .txt/.log
+        if (ext == ".txt" or ext == ".log" or ext == ".dat") and self._looks_fixed_width(text) {
+            let csv_text = self._fixed_width_to_csv(text)
+            return self._make_result("fixed_width", csv_text, "csv", path, t0)
+        }
+
+        return self._make_result(ext.replace(".", ""), text, out_fmt, path, t0)
+    }
+
+    // ─── EXCEL / ODS ────────────────────────────────────────────
+
+    fn _handle_excel(self, path: string, ext: string, t0: float) -> ConversionResult {
+        let csv_parts: List[string] = []
+
+        if ext == ".xlsx" or ext == ".ods" {
+            try {
+                let openpyxl = __import__("openpyxl")
+                let wb = openpyxl.load_workbook(path, read_only=true, data_only=true)
+
+                for sheet_name in wb.sheetnames {
+                    let ws = wb[sheet_name]
+                    let rows: List[string] = []
+
+                    for row in ws.iter_rows(values_only=true) {
+                        let cells: List[string] = []
+                        for cell in row {
+                            if cell == None {
+                                append(cells, "")
+                            } else {
+                                let val = str(cell)
+                                if "," in val or '"' in val or "\n" in val {
+                                    val = '"' + val.replace('"', '""') + '"'
+                                }
+                                append(cells, val)
+                            }
+                        }
+                        append(rows, join(cells, ","))
+                    }
+
+                    if len(rows) > 0 {
+                        append(csv_parts, join(rows, "\n"))
+                    }
+                }
+                wb.close()
+            } catch as e {
+                self._warn("openpyxl failed: " + str(e) + " — trying xlrd")
+                return self._handle_excel_xlrd(path, t0)
+            }
+        }
+
+        if ext == ".xls" {
+            return self._handle_excel_xlrd(path, t0)
+        }
+
+        let combined = join(csv_parts, "\n")
+        return self._make_result("excel", combined, "csv", path, t0)
+    }
+
+    fn _handle_excel_xlrd(self, path: string, t0: float) -> ConversionResult {
+        try {
+            let xlrd = __import__("xlrd")
+            let wb = xlrd.open_workbook(path)
+            let csv_parts: List[string] = []
+
+            for idx in range(wb.nsheets) {
+                let ws = wb.sheet_by_index(idx)
+                let rows: List[string] = []
+
+                for r in range(ws.nrows) {
+                    let cells: List[string] = []
+                    for c in range(ws.ncols) {
+                        let val = str(ws.cell_value(r, c))
+                        if "," in val or '"' in val {
+                            val = '"' + val.replace('"', '""') + '"'
+                        }
+                        append(cells, val)
+                    }
+                    append(rows, join(cells, ","))
+                }
+                if len(rows) > 0 {
+                    append(csv_parts, join(rows, "\n"))
+                }
+            }
+
+            let combined = join(csv_parts, "\n")
+            return self._make_result("excel_xls", combined, "csv", path, t0)
+        } catch as e {
+            self._warn("xlrd not available: " + str(e))
+            return self._make_result("excel_xls", "", "csv", path, t0)
+        }
+    }
+
+    // ─── PDF ────────────────────────────────────────────────────
+
+    fn _handle_pdf(self, path: string, t0: float) -> ConversionResult {
+        let text = ""
+
+        // Strategy 1: pdfplumber (best for tables)
+        try {
+            let pdfplumber = __import__("pdfplumber")
+            let pdf = pdfplumber.open(path)
+            let all_rows: List[string] = []
+            let header_written = false
+
+            for page in pdf.pages {
+                let tables = page.extract_tables()
+                for table in tables {
+                    for row_idx in range(len(table)) {
+                        let row = table[row_idx]
+                        if row_idx == 0 and !header_written {
+                            let hdr: List[string] = []
+                            for cell in row {
+                                if cell == None { append(hdr, "") }
+                                else { append(hdr, str(cell).replace(",", ";").replace("\n", " ")) }
+                            }
+                            append(all_rows, join(hdr, ","))
+                            header_written = true
+                            continue
+                        }
+                        if row_idx == 0 and header_written { continue }
+
+                        let cells: List[string] = []
+                        for cell in row {
+                            if cell == None { append(cells, "") }
+                            else {
+                                let val = str(cell).replace(",", ";").replace("\n", " ")
+                                append(cells, val)
+                            }
+                        }
+                        append(all_rows, join(cells, ","))
+                    }
+                }
+
+                // If no tables found, extract raw text
+                if len(tables) == 0 {
+                    let page_text = page.extract_text()
+                    if page_text != None and len(page_text.strip()) > 0 {
+                        let csv_from_text = self._text_block_to_csv(page_text)
+                        if len(csv_from_text.strip()) > 0 {
+                            append(all_rows, csv_from_text)
+                        }
+                    }
+                }
+            }
+            pdf.close()
+            text = join(all_rows, "\n")
+        } catch as e1 {
+            self._warn("pdfplumber failed: " + str(e1) + " — trying PyPDF2")
+
+            // Strategy 2: PyPDF2 / pypdf
+            try {
+                let pypdf = __import__("pypdf")
+                let reader = pypdf.PdfReader(path)
+                let pages_text: List[string] = []
+                for page in reader.pages {
+                    let pt = page.extract_text()
+                    if pt != None { append(pages_text, pt) }
+                }
+                let raw = join(pages_text, "\n")
+                text = self._text_block_to_csv(raw)
+            } catch as e2 {
+                self._warn("pypdf failed: " + str(e2) + " — trying pdftotext CLI")
+
+                // Strategy 3: pdftotext CLI
+                try {
+                    let subprocess = __import__("subprocess")
+                    let proc = subprocess.run(
+                        ["pdftotext", "-layout", path, "-"],
+                        capture_output=true, text=true, timeout=60
+                    )
+                    if proc.returncode == 0 {
+                        text = self._text_block_to_csv(proc.stdout)
+                    }
+                } catch as e3 {
+                    self._warn("pdftotext CLI failed: " + str(e3))
+                }
+            }
+        }
+
+        return self._make_result("pdf", text, "csv", path, t0)
+    }
+
+    // ─── WORD DOCUMENTS ─────────────────────────────────────────
+
+    fn _handle_docx(self, path: string, t0: float) -> ConversionResult {
+        let text = ""
+
+        try {
+            let docx = __import__("docx")
+            let doc = docx.Document(path)
+            let parts: List[string] = []
+
+            // Extract tables first
+            for table in doc.tables {
+                let rows: List[string] = []
+                for row in table.rows {
+                    let cells: List[string] = []
+                    for cell in row.cells {
+                        let val = cell.text.replace(",", ";").replace("\n", " ")
+                        append(cells, val)
+                    }
+                    append(rows, join(cells, ","))
+                }
+                append(parts, join(rows, "\n"))
+            }
+
+            // If no tables, extract paragraphs
+            if len(parts) == 0 {
+                let para_text: List[string] = []
+                for para in doc.paragraphs {
+                    if len(para.text.strip()) > 0 {
+                        append(para_text, para.text)
+                    }
+                }
+                let raw = join(para_text, "\n")
+                text = self._text_block_to_csv(raw)
+            } else {
+                text = join(parts, "\n")
+            }
+        } catch as e {
+            self._warn("python-docx failed: " + str(e))
+        }
+
+        return self._make_result("docx", text, "csv", path, t0)
+    }
+
+    fn _handle_doc_legacy(self, path: string, t0: float) -> ConversionResult {
+        let text = ""
+
+        // Try antiword or textract
+        try {
+            let subprocess = __import__("subprocess")
+            let proc = subprocess.run(
+                ["antiword", path],
+                capture_output=true, text=true, timeout=30
+            )
+            if proc.returncode == 0 {
+                text = self._text_block_to_csv(proc.stdout)
+            }
+        } catch as e {
+            self._warn("antiword failed: " + str(e) + " — trying textract")
+            try {
+                let textract = __import__("textract")
+                let raw = textract.process(path).decode("utf-8")
+                text = self._text_block_to_csv(raw)
+            } catch as e2 {
+                self._warn("textract failed: " + str(e2))
+            }
+        }
+
+        return self._make_result("doc", text, "csv", path, t0)
+    }
+
+    fn _handle_rtf(self, path: string, t0: float) -> ConversionResult {
+        let text = ""
+        try {
+            let striprtf = __import__("striprtf.striprtf")
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let raw = f.read()
+            f.close()
+            let plain = striprtf.striprtf.rtf_to_text(raw)
+            text = self._text_block_to_csv(plain)
+        } catch as e {
+            self._warn("striprtf failed: " + str(e))
+            // Fallback: read raw and strip RTF control words
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let raw = f.read()
+            f.close()
+            let cleaned = re.sub(r"\\[a-z]+\d*\s?", " ", raw)
+            cleaned = re.sub(r"[{}]", "", cleaned)
+            text = self._text_block_to_csv(cleaned)
+        }
+
+        return self._make_result("rtf", text, "csv", path, t0)
+    }
+
+    // ─── HTML ───────────────────────────────────────────────────
+
+    fn _handle_html(self, path: string, t0: float) -> ConversionResult {
+        let f = open(path, "r", encoding="utf-8", errors="replace")
+        let raw = f.read()
+        f.close()
+
+        let text = ""
+        try {
+            let bs4 = __import__("bs4")
+            let soup = bs4.BeautifulSoup(raw, "html.parser")
+
+            let tables = soup.find_all("table")
+            if len(tables) > 0 {
+                let all_rows: List[string] = []
+                for table in tables {
+                    let trs = table.find_all("tr")
+                    for tr in trs {
+                        let cells: List[string] = []
+                        let tds = tr.find_all(["td", "th"])
+                        for td in tds {
+                            let val = td.get_text(strip=true).replace(",", ";")
+                            append(cells, val)
+                        }
+                        append(all_rows, join(cells, ","))
+                    }
+                }
+                text = join(all_rows, "\n")
+            } else {
+                let body_text = soup.get_text("\n", strip=true)
+                text = self._text_block_to_csv(body_text)
+            }
+        } catch as e {
+            self._warn("BeautifulSoup failed: " + str(e) + " — regex fallback")
+            let cleaned = re.sub(r"<[^>]+>", " ", raw)
+            text = self._text_block_to_csv(cleaned)
+        }
+
+        return self._make_result("html", text, "csv", path, t0)
+    }
+
+    // ─── PARQUET ────────────────────────────────────────────────
+
+    fn _handle_parquet(self, path: string, t0: float) -> ConversionResult {
+        let text = ""
+        try {
+            let pandas = __import__("pandas")
+            let df = pandas.read_parquet(path)
+            text = df.to_csv(index=false)
+        } catch as e {
+            self._warn("pandas/pyarrow parquet failed: " + str(e))
+            try {
+                let pyarrow_pq = __import__("pyarrow.parquet")
+                let table = pyarrow_pq.parquet.read_table(path)
+                let pandas = __import__("pandas")
+                let df = table.to_pandas()
+                text = df.to_csv(index=false)
+            } catch as e2 {
+                self._warn("pyarrow parquet also failed: " + str(e2))
+            }
+        }
+
+        return self._make_result("parquet", text, "csv", path, t0)
+    }
+
+    // ─── AVRO ───────────────────────────────────────────────────
+
+    fn _handle_avro(self, path: string, t0: float) -> ConversionResult {
+        let lines: List[string] = []
+        try {
+            let fastavro = __import__("fastavro")
+            let f = open(path, "rb")
+            let reader = fastavro.reader(f)
+            for record in reader {
+                append(lines, json.dumps(record))
+            }
+            f.close()
+        } catch as e {
+            self._warn("fastavro failed: " + str(e))
+        }
+
+        let text = join(lines, "\n")
+        return self._make_result("avro", text, "json", path, t0)
+    }
+
+    // ─── ARROW / ORC / FEATHER ──────────────────────────────────
+
+    fn _handle_arrow_family(self, path: string, ext: string, t0: float) -> ConversionResult {
+        let text = ""
+        try {
+            let pandas = __import__("pandas")
+            if ext == ".feather" or ext == ".arrow" {
+                let df = pandas.read_feather(path)
+            } else {
+                let pyarrow_orc = __import__("pyarrow.orc")
+                let table = pyarrow_orc.orc.read_table(path)
+                let df = table.to_pandas()
+            }
+            text = df.to_csv(index=false)
+        } catch as e {
+            self._warn("Arrow/ORC/Feather read failed: " + str(e))
+        }
+
+        return self._make_result(ext.replace(".", ""), text, "csv", path, t0)
+    }
+
+    // ─── DATABASE ───────────────────────────────────────────────
+
+    fn _handle_database(self, path: string, ext: string, t0: float) -> ConversionResult {
+        let csv_parts: List[string] = []
+
+        if ext == ".sqlite" or ext == ".db" or ext == ".sqlite3" {
+            try {
+                let sqlite3 = __import__("sqlite3")
+                let conn = sqlite3.connect(path)
+                let cursor = conn.cursor()
+
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                let tables = cursor.fetchall()
+
+                for table_row in tables {
+                    let table_name = table_row[0]
+                    if table_name.startswith("sqlite_") { continue }
+
+                    cursor.execute("PRAGMA table_info('" + table_name + "')")
+                    let cols = cursor.fetchall()
+                    let col_names: List[string] = []
+                    for col in cols { append(col_names, col[1]) }
+
+                    cursor.execute("SELECT * FROM '" + table_name + "'")
+                    let rows_data = cursor.fetchall()
+
+                    let rows: List[string] = [join(col_names, ",")]
+                    for row in rows_data {
+                        let cells: List[string] = []
+                        for cell in row {
+                            let val = str(cell) if cell != None else ""
+                            if "," in val or '"' in val {
+                                val = '"' + val.replace('"', '""') + '"'
+                            }
+                            append(cells, val)
+                        }
+                        append(rows, join(cells, ","))
+                    }
+                    append(csv_parts, join(rows, "\n"))
+                }
+                conn.close()
+            } catch as e {
+                self._warn("SQLite read failed: " + str(e))
+            }
+        }
+
+        if ext == ".mdb" or ext == ".accdb" {
+            try {
+                let subprocess = __import__("subprocess")
+                let proc = subprocess.run(
+                    ["mdb-tables", "-1", path],
+                    capture_output=true, text=true, timeout=30
+                )
+                if proc.returncode == 0 {
+                    let tables = proc.stdout.strip().split("\n")
+                    for table_name in tables {
+                        if len(table_name.strip()) == 0 { continue }
+                        let export_proc = subprocess.run(
+                            ["mdb-export", path, table_name.strip()],
+                            capture_output=true, text=true, timeout=60
+                        )
+                        if export_proc.returncode == 0 and len(export_proc.stdout.strip()) > 0 {
+                            append(csv_parts, export_proc.stdout.strip())
+                        }
+                    }
+                }
+            } catch as e {
+                self._warn("mdbtools failed: " + str(e))
+            }
+        }
+
+        let combined = join(csv_parts, "\n")
+        return self._make_result("database", combined, "csv", path, t0)
+    }
+
+    // ─── PCAP ───────────────────────────────────────────────────
+
+    fn _handle_pcap(self, path: string, t0: float) -> ConversionResult {
+        let text = ""
+
+        // Strategy 1: tshark CLI (most reliable for telecom protocols)
+        try {
+            let subprocess = __import__("subprocess")
+            let fields = [
+                "-e", "frame.time_epoch",
+                "-e", "ip.src", "-e", "ip.dst",
+                "-e", "gsm_map.opcode", "-e", "gsm_map.error_code",
+                "-e", "sccp.calling.digits", "-e", "sccp.called.digits",
+                "-e", "m3ua.protocol_data.opc", "-e", "m3ua.protocol_data.dpc",
+                "-e", "gsm_a.imsi",
+                "-e", "frame.len"
+            ]
+            let cmd = ["tshark", "-r", path, "-T", "fields"]
+            for f in fields { append(cmd, f) }
+            append(cmd, "-E")
+            append(cmd, "header=y")
+            append(cmd, "-E")
+            append(cmd, "separator=,")
+
+            let proc = subprocess.run(cmd, capture_output=true, text=true, timeout=120)
+            if proc.returncode == 0 {
+                text = proc.stdout
+            }
+        } catch as e {
+            self._warn("tshark failed: " + str(e) + " — trying scapy")
+
+            // Strategy 2: scapy
+            try {
+                let scapy = __import__("scapy.all")
+                let packets = scapy.all.rdpcap(path)
+                let rows: List[string] = ["timestamp,src,dst,protocol,length"]
+                for pkt in packets {
+                    let ts = str(float(pkt.time))
+                    let src = pkt.sprintf("%IP.src%") if pkt.haslayer("IP") else ""
+                    let dst = pkt.sprintf("%IP.dst%") if pkt.haslayer("IP") else ""
+                    let proto = str(pkt.lastlayer().name)
+                    let pkt_len = str(len(pkt))
+                    append(rows, ts + "," + src + "," + dst + "," + proto + "," + pkt_len)
+                }
+                text = join(rows, "\n")
+            } catch as e2 {
+                self._warn("scapy failed: " + str(e2))
+            }
+        }
+
+        return self._make_result("pcap", text, "csv", path, t0)
+    }
+
+    // ─── ASN.1 / BER / DER ─────────────────────────────────────
+
+    fn _handle_asn1(self, path: string, t0: float) -> ConversionResult {
+        let text = ""
+        try {
+            let asn1tools = __import__("asn1tools")
+            let f = open(path, "rb")
+            let raw = f.read()
+            f.close()
+
+            // Try generic BER decode
+            let pyasn1 = __import__("pyasn1")
+            let pyasn1_codec = __import__("pyasn1.codec.ber.decoder")
+            let decoded = pyasn1_codec.codec.ber.decoder.decode(raw)
+            text = str(decoded[0])
+        } catch as e {
+            self._warn("ASN.1 decode failed: " + str(e) + " — hex dump fallback")
+            let f = open(path, "rb")
+            let raw = f.read()
+            f.close()
+            // Hex dump as last resort
+            let hex_lines: List[string] = ["offset,hex,ascii"]
+            let offset = 0
+            while offset < len(raw) {
+                let chunk = raw[offset:offset + 16]
+                let hex_str = " ".join([format(b, "02x") for b in chunk])
+                let ascii_str = "".join([chr(b) if 32 <= b < 127 else "." for b in chunk])
+                append(hex_lines, str(offset) + "," + hex_str + "," + ascii_str)
+                offset = offset + 16
+            }
+            text = join(hex_lines, "\n")
+        }
+
+        return self._make_result("asn1", text, "json", path, t0)
+    }
+
+    // ─── 3GPP CDR ───────────────────────────────────────────────
+
+    fn _handle_3gpp_cdr(self, path: string, t0: float) -> ConversionResult {
+        // 3GPP CDRs are typically ASN.1 BER-encoded
+        let result = self._handle_asn1(path, t0)
+        result.format_detected = "3gpp_cdr"
+        return result
+    }
+
+    // ─── ERICSSON OSS EXPORT ────────────────────────────────────
+
+    fn _handle_ericsson_export(self, path: string, t0: float) -> ConversionResult {
+        let f = open(path, "r", encoding="utf-8", errors="replace")
+        let raw = f.read()
+        f.close()
+
+        // Ericsson OSS exports often have a header block then fixed-width or
+        // semicolon-delimited data. Detect the pattern.
+        let lines = raw.split("\n")
+        let data_start = 0
+
+        // Skip header lines (often start with %, #, or are metadata)
+        for i in range(len(lines)) {
+            let line = lines[i].strip()
+            if len(line) == 0 { continue }
+            if line.startswith("%") or line.startswith("#") or line.startswith("!") {
+                data_start = i + 1
+                continue
+            }
+            // If we hit a line with semicolons, that's likely the data delimiter
+            if ";" in line {
+                data_start = i
+                break
+            }
+            // If we hit a line with tabs, that's likely TSV
+            if "\t" in line {
+                data_start = i
+                break
+            }
+            break
+        }
+
+        let data_lines = lines[data_start:]
+        let data_text = join(data_lines, "\n")
+
+        // Convert semicolons to commas if that's the delimiter
+        if ";" in data_text and "," not in data_text {
+            data_text = data_text.replace(";", ",")
+        }
+
+        // If it looks fixed-width, convert
+        if self._looks_fixed_width(data_text) {
+            data_text = self._fixed_width_to_csv(data_text)
+        }
+
+        return self._make_result("ericsson_oss", data_text, "csv", path, t0)
+    }
+
+    // ─── PERFORMANCE LOGS (nmon, sar) ───────────────────────────
+
+    fn _handle_perf_log(self, path: string, ext: string, t0: float) -> ConversionResult {
+        let f = open(path, "r", encoding="utf-8", errors="replace")
+        let raw = f.read()
+        f.close()
+
+        if ext == ".nmon" {
+            return self._parse_nmon(raw, path, t0)
+        }
+
+        // sar output: typically fixed-width
+        let text = self._fixed_width_to_csv(raw)
+        return self._make_result("sar", text, "csv", path, t0)
+    }
+
+    fn _parse_nmon(self, raw: string, path: string, t0: float) -> ConversionResult {
+        let lines = raw.split("\n")
+        let sections: Dict[string, List[string]] = {}
+
+        for line in lines {
+            if len(line.strip()) == 0 { continue }
+            let parts = line.split(",")
+            if len(parts) < 2 { continue }
+            let section = parts[0]
+            if section not in sections {
+                sections[section] = []
+            }
+            append(sections[section], line)
+        }
+
+        // Combine all sections into CSV with a section prefix column
+        let rows: List[string] = ["section,data"]
+        for section_name in sections {
+            for line in sections[section_name] {
+                append(rows, section_name + "," + line.replace(",", ";", 1))
+            }
+        }
+
+        let text = join(rows, "\n")
+        return self._make_result("nmon", text, "csv", path, t0)
+    }
+
+    // ─── IMAGE OCR ──────────────────────────────────────────────
+
+    fn _handle_image_ocr(self, path: string, t0: float) -> ConversionResult {
+        let text = ""
+
+        try {
+            let pytesseract = __import__("pytesseract")
+            let PIL = __import__("PIL.Image")
+            let img = PIL.Image.open(path)
+            let raw = pytesseract.image_to_string(img)
+            text = self._text_block_to_csv(raw)
+        } catch as e {
+            self._warn("OCR failed (pytesseract): " + str(e))
+
+            // Fallback: try tesseract CLI directly
+            try {
+                let subprocess = __import__("subprocess")
+                let proc = subprocess.run(
+                    ["tesseract", path, "stdout"],
+                    capture_output=true, text=true, timeout=60
+                )
+                if proc.returncode == 0 {
+                    text = self._text_block_to_csv(proc.stdout)
+                }
+            } catch as e2 {
+                self._warn("tesseract CLI failed: " + str(e2))
+            }
+        }
+
+        return self._make_result("image_ocr", text, "csv", path, t0)
+    }
+
+    // ─── COMPRESSED ─────────────────────────────────────────────
+
+    fn _handle_compressed(self, path: string, ext: string, t0: float) -> ConversionResult {
+        import tempfile from "std/tempfile"
+
+        let decompressed_path = ""
+
+        try {
+            if ext == ".gz" {
+                let gzip = __import__("gzip")
+                let f_in = gzip.open(path, "rb")
+                let data = f_in.read()
+                f_in.close()
+
+                let base = os.path.basename(path)
+                if base.endswith(".gz") { base = base[0:-3] }
+                let tmp = tempfile.NamedTemporaryFile(delete=false, suffix="_" + base)
+                tmp.write(data)
+                tmp.close()
+                decompressed_path = tmp.name
+            }
+
+            if ext == ".bz2" {
+                let bz2 = __import__("bz2")
+                let f_in = bz2.open(path, "rb")
+                let data = f_in.read()
+                f_in.close()
+
+                let base = os.path.basename(path)
+                if base.endswith(".bz2") { base = base[0:-4] }
+                let tmp = tempfile.NamedTemporaryFile(delete=false, suffix="_" + base)
+                tmp.write(data)
+                tmp.close()
+                decompressed_path = tmp.name
+            }
+
+            if ext == ".xz" or ext == ".lzma" {
+                let lzma = __import__("lzma")
+                let f_in = lzma.open(path, "rb")
+                let data = f_in.read()
+                f_in.close()
+
+                let base = os.path.basename(path)
+                if base.endswith(".xz") { base = base[0:-3] }
+                if base.endswith(".lzma") { base = base[0:-5] }
+                let tmp = tempfile.NamedTemporaryFile(delete=false, suffix="_" + base)
+                tmp.write(data)
+                tmp.close()
+                decompressed_path = tmp.name
+            }
+
+            if ext == ".zst" {
+                let zstandard = __import__("zstandard")
+                let f_in = open(path, "rb")
+                let dctx = zstandard.ZstdDecompressor()
+                let data = dctx.decompress(f_in.read())
+                f_in.close()
+
+                let base = os.path.basename(path)
+                if base.endswith(".zst") { base = base[0:-4] }
+                let tmp = tempfile.NamedTemporaryFile(delete=false, suffix="_" + base)
+                tmp.write(data)
+                tmp.close()
+                decompressed_path = tmp.name
+            }
+
+            if ext == ".lz4" {
+                let lz4_frame = __import__("lz4.frame")
+                let f_in = open(path, "rb")
+                let data = lz4_frame.frame.decompress(f_in.read())
+                f_in.close()
+
+                let base = os.path.basename(path)
+                if base.endswith(".lz4") { base = base[0:-4] }
+                let tmp = tempfile.NamedTemporaryFile(delete=false, suffix="_" + base)
+                tmp.write(data)
+                tmp.close()
+                decompressed_path = tmp.name
+            }
+
+            if decompressed_path != "" {
+                let inner_result = self.convert(decompressed_path)
+                inner_result.original_path = path
+                inner_result.format_detected = ext.replace(".", "") + "+" + inner_result.format_detected
+                try { os.unlink(decompressed_path) } catch {}
+                return inner_result
+            }
+        } catch as e {
+            self._warn("Decompression failed: " + str(e))
+            if decompressed_path != "" {
+                try { os.unlink(decompressed_path) } catch {}
+            }
+        }
+
+        return self._make_result("compressed_unknown", "", "csv", path, t0)
+    }
+
+    // ─── ARCHIVES ───────────────────────────────────────────────
+
+    fn _handle_archive(self, path: string, ext: string, t0: float) -> ConversionResult {
+        import tempfile from "std/tempfile"
+
+        let extract_dir = tempfile.mkdtemp(prefix="nrs_telecom_")
+        let all_texts: List[string] = []
+        let sub_files: List[string] = []
+
+        try {
+            if ext == ".zip" {
+                let zipfile = __import__("zipfile")
+                let zf = zipfile.ZipFile(path, "r")
+                zf.extractall(extract_dir)
+                zf.close()
+            }
+
+            if ext == ".tar" or ext == ".tgz" or ext == ".tar.gz" or ext == ".tar.bz2" or ext == ".tar.xz" {
+                let tarfile = __import__("tarfile")
+                let tf = tarfile.open(path, "r:*")
+                tf.extractall(extract_dir)
+                tf.close()
+            }
+
+            if ext == ".7z" {
+                try {
+                    let py7zr = __import__("py7zr")
+                    let sz = py7zr.SevenZipFile(path, mode="r")
+                    sz.extractall(path=extract_dir)
+                    sz.close()
+                } catch as e {
+                    self._warn("py7zr failed: " + str(e))
+                    let subprocess = __import__("subprocess")
+                    subprocess.run(["7z", "x", path, "-o" + extract_dir], timeout=120)
+                }
+            }
+
+            if ext == ".rar" {
+                try {
+                    let rarfile = __import__("rarfile")
+                    let rf = rarfile.RarFile(path)
+                    rf.extractall(extract_dir)
+                    rf.close()
+                } catch as e {
+                    self._warn("rarfile failed: " + str(e))
+                    let subprocess = __import__("subprocess")
+                    subprocess.run(["unrar", "x", path, extract_dir], timeout=120)
+                }
+            }
+
+            // Walk extracted directory and convert each file
+            for root_dir, dirs, files in os.walk(extract_dir) {
+                for fname in files {
+                    let fpath = os.path.join(root_dir, fname)
+                    append(sub_files, fname)
+                    let sub_result = self.convert(fpath)
+                    if sub_result.success and len(sub_result.output_text.strip()) > 0 {
+                        append(all_texts, sub_result.output_text)
+                    }
+                    for w in sub_result.warnings {
+                        self._warn("[" + fname + "] " + w)
+                    }
+                }
+            }
+        } catch as e {
+            self._warn("Archive extraction failed: " + str(e))
+        }
+
+        // Clean up temp dir
+        try {
+            let shutil = __import__("shutil")
+            shutil.rmtree(extract_dir)
+        } catch {}
+
+        import time from "std/time"
+        let combined = join(all_texts, "\n")
+        return ConversionResult {
+            success: len(combined.strip()) > 0,
+            format_detected: "archive_" + ext.replace(".", ""),
+            original_path: path,
+            output_text: combined,
+            output_format: "csv",
+            records_estimated: self._estimate_records(combined),
+            warnings: self._warnings,
+            sub_files: sub_files,
+            elapsed_ms: (time.time() - t0) * 1000.0
+        }
+    }
+
+    // ─── UNKNOWN / FALLBACK ─────────────────────────────────────
+
+    fn _handle_unknown(self, path: string, t0: float) -> ConversionResult {
+        // Try reading as text first
+        try {
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let raw = f.read()
+            f.close()
+
+            if len(raw.strip()) == 0 {
+                self._warn("File is empty")
+                return self._make_result("unknown", "", "csv", path, t0)
+            }
+
+            // Check if it's valid JSON
+            try {
+                let parsed = json.loads(raw)
+                return self._make_result("json", raw, "json", path, t0)
+            } catch {}
+
+            // Check if it looks like CSV
+            let first_lines = raw.split("\n")[0:5]
+            let comma_count = 0
+            for line in first_lines { comma_count = comma_count + line.count(",") }
+            if comma_count > len(first_lines) {
+                return self._make_result("csv", raw, "csv", path, t0)
+            }
+
+            // Check if it looks like TSV
+            let tab_count = 0
+            for line in first_lines { tab_count = tab_count + line.count("\t") }
+            if tab_count > len(first_lines) {
+                return self._make_result("tsv", raw, "tsv", path, t0)
+            }
+
+            // Check if it looks like XML
+            if raw.strip().startswith("<") {
+                return self._make_result("xml", raw, "xml", path, t0)
+            }
+
+            // Fixed-width?
+            if self._looks_fixed_width(raw) {
+                let csv_text = self._fixed_width_to_csv(raw)
+                return self._make_result("fixed_width", csv_text, "csv", path, t0)
+            }
+
+            // Last resort: try to extract any tabular structure
+            let csv_text = self._text_block_to_csv(raw)
+            return self._make_result("freeform_text", csv_text, "csv", path, t0)
+        } catch {
+            // Binary file — try hex dump
+            self._warn("Cannot read as text, producing hex summary")
+            let f = open(path, "rb")
+            let raw_bytes = f.read(65536)
+            f.close()
+
+            let hex_lines: List[string] = ["offset,hex,ascii"]
+            let offset = 0
+            while offset < len(raw_bytes) {
+                let chunk = raw_bytes[offset:offset + 16]
+                let hex_str = " ".join([format(b, "02x") for b in chunk])
+                let ascii_str = "".join([chr(b) if 32 <= b < 127 else "." for b in chunk])
+                append(hex_lines, str(offset) + "," + hex_str + "," + ascii_str)
+                offset = offset + 16
+            }
+            let text = join(hex_lines, "\n")
+            return self._make_result("binary", text, "csv", path, t0)
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  TEXT STRUCTURE DETECTION AND CONVERSION
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Detect if text looks like fixed-width columns.
+    fn _looks_fixed_width(self, text: string) -> bool {
+        let lines = text.strip().split("\n")
+        if len(lines) < 3 { return false }
+
+        // Fixed-width files have consistent spacing patterns.
+        // Check if multiple consecutive spaces appear at the same positions.
+        let space_positions: Dict[int, int] = {}
+
+        let check_count = min(20, len(lines))
+        for i in range(check_count) {
+            let line = lines[i]
+            let in_space_run = false
+            for j in range(len(line)) {
+                if line[j] == " " {
+                    if !in_space_run and j > 0 and j < len(line) - 1 {
+                        if j not in space_positions { space_positions[j] = 0 }
+                        space_positions[j] = space_positions[j] + 1
+                    }
+                    in_space_run = true
+                } else {
+                    in_space_run = false
+                }
+            }
+        }
+
+        // If many positions have consistent multi-space boundaries, it's fixed-width
+        let consistent = 0
+        let threshold = int(check_count * 0.6)
+        for pos in space_positions {
+            if space_positions[pos] >= threshold { consistent = consistent + 1 }
+        }
+
+        return consistent >= 3
+    }
+
+    /// Convert fixed-width text to CSV.
+    fn _fixed_width_to_csv(self, text: string) -> ConversionResult {
+        let lines = text.strip().split("\n")
+        if len(lines) < 2 { return text }
+
+        // Find column boundaries by analyzing space patterns
+        let boundaries = self._detect_column_boundaries(lines)
+        if len(boundaries) == 0 { return text }
+
+        let csv_rows: List[string] = []
+        for line in lines {
+            if len(line.strip()) == 0 { continue }
+            // Skip separator lines (all dashes, equals, etc.)
+            let stripped = line.strip()
+            if len(stripped) > 0 {
+                let is_separator = true
+                for ch in stripped {
+                    if ch != "-" and ch != "=" and ch != "+" and ch != "|" and ch != " " {
+                        is_separator = false
+                        break
+                    }
+                }
+                if is_separator { continue }
+            }
+
+            let cells: List[string] = []
+            for b in boundaries {
+                let start = b.start
+                let end = b.end
+                if start >= len(line) {
+                    append(cells, "")
+                } else {
+                    let end_pos = min(end, len(line))
+                    let val = line[start:end_pos].strip()
+                    if "," in val or '"' in val {
+                        val = '"' + val.replace('"', '""') + '"'
+                    }
+                    append(cells, val)
+                }
+            }
+            append(csv_rows, join(cells, ","))
+        }
+
+        return join(csv_rows, "\n")
+    }
+
+    /// Detect column boundaries from fixed-width text.
+    fn _detect_column_boundaries(self, lines: List[string]) -> List[ColumnBoundary] {
+        if len(lines) == 0 { return [] }
+
+        // Find the maximum line length
+        let max_len = 0
+        for line in lines {
+            if len(line) > max_len { max_len = len(line) }
+        }
+
+        if max_len == 0 { return [] }
+
+        // Count non-space characters at each position
+        let char_counts: List[int] = []
+        for i in range(max_len) { append(char_counts, 0) }
+
+        let sample_count = min(50, len(lines))
+        for i in range(sample_count) {
+            let line = lines[i]
+            for j in range(len(line)) {
+                if line[j] != " " {
+                    char_counts[j] = char_counts[j] + 1
+                }
+            }
+        }
+
+        // Find gaps (positions where most lines have spaces)
+        let gap_threshold = int(sample_count * 0.7)
+        let in_gap = true
+        let boundaries: List[ColumnBoundary] = []
+        let col_start = 0
+        let col_idx = 0
+
+        for pos in range(max_len) {
+            let is_gap = char_counts[pos] < (sample_count - gap_threshold)
+
+            if in_gap and !is_gap {
+                col_start = pos
+                in_gap = false
+            }
+            if !in_gap and is_gap {
+                append(boundaries, ColumnBoundary {
+                    start: col_start,
+                    end: pos,
+                    name: "col_" + str(col_idx)
+                })
+                col_idx = col_idx + 1
+                in_gap = true
+            }
+        }
+
+        // Capture last column
+        if !in_gap {
+            append(boundaries, ColumnBoundary {
+                start: col_start,
+                end: max_len,
+                name: "col_" + str(col_idx)
+            })
+        }
+
+        // Use first line as header names if possible
+        if len(lines) > 0 and len(boundaries) > 0 {
+            let header_line = lines[0]
+            for b in boundaries {
+                let end_pos = min(b.end, len(header_line))
+                if b.start < len(header_line) {
+                    let name = header_line[b.start:end_pos].strip()
+                    if len(name) > 0 { b.name = name }
+                }
+            }
+        }
+
+        return boundaries
+    }
+
+    /// Convert a freeform text block to CSV by extracting key-value patterns
+    /// and tabular structures.
+    fn _text_block_to_csv(self, text: string) -> string {
+        let lines = text.strip().split("\n")
+        if len(lines) == 0 { return "" }
+
+        // Strategy 1: Look for consistent delimiter patterns
+        let delimiters = [",", "\t", "|", ";"]
+        for delim in delimiters {
+            let counts: List[int] = []
+            for line in lines {
+                append(counts, line.count(delim))
+            }
+            // If most lines have the same number of this delimiter, use it
+            if len(counts) > 2 {
+                let mode_count = self._mode(counts)
+                if mode_count > 0 {
+                    let consistent = 0
+                    for c in counts {
+                        if c == mode_count { consistent = consistent + 1 }
+                    }
+                    if float(consistent) / float(len(counts)) > 0.7 {
+                        if delim == "," { return text }
+                        // Convert to CSV
+                        let csv_lines: List[string] = []
+                        for line in lines {
+                            let parts = line.split(delim)
+                            let cells: List[string] = []
+                            for p in parts {
+                                let val = p.strip()
+                                if "," in val { val = '"' + val + '"' }
+                                append(cells, val)
+                            }
+                            append(csv_lines, join(cells, ","))
+                        }
+                        return join(csv_lines, "\n")
+                    }
+                }
+            }
+        }
+
+        // Strategy 2: Key-value extraction (e.g., "Tower ID: 12345")
+        let kv_pattern = re.compile(r"^(.+?)[:=]\s*(.+)$")
+        let kv_pairs: List[Dict[string, string]] = []
+        let current_record: Dict[string, string] = {}
+
+        for line in lines {
+            let stripped = line.strip()
+            if len(stripped) == 0 {
+                if len(current_record) > 0 {
+                    append(kv_pairs, current_record)
+                    current_record = {}
+                }
+                continue
+            }
+
+            let match = kv_pattern.match(stripped)
+            if match != None {
+                let key = match.group(1).strip()
+                let val = match.group(2).strip()
+                current_record[key] = val
+            }
+        }
+
+        if len(current_record) > 0 {
+            append(kv_pairs, current_record)
+        }
+
+        if len(kv_pairs) > 0 {
+            // Build CSV from key-value records
+            let all_keys: List[string] = []
+            for rec in kv_pairs {
+                for k in rec {
+                    if k not in all_keys { append(all_keys, k) }
+                }
+            }
+
+            let csv_lines: List[string] = [join(all_keys, ",")]
+            for rec in kv_pairs {
+                let cells: List[string] = []
+                for k in all_keys {
+                    let val = rec.get(k, "")
+                    if "," in val { val = '"' + val + '"' }
+                    append(cells, val)
+                }
+                append(csv_lines, join(cells, ","))
+            }
+            return join(csv_lines, "\n")
+        }
+
+        // Strategy 3: Fixed-width detection
+        if self._looks_fixed_width(text) {
+            return self._fixed_width_to_csv(text)
+        }
+
+        // Strategy 4: Return as single-column CSV
+        let csv_lines: List[string] = ["data"]
+        for line in lines {
+            let val = line.strip()
+            if len(val) > 0 {
+                if "," in val { val = '"' + val + '"' }
+                append(csv_lines, val)
+            }
+        }
+        return join(csv_lines, "\n")
+    }
+
+    /// Convert syslog-style lines to CSV.
+    fn _syslog_to_csv(self, text: string) -> string {
+        let lines = text.strip().split("\n")
+
+        // Common syslog pattern: timestamp host process[pid]: message
+        let syslog_re = re.compile(
+            r"^(\w+\s+\d+\s+[\d:]+)\s+(\S+)\s+(\S+?)(?:\[(\d+)\])?:\s+(.+)$"
+        )
+
+        let csv_rows: List[string] = ["timestamp,host,process,pid,message"]
+        for line in lines {
+            let match = syslog_re.match(line.strip())
+            if match != None {
+                let ts = match.group(1)
+                let host = match.group(2)
+                let proc = match.group(3)
+                let pid = match.group(4) if match.group(4) != None else ""
+                let msg = match.group(5).replace(",", ";")
+                append(csv_rows, ts + "," + host + "," + proc + "," + pid + "," + msg)
+            } else {
+                // Try generic timestamp extraction
+                let ts_match = re.match(r"^([\d\-/T:\.Z+]+)\s+(.+)$", line.strip())
+                if ts_match != None {
+                    let ts = ts_match.group(1)
+                    let rest = ts_match.group(2).replace(",", ";")
+                    append(csv_rows, ts + ",,,,\"" + rest + "\"")
+                }
+            }
+        }
+
+        return join(csv_rows, "\n")
+    }
+
+    fn _mode(self, values: List[int]) -> int {
+        let counts: Dict[int, int] = {}
+        for v in values {
+            if v not in counts { counts[v] = 0 }
+            counts[v] = counts[v] + 1
+        }
+        let best_val = 0
+        let best_count = 0
+        for v in counts {
+            if counts[v] > best_count {
+                best_count = counts[v]
+                best_val = v
+            }
+        }
+        return best_val
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONVENIENCE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════
+
+/// Convert any file to parser-ready text. One-liner entry point.
+fn convert_file(path: string) -> ConversionResult {
+    let converter = UniversalFileConverter()
+    return converter.convert(path)
+}
+
+/// Convert raw bytes with a filename hint.
+fn convert_bytes(data: bytes, filename: string) -> ConversionResult {
+    let converter = UniversalFileConverter()
+    return converter.convert_bytes(data, filename)
+}
+
+/// Get all supported file extensions.
+fn supported_extensions() -> List[string] {
+    return _all_supported_extensions()
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  NORMS
+// ═══════════════════════════════════════════════════════════════════
+
+norm preserve_original_data {
+    type: obligation,
+    scope: global,
+    action: "convert",
+    priority: 95,
+    condition: true
+}
+
+norm warn_on_lossy_conversion {
+    type: obligation,
+    scope: global,
+    action: "convert",
+    priority: 90,
+    condition: format_detected == "binary" or format_detected == "image_ocr"
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  EXPORTS
+// ═══════════════════════════════════════════════════════════════════
+
+export ConversionResult, ColumnBoundary
+export UniversalFileConverter
+export convert_file, convert_bytes, supported_extensions

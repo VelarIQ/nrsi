@@ -1,0 +1,511 @@
+/// NRSIP IP Credit Score — the AI credit report.
+///
+/// Real-time 0.0–5.0 reliability score for every NRSIP entity.
+/// Score = weighted combination of 5 factors:
+///   Response Quality (25%), Incident Rate (25%), Interaction Count (20%),
+///   Node Liveness (20%), Verification Level (10%).
+///
+/// 6 Tiers: UNTRUSTED, LOW, DEVELOPING, ESTABLISHED, TRUSTED, EXEMPLARY.
+///
+/// Patent-covered: IP Credit Report, reputation scoring, tiered identity,
+/// capability unlock thresholds, PRISM-fed response quality scoring.
+/// Ported from nrsip/ip_credit_score.py.
+
+module ip_credit_score
+
+
+import time from "std/time"
+import log from "logging"
+import log1p, exp from "math"
+
+/// ── Tier Definitions ──
+
+enum CreditTier {
+    UNTRUSTED = "UNTRUSTED",
+    LOW = "LOW",
+    DEVELOPING = "DEVELOPING",
+    ESTABLISHED = "ESTABLISHED",
+    TRUSTED = "TRUSTED",
+    EXEMPLARY = "EXEMPLARY"
+}
+
+fn tier_for_score(score: float) -> CreditTier {
+    let clamped = max(0.0, min(5.0, score))
+    if clamped < 1.0 { return CreditTier.UNTRUSTED }
+    if clamped < 2.0 { return CreditTier.LOW }
+    if clamped < 3.0 { return CreditTier.DEVELOPING }
+    if clamped < 4.0 { return CreditTier.ESTABLISHED }
+    if clamped < 4.5 { return CreditTier.TRUSTED }
+    return CreditTier.EXEMPLARY
+}
+
+/// ── Entity Types ──
+
+enum EntityType {
+    NRS_INSTANCE = "nrs_instance",
+    USER = "user",
+    APPLICATION = "application",
+    SERVICE = "service"
+}
+
+enum TrustLevel {
+    ANONYMOUS = "ANONYMOUS",
+    AUTHENTICATED = "AUTHENTICATED",
+    ATTESTED = "ATTESTED"
+}
+
+let VERIFICATION_SCORES = {
+    "ANONYMOUS": 0.2,
+    "AUTHENTICATED": 0.6,
+    "ATTESTED": 1.0
+}
+
+/// ── Factor Weights ──
+
+let WEIGHT_RESPONSE_QUALITY = 0.25
+let WEIGHT_INCIDENT_RATE = 0.25
+let WEIGHT_INTERACTION_COUNT = 0.20
+let WEIGHT_NODE_LIVENESS = 0.20
+let WEIGHT_VERIFICATION_LEVEL = 0.10
+
+/// ── Capability Unlocks ──
+
+type CapabilityRequirement {
+    min_score: float,
+    min_alive_days: int,
+    description: string
+}
+
+let CAPABILITIES = {
+    "basic_queries": CapabilityRequirement { min_score: 0.5, min_alive_days: 0, description: "Basic queries only" },
+    "standard_access": CapabilityRequirement { min_score: 1.5, min_alive_days: 7, description: "Standard access" },
+    "domain_specific": CapabilityRequirement { min_score: 2.5, min_alive_days: 30, description: "Domain-specific queries" },
+    "cross_provider": CapabilityRequirement { min_score: 3.0, min_alive_days: 60, description: "Cross-provider trust" },
+    "priority_routing": CapabilityRequirement { min_score: 4.0, min_alive_days: 0, description: "Priority routing + full access" },
+    "endorse_entities": CapabilityRequirement { min_score: 4.5, min_alive_days: 0, description: "Can endorse other entities" }
+}
+
+let SUSPENSION_THRESHOLD = 1.0
+let BAN_THRESHOLD = 0.5
+
+/// ── Incident Types ──
+
+enum IncidentType {
+    HALLUCINATION = "hallucination",
+    COMPLAINT = "complaint",
+    BLOCK = "block",
+    BAN = "ban",
+    SECURITY = "security",
+    ATTESTATION_FAILURE = "attestation_failure"
+}
+
+let INCIDENT_SEVERITY = {
+    "hallucination": 1.0,
+    "complaint": 0.5,
+    "block": 2.0,
+    "ban": 5.0,
+    "security": 3.0,
+    "attestation_failure": 4.0
+}
+
+/// ── Factor Scores ──
+
+type FactorScores {
+    response_quality: float,
+    incident_rate: float,
+    interaction_count: float,
+    node_liveness: float,
+    verification_level: float
+}
+
+/// ── Interaction Record ──
+
+type InteractionRecord {
+    timestamp_ms: int,
+    prism_tier: string,
+    h_score: float,
+    validated: bool,
+    domain: string,
+    processing_mode: string
+}
+
+/// ── Incident Record ──
+
+type IncidentRecord {
+    timestamp_ms: int,
+    incident_type: IncidentType,
+    severity: float,
+    description: string,
+    resolved: bool
+}
+
+fn make_incident(timestamp_ms: int, incident_type: IncidentType,
+                 severity: float, description: string) -> IncidentRecord {
+    let sev = severity
+    if sev == 0.0 {
+        sev = INCIDENT_SEVERITY.get(incident_type.value, 1.0)
+    }
+    return IncidentRecord {
+        timestamp_ms: timestamp_ms,
+        incident_type: incident_type,
+        severity: sev,
+        description: description,
+        resolved: false
+    }
+}
+
+/// ── Credit Ledger ──
+
+type CreditLedger {
+    entity_id: string,
+    entity_type: EntityType,
+    nrsip_address: string,
+    trust_level: TrustLevel,
+    enrolled_at_ms: int,
+    last_seen_ms: int,
+    uptime_pct: float,
+    total_interactions: int,
+    validated_interactions: int,
+    positive_feedback_count: int,
+    prism_score_sum: float,
+    prism_score_count: int,
+    incidents: List[IncidentRecord],
+    domain_certifications: List[string],
+    current_score: float,
+    current_tier: CreditTier,
+    factor_scores: FactorScores,
+    suspended: bool,
+    banned: bool,
+    score_history: List[Map[string, any]]
+}
+
+fn ledger_alive_days(ledger: CreditLedger) -> float {
+    if ledger.enrolled_at_ms <= 0 { return 0.0 }
+    let now_ms = to_int(time.time() * 1000.0)
+    return to_float(now_ms - ledger.enrolled_at_ms) / 86400000.0
+}
+
+fn ledger_positive_feedback_pct(ledger: CreditLedger) -> float {
+    if ledger.total_interactions == 0 { return 0.0 }
+    return (to_float(ledger.positive_feedback_count) / to_float(ledger.total_interactions)) * 100.0
+}
+
+fn ledger_unresolved_incidents(ledger: CreditLedger) -> int {
+    let count = 0
+    for inc in ledger.incidents {
+        if !inc.resolved { count += 1 }
+    }
+    return count
+}
+
+fn ledger_weighted_incident_severity(ledger: CreditLedger) -> float {
+    let total = 0.0
+    for inc in ledger.incidents {
+        if !inc.resolved { total += inc.severity }
+    }
+    return total
+}
+
+/// ── Score Computation Engine ──
+
+class IPCreditScoreEngine {
+    let INTERACTION_SATURATION = 10000
+    let LIVENESS_FULL_DAYS = 90
+    let INCIDENT_DECAY_BASE = 5.0
+
+    fn init(self) {}
+
+    fn compute_response_quality(self, ledger: CreditLedger) -> float {
+        if ledger.prism_score_count == 0 { return 0.0 }
+        let avg_prism = ledger.prism_score_sum / to_float(ledger.prism_score_count)
+        let validation_ratio = 0.0
+        if ledger.total_interactions > 0 {
+            validation_ratio = to_float(ledger.validated_interactions) /
+                               to_float(ledger.total_interactions)
+        }
+        return min(1.0, avg_prism * 0.7 + validation_ratio * 0.3)
+    }
+
+    fn compute_incident_rate(self, ledger: CreditLedger) -> float {
+        if ledger.total_interactions == 0 {
+            if ledger.incidents.len() == 0 { return 1.0 }
+            return 0.0
+        }
+        let severity = ledger_weighted_incident_severity(ledger)
+        let ratio = severity / to_float(max(ledger.total_interactions, 1))
+        let score = exp(-self.INCIDENT_DECAY_BASE * ratio)
+        return max(0.0, min(1.0, score))
+    }
+
+    fn compute_interaction_count(self, ledger: CreditLedger) -> float {
+        if ledger.total_interactions <= 0 { return 0.0 }
+        let normalized = log1p(to_float(ledger.total_interactions)) /
+                         log1p(to_float(self.INTERACTION_SATURATION))
+        return max(0.0, min(1.0, normalized))
+    }
+
+    fn compute_node_liveness(self, ledger: CreditLedger) -> float {
+        let days = ledger_alive_days(ledger)
+        let uptime = ledger.uptime_pct
+        if uptime > 1.0 { uptime = uptime / 100.0 }
+        let days_score = min(1.0, days / to_float(self.LIVENESS_FULL_DAYS))
+        let uptime_score = uptime
+        if uptime >= 0.9 {
+            uptime_score = min(1.0, max(0.0, (uptime - 0.9) / 0.1))
+        }
+        return days_score * 0.5 + uptime_score * 0.5
+    }
+
+    fn compute_verification_level(self, ledger: CreditLedger) -> float {
+        return VERIFICATION_SCORES.get(ledger.trust_level.value, 0.2)
+    }
+
+    fn compute(self, ledger: CreditLedger) -> float {
+        let f1 = self.compute_response_quality(ledger)
+        let f2 = self.compute_incident_rate(ledger)
+        let f3 = self.compute_interaction_count(ledger)
+        let f4 = self.compute_node_liveness(ledger)
+        let f5 = self.compute_verification_level(ledger)
+
+        ledger.factor_scores = FactorScores {
+            response_quality: f1, incident_rate: f2,
+            interaction_count: f3, node_liveness: f4,
+            verification_level: f5
+        }
+
+        let weighted = f1 * WEIGHT_RESPONSE_QUALITY +
+                       f2 * WEIGHT_INCIDENT_RATE +
+                       f3 * WEIGHT_INTERACTION_COUNT +
+                       f4 * WEIGHT_NODE_LIVENESS +
+                       f5 * WEIGHT_VERIFICATION_LEVEL
+
+        let score = max(0.0, min(5.0, weighted * 5.0))
+        ledger.current_score = round(score, 4)
+        ledger.current_tier = tier_for_score(score)
+        ledger.suspended = score < SUSPENSION_THRESHOLD
+        ledger.banned = score < BAN_THRESHOLD
+
+        ledger.score_history.append({
+            "timestamp_ms": to_int(time.time() * 1000.0),
+            "score": ledger.current_score,
+            "tier": ledger.current_tier.value,
+            "factors": {
+                "response_quality": round(f1, 4),
+                "incident_rate": round(f2, 4),
+                "interaction_count": round(f3, 4),
+                "node_liveness": round(f4, 4),
+                "verification_level": round(f5, 4)
+            }
+        })
+        return ledger.current_score
+    }
+
+    fn record_interaction(self, ledger: CreditLedger,
+                          interaction: InteractionRecord) -> float {
+        ledger.total_interactions += 1
+        if interaction.validated {
+            ledger.validated_interactions += 1
+            ledger.positive_feedback_count += 1
+        }
+        ledger.prism_score_sum += interaction.h_score
+        ledger.prism_score_count += 1
+        ledger.last_seen_ms = interaction.timestamp_ms
+        return self.compute(ledger)
+    }
+
+    fn record_incident(self, ledger: CreditLedger,
+                       incident: IncidentRecord) -> float {
+        ledger.incidents.append(incident)
+        return self.compute(ledger)
+    }
+
+    fn resolve_incident(self, ledger: CreditLedger, index: int) -> float {
+        if index >= 0 && index < ledger.incidents.len() {
+            ledger.incidents[index].resolved = true
+        }
+        return self.compute(ledger)
+    }
+
+    fn update_liveness(self, ledger: CreditLedger, uptime_pct: float) -> float {
+        ledger.uptime_pct = uptime_pct
+        ledger.last_seen_ms = to_int(time.time() * 1000.0)
+        return self.compute(ledger)
+    }
+
+    fn set_trust_level(self, ledger: CreditLedger, level: TrustLevel) -> float {
+        ledger.trust_level = level
+        return self.compute(ledger)
+    }
+
+    fn add_domain_certification(self, ledger: CreditLedger, domain: string) {
+        let found = false
+        for d in ledger.domain_certifications {
+            if d == domain { found = true; break }
+        }
+        if !found {
+            ledger.domain_certifications.append(domain)
+        }
+    }
+}
+
+/// ── Capability Enforcer ──
+
+class CapabilityEnforcer {
+    fn init(self) {}
+
+    fn unlocked_capabilities(self, ledger: CreditLedger) -> any {
+        let result = {}
+        for cap_name in CAPABILITIES.keys() {
+            let req = CAPABILITIES[cap_name]
+            let meets_score = ledger.current_score >= req.min_score
+            let meets_age = ledger_alive_days(ledger) >= to_float(req.min_alive_days)
+            result[cap_name] = meets_score && meets_age
+        }
+        return result
+    }
+
+    fn can(self, ledger: CreditLedger, capability: string) -> bool {
+        let req = CAPABILITIES.get(capability, nil)
+        if req == nil { return false }
+        if ledger.banned { return false }
+        if ledger.suspended && capability != "basic_queries" { return false }
+        return ledger.current_score >= req.min_score &&
+               ledger_alive_days(ledger) >= to_float(req.min_alive_days)
+    }
+
+    fn enforcement_decision(self, ledger: CreditLedger,
+                            requested_capability: string) -> any {
+        let req = CAPABILITIES.get(requested_capability, nil)
+        if req == nil {
+            return {
+                "allowed": false,
+                "reason": "unknown capability: " + requested_capability,
+                "entity_id": ledger.entity_id
+            }
+        }
+        let allowed = self.can(ledger, requested_capability)
+        let reason = ""
+        if ledger.banned {
+            reason = "entity banned (score " + to_string(ledger.current_score) +
+                     " < " + to_string(BAN_THRESHOLD) + ")"
+        } else if ledger.suspended && requested_capability != "basic_queries" {
+            reason = "entity suspended (score " + to_string(ledger.current_score) +
+                     " < " + to_string(SUSPENSION_THRESHOLD) + ")"
+        } else if ledger.current_score < req.min_score {
+            reason = "score " + to_string(ledger.current_score) +
+                     " below required " + to_string(req.min_score)
+        } else if ledger_alive_days(ledger) < to_float(req.min_alive_days) {
+            reason = "alive " + to_string(round(ledger_alive_days(ledger), 0)) +
+                     "d below required " + to_string(req.min_alive_days) + "d"
+        }
+        return {
+            "allowed": allowed,
+            "capability": requested_capability,
+            "entity_id": ledger.entity_id,
+            "entity_score": ledger.current_score,
+            "entity_tier": ledger.current_tier.value,
+            "required_score": req.min_score,
+            "required_alive_days": req.min_alive_days,
+            "actual_alive_days": round(ledger_alive_days(ledger), 1),
+            "reason": reason,
+            "suspended": ledger.suspended,
+            "banned": ledger.banned
+        }
+    }
+}
+
+/// ── IP Credit Report ──
+
+type IPCreditReport {
+    entity: string,
+    entity_type: string,
+    nrsip_address: string,
+    reliability_score: float,
+    tier: string,
+    alive_days: float,
+    uptime_pct: float,
+    total_interactions: int,
+    positive_feedback_pct: float,
+    incidents: int,
+    unresolved_incidents: int,
+    domain_certifications: List[string],
+    cross_provider_enabled: bool,
+    priority_routing: bool,
+    can_endorse: bool,
+    suspended: bool,
+    banned: bool,
+    trust_level: string,
+    factor_breakdown: Map[string, float],
+    unlocked_capabilities: Map[string, bool],
+    score_history_length: int
+}
+
+fn credit_report_to_dict(r: IPCreditReport) -> any {
+    return {
+        "entity": r.entity,
+        "type": r.entity_type,
+        "nrsip_address": r.nrsip_address,
+        "reliability_score": r.reliability_score,
+        "tier": r.tier,
+        "alive_days": round(r.alive_days, 1),
+        "uptime_pct": round(r.uptime_pct, 2),
+        "total_interactions": r.total_interactions,
+        "positive_feedback_pct": round(r.positive_feedback_pct, 1),
+        "incidents": r.incidents,
+        "unresolved_incidents": r.unresolved_incidents,
+        "domain_certifications": r.domain_certifications,
+        "cross_provider_enabled": r.cross_provider_enabled,
+        "priority_routing": r.priority_routing,
+        "can_endorse": r.can_endorse,
+        "suspended": r.suspended,
+        "banned": r.banned,
+        "trust_level": r.trust_level,
+        "factor_breakdown": r.factor_breakdown,
+        "unlocked_capabilities": r.unlocked_capabilities
+    }
+}
+
+fn generate_credit_report(ledger: CreditLedger) -> IPCreditReport {
+    let enforcer = CapabilityEnforcer()
+    enforcer.init()
+    let caps = enforcer.unlocked_capabilities(ledger)
+    return IPCreditReport {
+        entity: ledger.entity_id,
+        entity_type: ledger.entity_type.value,
+        nrsip_address: ledger.nrsip_address,
+        reliability_score: ledger.current_score,
+        tier: ledger.current_tier.value,
+        alive_days: ledger_alive_days(ledger),
+        uptime_pct: ledger.uptime_pct,
+        total_interactions: ledger.total_interactions,
+        positive_feedback_pct: ledger_positive_feedback_pct(ledger),
+        incidents: ledger.incidents.len(),
+        unresolved_incidents: ledger_unresolved_incidents(ledger),
+        domain_certifications: ledger.domain_certifications.copy(),
+        cross_provider_enabled: caps.get("cross_provider", false),
+        priority_routing: caps.get("priority_routing", false),
+        can_endorse: caps.get("endorse_entities", false),
+        suspended: ledger.suspended,
+        banned: ledger.banned,
+        trust_level: ledger.trust_level.value,
+        factor_breakdown: {
+            "response_quality": ledger.factor_scores.response_quality,
+            "incident_rate": ledger.factor_scores.incident_rate,
+            "interaction_count": ledger.factor_scores.interaction_count,
+            "node_liveness": ledger.factor_scores.node_liveness,
+            "verification_level": ledger.factor_scores.verification_level
+        },
+        unlocked_capabilities: caps,
+        score_history_length: ledger.score_history.len()
+    }
+}
+
+export CreditTier, tier_for_score
+export EntityType, TrustLevel
+export CapabilityRequirement, CAPABILITIES, SUSPENSION_THRESHOLD, BAN_THRESHOLD
+export IncidentType, INCIDENT_SEVERITY
+export FactorScores, InteractionRecord, IncidentRecord, make_incident
+export CreditLedger, ledger_alive_days, ledger_positive_feedback_pct
+export ledger_unresolved_incidents, ledger_weighted_incident_severity
+export IPCreditScoreEngine, CapabilityEnforcer
+export IPCreditReport, credit_report_to_dict, generate_credit_report

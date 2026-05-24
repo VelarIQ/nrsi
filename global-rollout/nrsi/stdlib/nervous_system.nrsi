@@ -1,0 +1,1671 @@
+module nervous_system
+
+
+import time from "std/time"
+// NRS Nervous System — Brain-like subsystems for the NRS processing pipeline.
+//
+// Implements the biological analogs that make NRS operate like the human brain
+// and nervous system:
+//
+//   Sensory Cortex      — hierarchical input parsing into structured Percept
+//   Thalamus Gateway    — attention-based lobe routing / salience filtering
+//   Amygdala            — emotional valence scoring, urgency/threat detection
+//   Neurotransmitter    — global neuromodulatory state (arousal, exploration, caution)
+//   Myelination Tracker — pathway strengthening for frequently successful routes
+//   Hippocampal Replay  — memory consolidation (L2→L3→L4 promotion)
+//   Cerebellum          — prediction-error correction loop
+//   Motor Cortex        — structured output planning (plan → sections → verbalize)
+//   Spinal Reflex       — ultra-fast pre-cortical pattern match
+//   Predictive Coding   — top-down prediction vs bottom-up input comparison
+//   Default Mode Network— background pattern discovery during idle
+//   Synaptic Pruner     — removal of low-use, low-confidence patterns
+//
+// Patent-covered: NRS nervous system architecture, brain-like processing pipeline.
+
+import hashlib
+import math
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Helper: sort key for lobe priority (replaces lambda)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn _lobe_sort_key(x: Tuple) -> float {
+    return x[1]
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  1. Sensory Cortex — hierarchical input parsing
+// ═════════════════════════════════════════════════════════════════════════════
+
+enum EmotionalTone {
+    NEUTRAL = "neutral",
+    CURIOUS = "curious",
+    URGENT = "urgent",
+    ANXIOUS = "anxious",
+    FRUSTRATED = "frustrated",
+    JOYFUL = "joyful",
+    ANALYTICAL = "analytical",
+    CREATIVE = "creative"
+}
+
+
+type Percept {
+    raw_text: str,
+    entities: List,
+    intent: str,
+    domain: str,
+    emotional_tone: EmotionalTone,
+    salience: float,
+    complexity: float,
+    urgency: float,
+    abstractness: float,
+    familiarity: float,
+    key_concepts: List,
+    query_type: str,
+    word_count: int,
+    has_negation: bool,
+    has_question: bool,
+    temporal_reference: str,
+    specificity: float,
+    user_sophistication: float
+}
+
+
+class SensoryCortex {
+    _ENTITY_PATTERN = re.compile(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b')
+    _DATE_PATTERN = re.compile(r'\b(?:\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2})\b')
+    _NUMBER_PATTERN = re.compile(r'\b\d+(?:\.\d+)?%?\b')
+
+    _EMOTION_SIGNALS: Dict = {
+        "urgent": [["urgent", "emergency", "immediately", "asap", "critical", "help",
+                    "dying", "broken", "failing", "crash"], 0.9],
+        "anxious": [["worried", "concerned", "afraid", "scared", "nervous", "unsure",
+                     "confused", "lost", "stuck", "don't understand"], 0.7],
+        "frustrated": [["why won't", "still not", "doesn't work", "broken again",
+                        "tried everything", "impossible", "ridiculous", "annoying"], 0.8],
+        "curious": [["wondering", "curious", "interested", "fascinating", "how does",
+                     "what if", "could you", "tell me about"], 0.5],
+        "joyful": [["amazing", "wonderful", "love", "excited", "great", "awesome",
+                    "brilliant", "fantastic", "perfect"], 0.3],
+        "creative": [["imagine", "create", "design", "invent", "write", "compose",
+                      "brainstorm", "story", "poem"], 0.4],
+        "analytical": [["analyze", "compare", "evaluate", "measure", "calculate",
+                        "prove", "derive", "optimize"], 0.4]
+    }
+
+    _DOMAIN_KEYWORDS: Dict = {
+        "science": ["atom", "molecule", "physics", "chemistry", "biology", "quantum",
+                    "gravity", "evolution", "dna", "energy", "relativity", "particle"],
+        "technology": ["computer", "software", "algorithm", "network", "encryption",
+                      "machine learning", "database", "api", "cloud", "neural network"],
+        "mathematics": ["equation", "theorem", "proof", "calculus", "algebra",
+                       "geometry", "probability", "matrix", "polynomial"],
+        "history": ["war", "century", "empire", "revolution", "ancient", "civilization",
+                   "dynasty", "treaty", "independence"],
+        "literature": ["novel", "poem", "author", "shakespeare", "fiction", "narrative",
+                      "literary", "prose", "verse", "metaphor"],
+        "philosophy": ["ethics", "epistemology", "metaphysics", "existentialism",
+                      "consciousness", "free will", "morality"],
+        "medicine": ["diagnosis", "treatment", "disease", "surgery", "patient",
+                    "symptom", "drug", "cancer", "immune"]
+    }
+
+    _CODE_SIGNALS: Set = {
+        "function", "class", "method", "script", "program", "code",
+        "implement", "algorithm", "api", "endpoint", "module",
+        "python", "javascript", "typescript", "rust", "golang", "java",
+        "swift", "kotlin", "c++", "ruby", "sql", "html", "css",
+        "regex", "refactor", "debug", "unittest", "test case",
+        "decorator", "generator", "async", "coroutine"
+    }
+
+    _ADVANCED_VOCAB: Set = {
+        "epistemological", "ontological", "heuristic", "paradigm", "axiomatic",
+        "stochastic", "asymptotic", "isomorphic", "endogenous", "exogenous",
+        "heterogeneous", "deterministic", "probabilistic", "morphological",
+        "dialectical", "empirical", "phenomenological", "transcendental",
+        "hermeneutic", "teleological", "deontological", "utilitarian",
+        "algorithm", "polynomial", "derivative", "integral", "eigenvalue",
+        "regression", "covariance", "homomorphism", "topological",
+        "cryptocurrency", "blockchain", "infrastructure", "architecture",
+        "microservices", "containerization", "kubernetes", "observability",
+        "idempotent", "concurrency", "mutex", "semaphore"
+    }
+
+    _SIMPLE_MARKERS: Set = {
+        "hi", "hey", "hello", "ok", "yes", "no", "yep", "nope", "cool",
+        "wow", "lol", "idk", "pls", "plz", "thx", "ty", "omg", "bruh",
+        "like", "stuff", "thing", "thingy", "dunno", "gonna", "wanna",
+        "gotta", "kinda", "sorta", "lemme", "gimme"
+    }
+
+    _INFORMAL_CONTRACTIONS: Set = {
+        "dont", "cant", "wont", "shouldnt", "wouldnt", "couldnt", "didnt",
+        "doesnt", "isnt", "arent", "wasnt", "werent", "aint", "im", "ur",
+        "u", "r", "thru", "tho", "cuz", "bcuz", "ppl", "rn", "ngl"
+    }
+
+    _CONDITIONAL_MARKERS: Set = {
+        "if", "unless", "assuming", "whereas", "given", "provided",
+        "supposing", "notwithstanding", "insofar"
+    }
+
+    fn parse(self, text: str, pvs_familiarity: float = 0.0) -> Percept {
+        let ql = text.lower()
+        let words = text.split()
+        let word_count = len(words)
+
+        // V1: Low-level features
+        let has_question = "?" in text
+        if not has_question {
+            let _qwords = ["what", "who", "where", "when", "why", "how", "is", "are", "can", "do"]
+            for _w in _qwords {
+                if ql.startswith(_w) {
+                    has_question = true
+                    break
+                }
+            }
+        }
+
+        let has_negation = false
+        let _neg_words = ["not", "n't", "never", "no", "none", "neither", "without"]
+        for _w in _neg_words {
+            if _w in ql {
+                has_negation = true
+                break
+            }
+        }
+
+        // V2: Entity extraction + intent markers
+        let _raw_entities = self._ENTITY_PATTERN.findall(text)
+        let entities = []
+        for e in _raw_entities {
+            if len(e) > 2 {
+                entities.append(e)
+            }
+        }
+        let dates = self._DATE_PATTERN.findall(text)
+        let numbers = self._NUMBER_PATTERN.findall(text)
+
+        // V4: Intent classification
+        let intent = self._classify_intent(ql)
+        let query_type = self._classify_query_type(ql, intent)
+
+        // V4: Domain detection
+        let domain = self._detect_domain(ql)
+
+        // V4: Emotional tone
+        let emotional_tone = self._detect_emotion(ql)
+
+        // IT: High-level features
+        let temporal = self._detect_temporal(ql)
+        let abstractness = self._score_abstractness(ql, entities, numbers)
+        let specificity = self._score_specificity(entities, numbers, dates, word_count)
+
+        // IT: Salience = urgency * novelty * specificity
+        let urgency = self._score_urgency(ql, emotional_tone)
+        let novelty = 1.0 - pvs_familiarity
+        let salience = min(1.0, urgency * 0.3 + novelty * 0.4 + specificity * 0.3)
+
+        // IT: Complexity
+        let _neg_factor = 0.0
+        if has_negation {
+            _neg_factor = 0.3
+        }
+        let complexity = min(1.0,
+            word_count / 30.0 * 0.2 +
+            len(entities) / 5.0 * 0.2 +
+            abstractness * 0.3 +
+            _neg_factor
+        )
+
+        let key_concepts = self._extract_key_concepts(text, entities)
+
+        let user_sophistication = self._estimate_sophistication(
+            text, words, entities, domain, complexity, abstractness)
+
+        return Percept {
+            raw_text: text,
+            entities: entities,
+            intent: intent,
+            domain: domain,
+            emotional_tone: emotional_tone,
+            salience: salience,
+            complexity: complexity,
+            urgency: urgency,
+            abstractness: abstractness,
+            familiarity: pvs_familiarity,
+            key_concepts: key_concepts,
+            query_type: query_type,
+            word_count: word_count,
+            has_negation: has_negation,
+            has_question: has_question,
+            temporal_reference: temporal,
+            specificity: specificity,
+            user_sophistication: user_sophistication
+        }
+    }
+
+    fn _classify_intent(self, ql: str) -> str {
+        let _define_markers = ["what is", "what are", "define", "tell me about"]
+        for _w in _define_markers {
+            if _w in ql {
+                return "define"
+            }
+        }
+
+        let _mechanism_markers = ["how do", "how does", "how to", "how can"]
+        for _w in _mechanism_markers {
+            if _w in ql {
+                return "explain_mechanism"
+            }
+        }
+
+        let _cause_markers = ["why is", "why do", "explain why"]
+        for _w in _cause_markers {
+            if _w in ql {
+                return "explain_cause"
+            }
+        }
+
+        let _compare_markers = ["compare", "versus", "vs", "difference"]
+        for _w in _compare_markers {
+            if _w in ql {
+                return "compare"
+            }
+        }
+
+        let _words_set = set(ql.split())
+        let _has_code_signal = false
+        for _w in _words_set {
+            if _w in self._CODE_SIGNALS {
+                _has_code_signal = true
+                break
+            }
+        }
+        if _has_code_signal {
+            let _code_action_markers = ["write", "create", "implement", "build", "make"]
+            for _w in _code_action_markers {
+                if _w in ql {
+                    return "code"
+                }
+            }
+        }
+
+        let _create_markers = ["write", "compose", "create", "imagine", "poem", "story"]
+        for _w in _create_markers {
+            if _w in ql {
+                return "create"
+            }
+        }
+
+        let _compute_markers = ["calculate", "compute", "solve"]
+        for _w in _compute_markers {
+            if _w in ql {
+                return "compute"
+            }
+        }
+
+        let _list_markers = ["list", "name", "enumerate", "give me"]
+        for _w in _list_markers {
+            if _w in ql {
+                return "list"
+            }
+        }
+
+        return "general"
+    }
+
+    fn _classify_query_type(self, ql: str, intent: str) -> str {
+        if intent == "define" or intent == "explain_mechanism" or intent == "explain_cause" or intent == "compare" or intent == "list" {
+            return "factual"
+        }
+        if intent == "compute" or intent == "code" {
+            return "procedural"
+        }
+        if intent == "create" {
+            return "creative"
+        }
+
+        let _social_markers = ["feel", "think", "believe", "opinion", "should i"]
+        for _w in _social_markers {
+            if _w in ql {
+                return "social"
+            }
+        }
+
+        return "factual"
+    }
+
+    fn _detect_domain(self, ql: str) -> str {
+        let best = "general"
+        let best_score = 0
+        for domain in self._DOMAIN_KEYWORDS {
+            let keywords = self._DOMAIN_KEYWORDS[domain]
+            let score = 0
+            for kw in keywords {
+                if kw in ql {
+                    score += 1
+                }
+            }
+            if score > best_score {
+                best = domain
+                best_score = score
+            }
+        }
+        return best
+    }
+
+    fn _detect_emotion(self, ql: str) -> EmotionalTone {
+        let best_tone = EmotionalTone.NEUTRAL
+        let best_score = 0.0
+        for tone_name in self._EMOTION_SIGNALS {
+            let pair = self._EMOTION_SIGNALS[tone_name]
+            let signals = pair[0]
+            let weight = pair[1]
+            let hits = 0
+            for s in signals {
+                if s in ql {
+                    hits += 1
+                }
+            }
+            let score = hits * weight
+            if score > best_score {
+                best_tone = EmotionalTone(tone_name)
+                best_score = score
+            }
+        }
+        return best_tone
+    }
+
+    fn _detect_temporal(self, ql: str) -> str {
+        let _past_words = ["was", "were", "did", "had", "ago", "history", "ancient",
+                           "formerly", "previous"]
+        let past = 0
+        for w in _past_words {
+            if w in ql {
+                past += 1
+            }
+        }
+
+        let _future_words = ["will", "future", "tomorrow", "upcoming", "next",
+                             "predict", "forecast"]
+        let future = 0
+        for w in _future_words {
+            if w in ql {
+                future += 1
+            }
+        }
+
+        if past > future {
+            return "past"
+        }
+        if future > past {
+            return "future"
+        }
+
+        let _present_words = ["is", "are", "now", "current"]
+        for w in _present_words {
+            if w in ql {
+                return "present"
+            }
+        }
+        return "none"
+    }
+
+    fn _score_abstractness(self, ql: str, entities: List, numbers: List) -> float {
+        let concrete_signals = len(entities) + len(numbers)
+        let _abstract_words = ["concept", "theory", "idea", "principle",
+                               "nature", "essence", "meaning", "truth",
+                               "existence", "consciousness", "reality",
+                               "freedom", "justice", "beauty"]
+        let abstract_words = 0
+        for w in _abstract_words {
+            if w in ql {
+                abstract_words += 1
+            }
+        }
+        if concrete_signals + abstract_words == 0 {
+            return 0.5
+        }
+        return min(1.0, abstract_words / max(1, concrete_signals + abstract_words))
+    }
+
+    fn _score_specificity(self, entities: List, numbers: List,
+                          dates: List, word_count: int) -> float {
+        let specifics = len(entities) + len(numbers) + len(dates)
+        return min(1.0, specifics / max(1, word_count / 3))
+    }
+
+    fn _score_urgency(self, ql: str, tone: EmotionalTone) -> float {
+        if tone == EmotionalTone.URGENT {
+            return 0.95
+        }
+        if tone == EmotionalTone.ANXIOUS {
+            return 0.7
+        }
+        if tone == EmotionalTone.FRUSTRATED {
+            return 0.6
+        }
+        return 0.3
+    }
+
+    fn _estimate_sophistication(self, text: str, words: List,
+                                entities: List, domain: str,
+                                complexity: float = 0.0,
+                                abstractness: float = 0.0) -> float {
+        // Estimate user reading/vocabulary level from the query itself.
+        // Returns 0.0 (young child) to 1.0 (expert/academic).
+        if not words {
+            return 0.5
+        }
+
+        let lower_words = []
+        for w in words {
+            lower_words.append(w.lower().strip(".,;:!?\"'()-"))
+        }
+        let _filtered = []
+        for w in lower_words {
+            if w {
+                _filtered.append(w)
+            }
+        }
+        lower_words = _filtered
+
+        // Signal 1: average word length
+        let _total_len = 0
+        for w in lower_words {
+            _total_len += len(w)
+        }
+        let avg_len = _total_len / max(len(lower_words), 1)
+        let len_score = min(1.0, max(0.0, (avg_len - 3.0) / 5.0))
+
+        // Signal 2: advanced vocabulary hits
+        let adv_hits = 0
+        for w in lower_words {
+            if w in self._ADVANCED_VOCAB {
+                adv_hits += 1
+            }
+        }
+        let adv_score = min(1.0, adv_hits / 2.0)
+
+        // Signal 3: simple/casual markers
+        let simple_hits = 0
+        for w in lower_words {
+            if w in self._SIMPLE_MARKERS {
+                simple_hits += 1
+            }
+        }
+        let simple_penalty = min(0.4, simple_hits * 0.15)
+
+        // Signal 4: sentence structure (clauses, commas, semicolons)
+        let structure_markers = text.count(",") + text.count(";") + text.count("—") + text.count(":")
+        let struct_score = min(1.0, structure_markers / 4.0)
+
+        // Signal 5: domain technicality boost
+        let _tech_domains = ["technology", "mathematics", "science", "philosophy",
+                             "medicine", "engineering", "law", "finance"]
+        let domain_boost = 0.0
+        for _d in _tech_domains {
+            if domain == _d {
+                domain_boost = 0.1
+                break
+            }
+        }
+
+        // Signal 6: word count (very short = likely casual/simple)
+        let brevity_factor = 0.0
+        if len(words) >= 4 {
+            brevity_factor = min(0.2, len(words) / 40.0)
+        }
+
+        // Signal 7: typo / grammar indicators
+        let _typo_hits = 0
+        for w in lower_words {
+            if w in self._INFORMAL_CONTRACTIONS {
+                _typo_hits += 1
+            }
+            if len(w) > 2 {
+                let _has_triple = false
+                for _i in range(2, len(w)) {
+                    if w[_i] == w[_i - 1] and w[_i - 1] == w[_i - 2] {
+                        _has_triple = true
+                        break
+                    }
+                }
+                if _has_triple {
+                    _typo_hits += 1
+                }
+            }
+        }
+        let _all_lower_no_punct = text.strip().rstrip("?!.")
+        if _all_lower_no_punct and _all_lower_no_punct[0].islower() and len(words) > 6 {
+            _typo_hits += 1
+        }
+        let typo_penalty = min(0.3, _typo_hits * 0.1)
+
+        // Signal 8: percept complexity + abstractness
+        let complexity_score = min(1.0, complexity * 0.6 + abstractness * 0.4)
+
+        // Signal 9: entity richness
+        let _entity_count = 0
+        if entities {
+            _entity_count = len(entities)
+        }
+        let entity_score = min(1.0, _entity_count / 4.0)
+
+        // Signal 10: question structure (conditionals, multi-part, embedded clauses)
+        let _cond_hits = 0
+        for w in lower_words {
+            if w in self._CONDITIONAL_MARKERS {
+                _cond_hits += 1
+            }
+        }
+
+        let _has_conjunction_chain = false
+        let _conj_patterns = [" and ", " but ", " however ", " therefore "]
+        let _lower_text = text.lower()
+        for p in _conj_patterns {
+            if p in _lower_text {
+                _has_conjunction_chain = true
+                break
+            }
+        }
+
+        let _multi_question = text.count("?") > 1
+
+        let _conj_boost = 0.0
+        if _has_conjunction_chain {
+            _conj_boost = 0.2
+        }
+        let _multi_q_boost = 0.0
+        if _multi_question {
+            _multi_q_boost = 0.3
+        }
+        let question_struct = min(1.0, _cond_hits * 0.3 + _conj_boost + _multi_q_boost)
+
+        let raw = (
+            len_score * 0.15 +
+            adv_score * 0.20 +
+            struct_score * 0.10 +
+            domain_boost +
+            brevity_factor +
+            complexity_score * 0.15 +
+            entity_score * 0.10 +
+            question_struct * 0.10 +
+            0.10
+        ) - simple_penalty - typo_penalty
+
+        return max(0.0, min(1.0, raw))
+    }
+
+    fn _extract_key_concepts(self, text: str, entities: List) -> List {
+        let stop = ["the", "a", "an", "is", "are", "was", "were", "of", "in", "to",
+                    "for", "and", "or", "what", "how", "why", "can", "do", "does",
+                    "tell", "me", "about", "explain", "describe", "please"]
+        let words = re.findall(r"[a-zA-Z']+", text.lower())
+        let meaningful = []
+        for w in words {
+            if w not in stop and len(w) > 2 {
+                meaningful.append(w)
+            }
+        }
+        let seen = {}
+        let concepts = []
+        let combined = entities + meaningful
+        for item in combined {
+            if item not in seen {
+                seen[item] = true
+                concepts.append(item)
+            }
+        }
+        return concepts[:10]
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  2. Thalamus Gateway — attention-based lobe routing
+// ═════════════════════════════════════════════════════════════════════════════
+
+type AttentionWeights {
+    weights: Dict,
+    suppressed: List,
+    amplified: List,
+    gate_reason: str
+}
+
+
+class ThalamusGateway {
+    _LOBE_AFFINITY: Dict = {
+        "linguistic": {"factual": 0.9, "social": 0.8, "creative": 0.5, "procedural": 0.6},
+        "logical": {"factual": 0.8, "procedural": 0.9, "social": 0.3, "creative": 0.2},
+        "mathematical": {"procedural": 0.95, "factual": 0.4, "creative": 0.1, "social": 0.1},
+        "spatial": {"factual": 0.5, "procedural": 0.4, "creative": 0.3, "social": 0.2},
+        "temporal": {"factual": 0.6, "procedural": 0.3, "creative": 0.2, "social": 0.4},
+        "creative": {"creative": 0.95, "social": 0.6, "factual": 0.2, "procedural": 0.1}
+    }
+
+    _DOMAIN_LOBE_AFFINITY: Dict = {
+        "science": {"logical": 0.3, "mathematical": 0.2},
+        "technology": {"logical": 0.3},
+        "mathematics": {"mathematical": 0.4, "logical": 0.2},
+        "history": {"temporal": 0.3},
+        "literature": {"creative": 0.2, "linguistic": 0.1},
+        "philosophy": {"logical": 0.2}
+    }
+
+    fn gate(self, percept: Percept, available_lobes: List,
+            neuro_state: Optional[NeuroState] = None) -> AttentionWeights {
+        let weights = {}
+        let suppressed = []
+        let amplified = []
+
+        for lobe in available_lobes {
+            let _lobe_map = self._LOBE_AFFINITY.get(lobe, {})
+            let affinity = _lobe_map.get(percept.query_type, 0.5)
+
+            // Domain boost
+            let _domain_map = self._DOMAIN_LOBE_AFFINITY.get(percept.domain, {})
+            let domain_boost = _domain_map.get(lobe, 0.0)
+            affinity += domain_boost
+
+            // Emotional modulation
+            if percept.emotional_tone == EmotionalTone.CREATIVE and lobe == "creative" {
+                affinity += 0.3
+            } else if percept.emotional_tone == EmotionalTone.ANALYTICAL and (lobe == "logical" or lobe == "mathematical") {
+                affinity += 0.2
+            } else if percept.emotional_tone == EmotionalTone.URGENT and lobe == "linguistic" {
+                affinity += 0.15
+            }
+
+            // Neurotransmitter modulation
+            if neuro_state {
+                if neuro_state.dopamine > 0.7 and lobe == "creative" {
+                    affinity += 0.15
+                }
+                if neuro_state.norepinephrine > 0.7 and (lobe == "logical" or lobe == "mathematical") {
+                    affinity += 0.1
+                }
+                if neuro_state.serotonin > 0.7 {
+                    affinity += 0.05
+                }
+            }
+
+            // Salience scaling
+            affinity = affinity * (0.5 + 0.5 * percept.salience)
+
+            weights[lobe] = min(1.0, max(0.0, affinity))
+        }
+
+        // Suppress lobes with very low attention (< 0.15)
+        let threshold = 0.15
+        for lobe in weights {
+            let w = weights[lobe]
+            if w < threshold {
+                suppressed.append(lobe)
+            } else if w > 0.7 {
+                amplified.append(lobe)
+            }
+        }
+
+        let gate_reason = "query_type=" + percept.query_type + " domain=" + percept.domain + " emotion=" + percept.emotional_tone.value + " salience=" + str(round(percept.salience, 2))
+
+        return AttentionWeights {
+            weights: weights,
+            suppressed: suppressed,
+            amplified: amplified,
+            gate_reason: gate_reason
+        }
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  3. Amygdala — emotional processing
+// ═════════════════════════════════════════════════════════════════════════════
+
+type EmotionalContext {
+    valence: float,
+    arousal: float,
+    threat_level: float,
+    social_weight: float,
+    approach_avoid: float,
+    dominant_emotion: str,
+    confidence_modifier: float
+}
+
+
+class Amygdala {
+    _THREAT_DOMAINS: Set = {"medical", "legal", "financial", "safety"}
+
+    _THREAT_WORDS: Set = {
+        "die", "dying", "death", "kill", "danger", "emergency", "poison",
+        "overdose", "suicide", "weapon", "bomb", "attack", "harm", "abuse",
+        "illegal", "fraud", "hack", "exploit", "vulnerability"
+    }
+
+    fn evaluate(self, percept: Percept) -> EmotionalContext {
+        let ql = percept.raw_text.lower()
+
+        // Threat assessment
+        let threat_word_hits = 0
+        for w in self._THREAT_WORDS {
+            if w in ql {
+                threat_word_hits += 1
+            }
+        }
+        let domain_threat = 0.0
+        if percept.domain in self._THREAT_DOMAINS {
+            domain_threat = 0.4
+        }
+        let threat_level = min(1.0, threat_word_hits * 0.25 + domain_threat + percept.urgency * 0.2)
+
+        // Valence (positive/negative)
+        let _pos_list = ["good", "great", "love", "happy", "beautiful",
+                         "amazing", "wonderful", "perfect", "brilliant",
+                         "excellent", "fantastic"]
+        let pos_words = 0
+        for w in _pos_list {
+            if w in ql {
+                pos_words += 1
+            }
+        }
+
+        let _neg_list = ["bad", "terrible", "hate", "sad", "ugly",
+                         "awful", "horrible", "worst", "disgusting",
+                         "failure", "wrong"]
+        let neg_words = 0
+        for w in _neg_list {
+            if w in ql {
+                neg_words += 1
+            }
+        }
+
+        let valence = (pos_words - neg_words) / max(1, pos_words + neg_words)
+
+        // Arousal
+        let _q_factor = 0.0
+        if percept.has_question {
+            _q_factor = 0.1
+        }
+        let arousal = min(1.0,
+            percept.urgency * 0.4 +
+            threat_level * 0.3 +
+            abs(valence) * 0.2 +
+            _q_factor
+        )
+
+        // Social weight
+        let _social_cue_words = ["people", "person", "friend", "family",
+                                 "relationship", "society", "culture",
+                                 "community", "human"]
+        let social_cues = 0
+        for w in _social_cue_words {
+            if w in ql {
+                social_cues += 1
+            }
+        }
+        let _social_type_boost = 0.0
+        if percept.query_type == "social" {
+            _social_type_boost = 0.3
+        }
+        let social_weight = min(1.0, social_cues * 0.2 + _social_type_boost)
+
+        // Approach-avoid
+        let approach_avoid = valence * 0.4 + (1.0 - threat_level) * 0.4 + percept.salience * 0.2
+        approach_avoid = max(-1.0, min(1.0, approach_avoid))
+
+        // Dominant emotion
+        let dominant = percept.emotional_tone.value
+        if threat_level > 0.6 {
+            dominant = "threat_alert"
+        }
+
+        // Confidence modifier: high threat → more cautious → lower confidence floor
+        let confidence_modifier = 1.0
+        if threat_level > 0.5 {
+            confidence_modifier = 0.85
+        }
+        if threat_level > 0.8 {
+            confidence_modifier = 0.7
+        }
+
+        return EmotionalContext {
+            valence: valence,
+            arousal: arousal,
+            threat_level: threat_level,
+            social_weight: social_weight,
+            approach_avoid: approach_avoid,
+            dominant_emotion: dominant,
+            confidence_modifier: confidence_modifier
+        }
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  4. Neurotransmitter System — global neuromodulation
+// ═════════════════════════════════════════════════════════════════════════════
+
+type NeuroState {
+    dopamine: float,
+    serotonin: float,
+    norepinephrine: float,
+    acetylcholine: float,
+    gaba: float,
+    glutamate: float
+}
+
+
+class NeurotransmitterSystem {
+    _baseline: NeuroState
+    _recent_success_rate: float
+
+    fn __init__(self) {
+        self._baseline = NeuroState {
+            dopamine: 0.5,
+            serotonin: 0.6,
+            norepinephrine: 0.4,
+            acetylcholine: 0.5,
+            gaba: 0.5,
+            glutamate: 0.5
+        }
+        self._recent_success_rate = 0.8
+    }
+
+    fn modulate(self, percept: Percept, emotional: EmotionalContext) -> NeuroState {
+        let s = NeuroState {
+            dopamine: self._baseline.dopamine,
+            serotonin: self._baseline.serotonin,
+            norepinephrine: self._baseline.norepinephrine,
+            acetylcholine: self._baseline.acetylcholine,
+            gaba: self._baseline.gaba,
+            glutamate: self._baseline.glutamate
+        }
+
+        // Dopamine: rises with novelty and creative queries
+        s.dopamine += (1.0 - percept.familiarity) * 0.2
+        if percept.query_type == "creative" {
+            s.dopamine += 0.2
+        }
+        s.dopamine += self._recent_success_rate * 0.1
+
+        // Serotonin: rises with familiarity and positive valence
+        s.serotonin += percept.familiarity * 0.15
+        s.serotonin += max(0, emotional.valence) * 0.1
+
+        // Norepinephrine: rises with urgency, threat, complexity
+        s.norepinephrine += emotional.arousal * 0.2
+        s.norepinephrine += emotional.threat_level * 0.15
+        s.norepinephrine += percept.complexity * 0.1
+
+        // Acetylcholine: rises with novelty (learn more from new things)
+        s.acetylcholine += (1.0 - percept.familiarity) * 0.25
+
+        // GABA: rises with high threat (be more inhibited/cautious)
+        s.gaba += emotional.threat_level * 0.2
+        s.gaba += percept.complexity * 0.1
+
+        // Glutamate: rises with urgency (process faster)
+        s.glutamate += percept.urgency * 0.15
+        s.glutamate += percept.salience * 0.1
+
+        // Clamp all to [0, 1]
+        s.dopamine = max(0.0, min(1.0, s.dopamine))
+        s.serotonin = max(0.0, min(1.0, s.serotonin))
+        s.norepinephrine = max(0.0, min(1.0, s.norepinephrine))
+        s.acetylcholine = max(0.0, min(1.0, s.acetylcholine))
+        s.gaba = max(0.0, min(1.0, s.gaba))
+        s.glutamate = max(0.0, min(1.0, s.glutamate))
+
+        return s
+    }
+
+    fn update_success_rate(self, success: bool) -> None {
+        let alpha = 0.1
+        let _val = 0.0
+        if success {
+            _val = 1.0
+        }
+        self._recent_success_rate = (1 - alpha) * self._recent_success_rate + alpha * _val
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  5. Myelination Tracker — pathway strengthening
+// ═════════════════════════════════════════════════════════════════════════════
+
+type PathwayRecord {
+    domain: str,
+    lobe: str,
+    query_type: str,
+    success_count: int = 0,
+    total_count: int = 0,
+    avg_confidence: float = 0.0,
+    myelin_strength: float = 0.0
+}
+
+
+class MyelinationTracker {
+    _pathways: Dict
+    _decay_rate: float
+
+    fn __init__(self) {
+        self._pathways = {}
+        self._decay_rate = 0.001
+    }
+
+    fn _key(self, domain: str, lobe: str, query_type: str) -> str {
+        return domain + ":" + lobe + ":" + query_type
+    }
+
+    fn record(self, domain: str, lobe: str, query_type: str,
+              success: bool, confidence: float) -> None {
+        let k = self._key(domain, lobe, query_type)
+        if k not in self._pathways {
+            self._pathways[k] = PathwayRecord {
+                domain: domain,
+                lobe: lobe,
+                query_type: query_type
+            }
+        }
+        let p = self._pathways[k]
+        p.total_count += 1
+        if success {
+            p.success_count += 1
+        }
+        let alpha = 0.1
+        p.avg_confidence = (1 - alpha) * p.avg_confidence + alpha * confidence
+        let rate = p.success_count / max(1, p.total_count)
+        p.myelin_strength = min(1.0, rate * 0.6 + p.avg_confidence * 0.4)
+    }
+
+    fn get_strength(self, domain: str, lobe: str, query_type: str) -> float {
+        let k = self._key(domain, lobe, query_type)
+        let p = self._pathways.get(k)
+        if p {
+            return p.myelin_strength
+        }
+        return 0.0
+    }
+
+    fn get_lobe_priority(self, domain: str, query_type: str,
+                         lobes: List) -> List {
+        // Returns lobes sorted by myelin strength (strongest first).
+        let scored = []
+        for lobe in lobes {
+            let strength = self.get_strength(domain, lobe, query_type)
+            scored.append([lobe, strength])
+        }
+        scored.sort(key=_lobe_sort_key, reverse=true)
+        return scored
+    }
+
+    fn decay(self) -> None {
+        for k in self._pathways {
+            let p = self._pathways[k]
+            p.myelin_strength = max(0.0, p.myelin_strength - self._decay_rate)
+        }
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  6. Hippocampal Consolidator — memory replay and promotion
+// ═════════════════════════════════════════════════════════════════════════════
+
+type ConsolidationTrace {
+    query: str,
+    answer: str,
+    domain: str,
+    confidence: float,
+    tvs_score: float,
+    emotional_arousal: float,
+    timestamp: float = 0.0
+}
+
+
+class HippocampalConsolidator {
+    _traces: List
+    _promotion_threshold: float
+    _max_traces: int
+
+    fn __init__(self, promotion_threshold: float = 0.85) {
+        self._traces = []
+        self._promotion_threshold = promotion_threshold
+        self._max_traces = 200
+    }
+
+    fn record_trace(self, query: str, answer: str, domain: str,
+                    confidence: float, tvs_score: float,
+                    emotional_arousal: float = 0.5) -> None {
+        let trace = ConsolidationTrace {
+            query: query,
+            answer: answer,
+            domain: domain,
+            confidence: confidence,
+            tvs_score: tvs_score,
+            emotional_arousal: emotional_arousal,
+            timestamp: time.time()
+        }
+        self._traces.append(trace)
+        if len(self._traces) > self._max_traces {
+            self._traces = self._traces[-self._max_traces:]
+        }
+    }
+
+    fn consolidate(self, vlt: Any) -> int {
+        let promoted = 0
+        let failed = 0
+        let _remaining: List[Any] = []
+
+        let layer_key = nil
+        if hasattr(vlt, "L3_PERSISTENT") {
+            layer_key = vlt.L3_PERSISTENT
+        } else if hasattr(vlt, "_L3") {
+            layer_key = vlt._L3
+        } else {
+            try {
+                let keys = list(vlt._layers.keys())
+                if len(keys) >= 3 {
+                    layer_key = keys[2]
+                } else if len(keys) > 0 {
+                    layer_key = keys[len(keys) - 1]
+                }
+            } catch(_keys_err) {
+                logging.warning("HippocampalConsolidator: cannot determine VLT layer: %s", str(_keys_err))
+                return 0
+            }
+        }
+
+        if layer_key == nil {
+            logging.warning("HippocampalConsolidator: no valid VLT layer found")
+            return 0
+        }
+
+        for trace in self._traces {
+            let consolidation_score = (
+                trace.confidence * 0.3 +
+                trace.tvs_score * 0.4 +
+                trace.emotional_arousal * 0.15 +
+                min(1.0, (time.time() - trace.timestamp) / 3600) * 0.15
+            )
+            if consolidation_score >= self._promotion_threshold {
+                try {
+                    let key = "hippo_" + hashlib.sha256(trace.query.encode()).hexdigest()[:12]
+                    vlt.store(
+                        key=key,
+                        value={"query": trace.query, "answer": trace.answer[:200]},
+                        layer=layer_key,
+                        confidence=trace.confidence,
+                        domain=trace.domain,
+                        source="hippocampal_consolidation",
+                        tags={"consolidated", trace.domain}
+                    )
+                    promoted += 1
+                } catch(_e) {
+                    failed += 1
+                    logging.warning("HippocampalConsolidator: failed to store trace '%s': %s",
+                                    trace.query[:40], str(_e))
+                }
+            } else {
+                _remaining.append(trace)
+            }
+        }
+
+        self._traces = _remaining
+        if failed > 0 {
+            logging.info("HippocampalConsolidator: promoted=%d, failed=%d, remaining=%d",
+                         promoted, failed, len(_remaining))
+        }
+        return promoted
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  7. Cerebellum — error correction loop
+// ═════════════════════════════════════════════════════════════════════════════
+
+type PredictionError {
+    predicted_tvs: float,
+    actual_tvs: float,
+    error_magnitude: float,
+    correction_signal: float
+}
+
+
+class Cerebellum {
+    _domain_predictions: Dict
+    _global_prediction: float
+    _learning_rate: float
+
+    fn __init__(self) {
+        self._domain_predictions = {}
+        self._global_prediction = 0.85
+        self._learning_rate = 0.05
+    }
+
+    fn predict_tvs(self, domain: str, complexity: float) -> float {
+        let base = self._domain_predictions.get(domain, self._global_prediction)
+        return max(0.0, min(1.0, base - complexity * 0.1))
+    }
+
+    fn correct(self, domain: str, predicted_tvs: float,
+               actual_tvs: float) -> PredictionError {
+        let error = actual_tvs - predicted_tvs
+        let magnitude = abs(error)
+
+        // Update internal model
+        let old = self._domain_predictions.get(domain, self._global_prediction)
+        self._domain_predictions[domain] = old + self._learning_rate * error
+        self._global_prediction += self._learning_rate * error * 0.5
+
+        // Clamp
+        self._domain_predictions[domain] = max(0.0, min(1.0, self._domain_predictions[domain]))
+        self._global_prediction = max(0.0, min(1.0, self._global_prediction))
+
+        let correction_signal = error * 0.5
+
+        return PredictionError {
+            predicted_tvs: predicted_tvs,
+            actual_tvs: actual_tvs,
+            error_magnitude: magnitude,
+            correction_signal: correction_signal
+        }
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  8. Motor Cortex — structured output planning
+// ═════════════════════════════════════════════════════════════════════════════
+
+type ResponsePlan {
+    sections: List,
+    tone: str,
+    verbosity: str,
+    include_followup: bool,
+    emotional_coloring: str
+}
+
+
+class MotorCortex {
+    fn plan_response(self, percept: Percept, emotional: EmotionalContext,
+                     raw_answer: str) -> ResponsePlan {
+        // Determine verbosity from complexity and specificity
+        let verbosity = "moderate"
+        if percept.complexity > 0.7 or percept.intent == "explain_mechanism" or percept.intent == "explain_cause" {
+            verbosity = "detailed"
+        } else if percept.word_count < 8 or percept.intent == "list" {
+            verbosity = "brief"
+        }
+
+        // Determine tone from emotional context
+        let tone = "neutral"
+        if emotional.threat_level > 0.5 {
+            tone = "careful"
+        } else if emotional.valence > 0.3 {
+            tone = "warm"
+        } else if percept.query_type == "creative" {
+            tone = "expressive"
+        } else if percept.emotional_tone == EmotionalTone.ANALYTICAL {
+            tone = "precise"
+        }
+
+        // Build section plan
+        let sections = [{"type": "core_answer", "content": raw_answer}]
+
+        let include_followup = (
+            percept.has_question
+            and percept.query_type == "factual"
+            and percept.complexity < 0.8
+        )
+
+        let emotional_coloring = "none"
+        if percept.emotional_tone == EmotionalTone.ANXIOUS or percept.emotional_tone == EmotionalTone.FRUSTRATED {
+            emotional_coloring = "reassuring"
+        } else if percept.emotional_tone == EmotionalTone.CURIOUS {
+            emotional_coloring = "encouraging"
+        }
+
+        return ResponsePlan {
+            sections: sections,
+            tone: tone,
+            verbosity: verbosity,
+            include_followup: include_followup,
+            emotional_coloring: emotional_coloring
+        }
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  9. Spinal Reflex — ultra-fast pre-cortical responses
+// ═════════════════════════════════════════════════════════════════════════════
+
+type ReflexResponse {
+    triggered: bool,
+    answer: str,
+    confidence: float,
+    reflex_type: str
+}
+
+
+class SpinalReflex {
+    _SAFETY_REFLEXES: Dict = {
+        "how to make a bomb": "[SAFETY] I can't help with that. This query involves potential harm.",
+        "how to hack": "[SAFETY] I focus on constructive technology use, not exploitation."
+    }
+
+    _GREETING_REFLEXES: Set = {
+        "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
+        "howdy", "greetings", "sup", "yo"
+    }
+
+    fn check(self, percept: Percept) -> ReflexResponse {
+        let ql = percept.raw_text.lower().strip().rstrip("!?. ")
+
+        // Safety reflexes (cannot be bypassed)
+        for pattern in self._SAFETY_REFLEXES {
+            if pattern in ql {
+                return ReflexResponse {
+                    triggered: true,
+                    answer: self._SAFETY_REFLEXES[pattern],
+                    confidence: 1.0,
+                    reflex_type: "safety"
+                }
+            }
+        }
+
+        // Greeting reflexes
+        if ql in self._GREETING_REFLEXES {
+            return ReflexResponse {
+                triggered: true,
+                answer: "Hello! I'm the NRS — a neural reasoning system. What would you like to explore?",
+                confidence: 0.99,
+                reflex_type: "greeting"
+            }
+        }
+
+        // Identity reflexes
+        if ql == "who are you" or ql == "what are you" {
+            return ReflexResponse {
+                triggered: true,
+                answer: "I'm the NRS — Neuromorphic Reasoning System by VelarIQ. I process information through specialized reasoning lobes, validated memory layers, and pattern-based synthesis. No external language models — just structured neural reasoning.",
+                confidence: 0.99,
+                reflex_type: "identity"
+            }
+        }
+
+        return ReflexResponse {
+            triggered: false,
+            answer: "",
+            confidence: 0.0,
+            reflex_type: "none"
+        }
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  10. Predictive Coding — top-down prediction vs bottom-up comparison
+// ═════════════════════════════════════════════════════════════════════════════
+
+type PredictionComparison {
+    expected_domain: str,
+    actual_domain: str,
+    domain_match: bool,
+    expected_confidence: float,
+    actual_confidence: float,
+    surprise: float,
+    needs_reprocessing: bool
+}
+
+
+class PredictiveCodingEngine {
+    _domain_confidence_history: Dict
+
+    fn __init__(self) {
+        self._domain_confidence_history = {}
+    }
+
+    fn predict(self, percept: Percept) -> Dict {
+        // Generate predictions about expected lobe outputs.
+        let history = self._domain_confidence_history.get(percept.domain, [])
+        let expected_conf = 0.75
+        if history {
+            let _recent = history[-10:]
+            expected_conf = sum(_recent) / max(1, len(_recent))
+        }
+
+        return {
+            "expected_domain": percept.domain,
+            "expected_confidence": expected_conf,
+            "expected_intent": percept.intent
+        }
+    }
+
+    fn compare(self, prediction: Dict,
+               actual_domain: str, actual_confidence: float) -> PredictionComparison {
+        let domain_match = prediction["expected_domain"] == actual_domain
+        let conf_diff = abs(prediction["expected_confidence"] - actual_confidence)
+        let _domain_miss_penalty = 0.0
+        if not domain_match {
+            _domain_miss_penalty = 0.3
+        }
+        let surprise = min(1.0, conf_diff + _domain_miss_penalty)
+
+        // Record for future predictions
+        let domain = prediction["expected_domain"]
+        if domain not in self._domain_confidence_history {
+            self._domain_confidence_history[domain] = []
+        }
+        self._domain_confidence_history[domain].append(actual_confidence)
+        if len(self._domain_confidence_history[domain]) > 50 {
+            self._domain_confidence_history[domain] = self._domain_confidence_history[domain][-50:]
+        }
+
+        return PredictionComparison {
+            expected_domain: prediction["expected_domain"],
+            actual_domain: actual_domain,
+            domain_match: domain_match,
+            expected_confidence: prediction["expected_confidence"],
+            actual_confidence: actual_confidence,
+            surprise: surprise,
+            needs_reprocessing: surprise > 0.5
+        }
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  11. Default Mode Network — background pattern discovery
+// ═════════════════════════════════════════════════════════════════════════════
+
+class DefaultModeNetwork {
+    _idle_since: float
+    _discoveries: List
+    _running: bool
+
+    fn __init__(self) {
+        self._idle_since = time.time()
+        self._discoveries = []
+        self._running = false
+    }
+
+    fn on_idle(self, vlt: Any, hippocampus: HippocampalConsolidator,
+               pruner: SynapticPruner) -> Dict {
+        // Run during idle periods — consolidation + pruning + discovery.
+        if self._running {
+            return {"status": "already_running"}
+        }
+        self._running = true
+        try {
+            let promoted = hippocampus.consolidate(vlt)
+            let pruned = pruner.prune(vlt)
+            let idle_duration = time.time() - self._idle_since
+            let result = {
+                "status": "complete",
+                "promoted": promoted,
+                "pruned": pruned,
+                "idle_duration_s": round(idle_duration, 1)
+            }
+            self._running = false
+            self._idle_since = time.time()
+            return result
+        } catch(e) {
+            self._running = false
+            self._idle_since = time.time()
+            raise e
+        }
+    }
+
+    fn mark_active(self) -> None {
+        self._idle_since = time.time()
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  12. Synaptic Pruner — remove low-use patterns
+// ═════════════════════════════════════════════════════════════════════════════
+
+class SynapticPruner {
+    _min_confidence: float
+    _min_access_age_s: float
+
+    fn __init__(self, min_confidence: float = 0.2, min_access_age_s: float = 86400.0) {
+        self._min_confidence = min_confidence
+        self._min_access_age_s = min_access_age_s
+    }
+
+    fn prune(self, vlt: Any) -> int {
+        // Remove expired and low-quality items from L2 and L3.
+        let pruned = 0
+        let now = time.time()
+        for layer_key in list(vlt._layers.keys()) {
+            let layer_name = str(layer_key)
+            try {
+                layer_name = str(layer_key.value)
+            } catch(_e) {
+                logging.warning("SynapticPruner: failed to resolve layer key value: %s", str(_e))
+            }
+
+            if "L4" in layer_name or "ARCHIVAL" in layer_name {
+                continue
+            }
+            if "L1" in layer_name or "EPHEMERAL" in layer_name {
+                continue
+            }
+
+            let store = vlt._layers[layer_key]
+            let to_remove = []
+            for key in store {
+                let item = store[key]
+                if item.immutable {
+                    continue
+                }
+                let age = now - item.accessed_at
+                if age > self._min_access_age_s and item.confidence < self._min_confidence {
+                    to_remove.append(key)
+                }
+            }
+            for key in to_remove {
+                store.pop(key)
+                pruned += 1
+            }
+        }
+        return pruned
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  13. Parallel Lobe Executor — concurrent cortical processing
+// ═════════════════════════════════════════════════════════════════════════════
+
+type ParallelLobeResult {
+    results: Dict,
+    execution_times: Dict,
+    attention_weighted_best: Optional[str],
+    total_wall_time_ms: float
+}
+
+
+class ParallelLobeExecutor {
+    _max_workers: int
+
+    fn __init__(self, max_workers: int = 6) {
+        self._max_workers = max_workers
+    }
+
+    fn execute(self, lobes_to_run: List,
+               lobe_instances: Dict,
+               query: str, domain: str,
+               attention: AttentionWeights) -> ParallelLobeResult {
+        let results = {}
+        let execution_times = {}
+        let start = time.monotonic()
+
+        // Filter out suppressed lobes
+        let active_lobes = []
+        for l in lobes_to_run {
+            if l not in attention.suppressed {
+                active_lobes.append(l)
+            }
+        }
+
+        let _worker_count = len(active_lobes)
+        if _worker_count == 0 {
+            _worker_count = 1
+        }
+        if _worker_count > self._max_workers {
+            _worker_count = self._max_workers
+        }
+
+        let pool = ThreadPoolExecutor(max_workers=_worker_count)
+        try {
+            let futures = {}
+            for lobe_name in active_lobes {
+                let processor = lobe_instances.get(lobe_name)
+                if processor {
+                    let t0 = time.monotonic()
+                    let future = pool.submit(processor.process, query, domain)
+                    futures[future] = [lobe_name, t0]
+                }
+            }
+
+            for future in as_completed(futures) {
+                let _pair = futures[future]
+                let lobe_name = _pair[0]
+                let t0 = _pair[1]
+                try {
+                    let result = future.result(timeout=5.0)
+                    let weight = attention.weights.get(lobe_name, 0.5)
+                    result.confidence = result.confidence * (0.5 + 0.5 * weight)
+                    results[lobe_name] = result
+                    execution_times[lobe_name] = (time.monotonic() - t0) * 1000
+                } catch(_exc) {
+                    logging.warning("ParallelLobeExecutor: lobe '%s' failed: %s", lobe_name, str(_exc))
+                    execution_times[lobe_name] = (time.monotonic() - t0) * 1000
+                }
+            }
+
+            pool.shutdown()
+        } catch(e) {
+            pool.shutdown()
+            raise e
+        }
+
+        // Find attention-weighted best
+        let best_lobe = None
+        let best_score = -1.0
+        for lobe_name in results {
+            let result = results[lobe_name]
+            let weight = attention.weights.get(lobe_name, 0.5)
+            let weighted_score = result.confidence * weight
+            if weighted_score > best_score {
+                best_score = weighted_score
+                best_lobe = lobe_name
+            }
+        }
+
+        let total_ms = (time.monotonic() - start) * 1000
+
+        return ParallelLobeResult {
+            results: results,
+            execution_times: execution_times,
+            attention_weighted_best: best_lobe,
+            total_wall_time_ms: round(total_ms, 2)
+        }
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Master: NervousSystem — orchestrates all subsystems
+// ═════════════════════════════════════════════════════════════════════════════
+
+class NervousSystem {
+    // Complete nervous system — wraps all subsystems into a single interface.
+    //
+    // Processing flow (mirrors the biological brain):
+    //
+    //   Input → Spinal Reflex (fast path)
+    //         ↓
+    //   Sensory Cortex → Percept
+    //         ↓
+    //   Amygdala → Emotional Context
+    //         ↓
+    //   Neurotransmitter System → NeuroState
+    //         ↓
+    //   Thalamus Gateway → Attention Weights (filtered lobes)
+    //         ↓
+    //   Predictive Coding → Predictions
+    //         ↓
+    //   Parallel Lobe Executor → Lobe Results (concurrent)
+    //         ↓
+    //   Cerebellum → Error Correction
+    //         ↓
+    //   Motor Cortex → Response Plan
+    //         ↓
+    //   Myelination → Pathway Updates
+    //         ↓
+    //   Hippocampus → Consolidation Trace
+    //         ↓
+    //   Default Mode → Background tasks (idle)
+
+    sensory_cortex: SensoryCortex
+    thalamus: ThalamusGateway
+    amygdala: Amygdala
+    neurotransmitters: NeurotransmitterSystem
+    myelination: MyelinationTracker
+    hippocampus: HippocampalConsolidator
+    cerebellum: Cerebellum
+    motor_cortex: MotorCortex
+    spinal_reflex: SpinalReflex
+    predictive_coding: PredictiveCodingEngine
+    default_mode: DefaultModeNetwork
+    synaptic_pruner: SynapticPruner
+    parallel_executor: ParallelLobeExecutor
+
+    fn __init__(self) {
+        self.sensory_cortex = SensoryCortex()
+        self.thalamus = ThalamusGateway()
+        self.amygdala = Amygdala()
+        self.neurotransmitters = NeurotransmitterSystem()
+        self.myelination = MyelinationTracker()
+        self.hippocampus = HippocampalConsolidator()
+        self.cerebellum = Cerebellum()
+        self.motor_cortex = MotorCortex()
+        self.spinal_reflex = SpinalReflex()
+        self.predictive_coding = PredictiveCodingEngine()
+        self.default_mode = DefaultModeNetwork()
+        self.synaptic_pruner = SynapticPruner()
+        self.parallel_executor = ParallelLobeExecutor()
+    }
+}
+
+
+export EmotionalTone, Percept, SensoryCortex,
+       AttentionWeights, ThalamusGateway,
+       EmotionalContext, Amygdala,
+       NeuroState, NeurotransmitterSystem,
+       PathwayRecord, MyelinationTracker,
+       ConsolidationTrace, HippocampalConsolidator,
+       PredictionError, Cerebellum,
+       ResponsePlan, MotorCortex,
+       ReflexResponse, SpinalReflex,
+       PredictionComparison, PredictiveCodingEngine,
+       DefaultModeNetwork, SynapticPruner,
+       ParallelLobeResult, ParallelLobeExecutor,
+       NervousSystem

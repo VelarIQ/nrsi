@@ -1,0 +1,59 @@
+/// NRSI TVS — Truthful Validation Score Thresholds and Gates
+///
+/// Declares the validation thresholds as auditable named constants
+/// and gates for the TVS validation pipeline.
+
+module tvs
+
+import NRSIData, TrustLevel from "types"
+
+/// ---------- TVS Threshold Constants ----------
+
+type TVSThresholds {
+    truth_floor: Float,
+    validated_threshold: Float,
+    acceptable_threshold: Float,
+    suspicious_threshold: Float,
+    retry_threshold: Float
+}
+
+/// ---------- TVS Norms ----------
+
+norm block_below_suspicious {
+    type: prohibition,
+    scope: global,
+    action: "output_below_suspicious",
+    priority: 100,
+    condition: tvs_score < 0.50
+}
+
+norm retry_below_floor {
+    type: obligation,
+    scope: global,
+    action: "retry_with_more_sources",
+    priority: 90,
+    condition: tvs_score < 0.952 and claims_total > 0
+}
+
+norm validated_requires_floor {
+    type: obligation,
+    scope: global,
+    action: "meet_truth_floor",
+    priority: 95,
+    condition: trust >= TrustLevel.VALIDATED
+}
+
+/// ---------- TVS Gates ----------
+
+gate tvs_validation(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.50
+    validate claims_extracted
+    validate sources_checked
+    validate score_computed
+}
+
+gate tvs_promotion(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.952
+    validate all_claims_confirmed
+    validate no_hallucination
+}

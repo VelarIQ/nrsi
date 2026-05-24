@@ -1,0 +1,517 @@
+/// NRSI Reasoning — Temporal & Quantitative Cognition.
+///
+/// Time-aware facts, temporal ordering, number extraction, unit
+/// normalization, comparison, and arithmetic over extracted values.
+///
+/// Gives the system a sense of "when" and "how much" — abilities
+/// the symbolic graph alone lacks.
+///
+/// All transformer-free.  No external ML dependencies.
+
+module reasoning_temporal
+
+from "reasoning_graph" import CausalGraph, GraphNode, RelationType
+
+/// ═══════════════════════════════════════════════════════════════════
+///  TEMPORAL REASONING
+/// ═══════════════════════════════════════════════════════════════════
+
+enum TemporalRelation {
+    BEFORE = "before",
+    AFTER = "after",
+    DURING = "during",
+    OVERLAPS = "overlaps",
+    STARTS = "starts",
+    ENDS = "ends",
+    EQUALS = "equals",
+    UNKNOWN = "unknown"
+}
+
+type TemporalFact {
+    concept: string,
+    year_start: Optional[int],
+    year_end: Optional[int],
+    is_ongoing: bool,
+    era: string,
+    raw_text: string,
+    confidence: float
+}
+
+fn temporal_fact_has_time(tf: TemporalFact) -> bool {
+    return tf.year_start != None
+}
+
+fn temporal_fact_duration(tf: TemporalFact) -> Optional[int] {
+    if tf.year_start != None and tf.year_end != None {
+        return tf.year_end - tf.year_start
+    }
+    return None
+}
+
+fn temporal_fact_is_current(tf: TemporalFact, reference_year: int) -> bool {
+    if reference_year == None {
+        reference_year = 2026
+    }
+    if tf.is_ongoing {
+        return true
+    }
+    if tf.year_end != None and tf.year_end >= reference_year {
+        return true
+    }
+    if tf.year_start != None and tf.year_end == None {
+        return true
+    }
+    return false
+}
+
+/// ── Patterns & Constants ───────────────────────────────────────────
+
+let _YEAR_PATTERN = "\\b(\\d{4})\\b"
+let _CENTURY_PATTERN = "(\\d{1,2})(?:st|nd|rd|th)\\s+century"
+let _DECADE_PATTERN = "(\\d{4})s"
+
+let _ERA_KEYWORDS: Dict[string, Tuple[int, int]] = {
+    "ancient": (-3000, 500),
+    "medieval": (500, 1500),
+    "renaissance": (1400, 1600),
+    "modern": (1800, 2026),
+    "contemporary": (1950, 2026)
+}
+
+let _ONGOING_SIGNALS: Set[string] = {
+    "currently", "today", "now", "present", "ongoing", "still", "continues"
+}
+
+/// ── Temporal Extractor ─────────────────────────────────────────────
+
+class TemporalExtractor {
+    fn extract(self, text: string, concept: string) -> TemporalFact {
+        if concept == None {
+            concept = ""
+        }
+        let tl = text.lower()
+
+        let year_matches = regex_findall(_YEAR_PATTERN, text)
+        let years: List[int] = []
+        for y_str in year_matches {
+            let y = int(y_str)
+            if y >= 100 and y <= 2100 {
+                years.append(y)
+            }
+        }
+
+        let year_start: Optional[int] = None
+        let year_end: Optional[int] = None
+        if len(years) > 0 {
+            year_start = years[0]
+            for y in years {
+                if y < year_start {
+                    year_start = y
+                }
+            }
+            if len(years) > 1 {
+                year_end = years[0]
+                for y in years {
+                    if y > year_end {
+                        year_end = y
+                    }
+                }
+            }
+        }
+
+        let m = regex_search(_CENTURY_PATTERN, text, "IGNORECASE")
+        if m != None and year_start == None {
+            let century = int(m.group(1))
+            year_start = (century - 1) * 100
+            year_end = century * 100
+        }
+
+        let m2 = regex_search(_DECADE_PATTERN, text)
+        if m2 != None and year_start == None {
+            year_start = int(m2.group(1))
+            year_end = year_start + 9
+        }
+
+        let is_ongoing = false
+        for w in _ONGOING_SIGNALS {
+            if w in tl {
+                is_ongoing = true
+                break
+            }
+        }
+
+        let era = ""
+        for era_name in _ERA_KEYWORDS {
+            if era_name in tl {
+                era = era_name
+                if year_start == None {
+                    let era_range = _ERA_KEYWORDS[era_name]
+                    year_start = era_range[0]
+                    year_end = era_range[1]
+                }
+                break
+            }
+        }
+
+        return TemporalFact {
+            concept: concept, year_start: year_start, year_end: year_end,
+            is_ongoing: is_ongoing, era: era, raw_text: text[:200],
+            confidence: 0.5
+        }
+    }
+}
+
+/// ── Temporal Reasoner ──────────────────────────────────────────────
+
+class TemporalReasoner {
+    fn __init__(self) {
+        self._facts: Dict[string, TemporalFact] = {}
+        self._extractor = TemporalExtractor()
+    }
+
+    fn add_fact(self, concept: string, text: string) -> TemporalFact {
+        let tf = self._extractor.extract(text, concept)
+        self._facts[concept.lower()] = tf
+        return tf
+    }
+
+    fn get_fact(self, concept: string) -> Optional[TemporalFact] {
+        return self._facts.get(concept.lower())
+    }
+
+    fn relate(self, concept_a: string, concept_b: string) -> TemporalRelation {
+        let a = self._facts.get(concept_a.lower())
+        let b = self._facts.get(concept_b.lower())
+        if a == None or b == None {
+            return TemporalRelation.UNKNOWN
+        }
+        if not temporal_fact_has_time(a) or not temporal_fact_has_time(b) {
+            return TemporalRelation.UNKNOWN
+        }
+
+        let a_start = a.year_start
+        if a_start == None {
+            a_start = 0
+        }
+        let a_end = a.year_end
+        if a_end == None {
+            a_end = a_start
+        }
+        let b_start = b.year_start
+        if b_start == None {
+            b_start = 0
+        }
+        let b_end = b.year_end
+        if b_end == None {
+            b_end = b_start
+        }
+
+        if a_end < b_start {
+            return TemporalRelation.BEFORE
+        }
+        if a_start > b_end {
+            return TemporalRelation.AFTER
+        }
+        if a_start == b_start and a_end == b_end {
+            return TemporalRelation.EQUALS
+        }
+        if a_start <= b_start and a_end >= b_end {
+            return TemporalRelation.DURING
+        }
+        return TemporalRelation.OVERLAPS
+    }
+
+    fn is_current(self, concept: string) -> Optional[bool] {
+        let fact = self._facts.get(concept.lower())
+        if fact == None {
+            return None
+        }
+        return temporal_fact_is_current(fact, 2026)
+    }
+
+    fn timeline(self, concepts: Optional[List[string]]) -> List[any] {
+        let items: List[Tuple[string, TemporalFact]] = []
+        if concepts != None {
+            for c in concepts {
+                let f = self._facts.get(c.lower())
+                if f != None {
+                    items.append((c, f))
+                }
+            }
+        } else {
+            for k in self._facts {
+                items.append((k, self._facts[k]))
+            }
+        }
+
+        let timed: List[Tuple[string, Optional[int]]] = []
+        for entry in items {
+            let name = entry[0]
+            let f = entry[1]
+            if temporal_fact_has_time(f) {
+                timed.append((name, f.year_start))
+            }
+        }
+
+        let sorted_timed: List[Tuple[string, Optional[int]]] = []
+        let remaining = list(timed)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                let val_i = remaining[i][1]
+                if val_i == None {
+                    val_i = 0
+                }
+                let val_b = remaining[best_idx][1]
+                if val_b == None {
+                    val_b = 0
+                }
+                if val_i < val_b {
+                    best_idx = i
+                }
+            }
+            sorted_timed.append(remaining.pop(best_idx))
+        }
+        return sorted_timed
+    }
+}
+
+/// ═══════════════════════════════════════════════════════════════════
+///  QUANTITATIVE REASONING
+/// ═══════════════════════════════════════════════════════════════════
+
+type QuantityFact {
+    concept: string,
+    value: float,
+    unit: string,
+    raw_text: string,
+    confidence: float
+}
+
+fn quantity_fact_to_string(qf: QuantityFact) -> string {
+    if qf.value == int(qf.value) {
+        return str(int(qf.value)) + " " + qf.unit
+    }
+    return str(round(qf.value, 2)) + " " + qf.unit
+}
+
+let _NUMBER_PATTERN = "(?:approximately|about|roughly|nearly|over|under|around|exactly)?\\s*(\\d[\\d,]*\\.?\\d*)\\s*(billion|million|thousand|trillion|hundred|percent|%|km|mi|m|cm|mm|ft|in|kg|g|lb|oz|°[CF]|degrees?|years?|months?|days?|hours?|minutes?|seconds?|people|inhabitants|dollars?|euros?|watts?|joules?|calories?|liters?|litres?|gallons?|mph|km/h|m/s)?"
+
+let _MULTIPLIERS: Dict[string, float] = {
+    "trillion": 1e12, "billion": 1e9, "million": 1e6,
+    "thousand": 1e3, "hundred": 1e2
+}
+
+let _UNIT_NORMALIZE: Dict[string, string] = {
+    "%": "percent", "°c": "celsius", "°f": "fahrenheit",
+    "km": "kilometers", "mi": "miles", "m": "meters",
+    "cm": "centimeters", "mm": "millimeters",
+    "ft": "feet", "in": "inches",
+    "kg": "kilograms", "g": "grams", "lb": "pounds", "oz": "ounces",
+    "km/h": "km/h", "mph": "mph", "m/s": "m/s"
+}
+
+let _UNIT_CONVERSIONS: Dict[Tuple[string, string], Optional[float]] = {
+    ("miles", "kilometers"): 1.60934,
+    ("kilometers", "miles"): 0.62137,
+    ("pounds", "kilograms"): 0.45359,
+    ("kilograms", "pounds"): 2.20462,
+    ("fahrenheit", "celsius"): None,
+    ("feet", "meters"): 0.3048,
+    ("meters", "feet"): 3.28084,
+    ("inches", "centimeters"): 2.54,
+    ("centimeters", "inches"): 0.39370,
+    ("gallons", "liters"): 3.78541,
+    ("liters", "gallons"): 0.26417
+}
+
+/// ── Quantity Extractor ─────────────────────────────────────────────
+
+class QuantityExtractor {
+    fn extract_all(self, text: string, concept: string) -> List[any] {
+        if concept == None {
+            concept = ""
+        }
+        let results: List[QuantityFact] = []
+        let matches = regex_finditer(_NUMBER_PATTERN, text, "IGNORECASE")
+        for m in matches {
+            let num_str = m.group(1).replace(",", "")
+            let unit_str = ""
+            if m.group(2) != None {
+                unit_str = m.group(2).lower().strip()
+            }
+
+            let value: Optional[float] = None
+            try {
+                value = float(num_str)
+            } catch {
+                continue
+            }
+
+            if unit_str in _MULTIPLIERS {
+                value = value * _MULTIPLIERS[unit_str]
+                unit_str = ""
+            }
+
+            let unit = _UNIT_NORMALIZE.get(unit_str, unit_str)
+            if unit == "" {
+                unit = "units"
+            }
+
+            results.append(QuantityFact {
+                concept: concept, value: value, unit: unit,
+                raw_text: text[:200], confidence: 0.5
+            })
+        }
+        return results
+    }
+
+    fn extract_primary(self, text: string,
+                       concept: string) -> Optional[QuantityFact] {
+        if concept == None {
+            concept = ""
+        }
+        let all_q = self.extract_all(text, concept)
+        if len(all_q) > 0 {
+            return all_q[0]
+        }
+        return None
+    }
+}
+
+/// ── Quantitative Reasoner ──────────────────────────────────────────
+
+class QuantitativeReasoner {
+    fn __init__(self) {
+        self._facts: Dict[string, List[QuantityFact]] = {}
+        self._extractor = QuantityExtractor()
+    }
+
+    fn add_fact(self, concept: string, text: string) -> List[any] {
+        let quantities = self._extractor.extract_all(text, concept)
+        let key = concept.lower()
+        if key not in self._facts {
+            self._facts[key] = []
+        }
+        for q in quantities {
+            self._facts[key].append(q)
+        }
+        return quantities
+    }
+
+    fn get_quantities(self, concept: string) -> List[any] {
+        return self._facts.get(concept.lower(), [])
+    }
+
+    fn compare(self, concept_a: string, concept_b: string,
+               unit: string) -> Optional[string] {
+        if unit == None {
+            unit = ""
+        }
+        let qa = self._facts.get(concept_a.lower(), [])
+        let qb = self._facts.get(concept_b.lower(), [])
+        if len(qa) == 0 or len(qb) == 0 {
+            return None
+        }
+
+        let a = qa[0]
+        let b = qb[0]
+
+        if a.unit != b.unit and unit != "" {
+            let a_conv = self._convert(a, unit)
+            let b_conv = self._convert(b, unit)
+            if a_conv != None and b_conv != None {
+                a = a_conv
+                b = b_conv
+            }
+        }
+
+        if a.unit != b.unit {
+            return "Cannot compare: " + a.unit + " vs " + b.unit
+        }
+
+        if a.value > b.value {
+            let ratio = 0.0
+            if b.value != 0 {
+                ratio = a.value / b.value
+            }
+            return concept_a + " (" + quantity_fact_to_string(a) + ") is greater than " + concept_b + " (" + quantity_fact_to_string(b) + ") by a factor of " + str(round(ratio, 1))
+        } else if b.value > a.value {
+            let ratio = 0.0
+            if a.value != 0 {
+                ratio = b.value / a.value
+            }
+            return concept_b + " (" + quantity_fact_to_string(b) + ") is greater than " + concept_a + " (" + quantity_fact_to_string(a) + ") by a factor of " + str(round(ratio, 1))
+        }
+        return concept_a + " and " + concept_b + " are equal (" + quantity_fact_to_string(a) + ")"
+    }
+
+    fn rank(self, concepts: List[string],
+            unit: string) -> List[any] {
+        if unit == None {
+            unit = ""
+        }
+        let items: List[Tuple[string, QuantityFact]] = []
+        for c in concepts {
+            let qs = self._facts.get(c.lower(), [])
+            if len(qs) > 0 {
+                items.append((c, qs[0]))
+            }
+        }
+
+        let sorted_items: List[Tuple[string, QuantityFact]] = []
+        let remaining = list(items)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i][1].value > remaining[best_idx][1].value {
+                    best_idx = i
+                }
+            }
+            sorted_items.append(remaining.pop(best_idx))
+        }
+        return sorted_items
+    }
+
+    fn sum_quantities(self, concepts: List[string]) -> Optional[QuantityFact] {
+        let total = 0.0
+        let unit = ""
+        for c in concepts {
+            let qs = self._facts.get(c.lower(), [])
+            if len(qs) > 0 {
+                if unit == "" {
+                    unit = qs[0].unit
+                }
+                if qs[0].unit == unit {
+                    total += qs[0].value
+                }
+            }
+        }
+
+        if unit != "" {
+            return QuantityFact { concept: "sum", value: total, unit: unit, raw_text: "", confidence: 0.5 }
+        }
+        return None
+    }
+
+    fn _convert(self, fact: QuantityFact,
+                target_unit: string) -> Optional[QuantityFact] {
+        let key = (fact.unit, target_unit)
+        let factor = _UNIT_CONVERSIONS.get(key)
+        if factor == None {
+            return None
+        }
+        return QuantityFact {
+            concept: fact.concept,
+            value: fact.value * factor,
+            unit: target_unit,
+            raw_text: "",
+            confidence: fact.confidence
+        }
+    }
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export TemporalRelation, TemporalFact, TemporalExtractor, TemporalReasoner
+export QuantityFact, QuantityExtractor, QuantitativeReasoner

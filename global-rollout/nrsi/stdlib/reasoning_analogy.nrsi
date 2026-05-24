@@ -1,0 +1,585 @@
+/// NRSI — Analogical Transfer via Structure Mapping.
+///
+/// Gentner-style structure mapping: align relational structures between
+/// domain subgraphs, score analogy quality by structural depth, and
+/// transfer conclusions from a known domain to a novel one.
+/// All transformer-free.
+
+module reasoning_analogy
+
+from "reasoning_graph" import CausalGraph, GraphEdge, GraphNode, RelationType
+
+/// ---------- Types ----------
+
+type RelationalStructure {
+    domain: string,
+    nodes: List[string],
+    edges: List[Tuple[string, RelationType, string]],
+    node_properties: Dict[string, Dict[string, Any]]
+}
+
+fn structure_size(s: RelationalStructure) -> int {
+    return len(s.edges)
+}
+
+fn structure_edge_types(s: RelationalStructure) -> any {
+    let types: Set[RelationType] = set()
+    for e in s.edges {
+        types.add(e[1])
+    }
+    return types
+}
+
+fn structure_adjacency(s: RelationalStructure, node: string) -> List[any] {
+    let result: List[Tuple[RelationType, string]] = []
+    for e in s.edges {
+        if e[0] == node {
+            result.append((e[1], e[2]))
+        }
+    }
+    return result
+}
+
+type NodeMapping {
+    source_node: string,
+    target_node: string,
+    score: float,
+    reason: string
+}
+
+type StructuralMapping {
+    source_domain: string,
+    target_domain: string,
+    node_map: Dict[string, string],
+    edge_alignments: List[Tuple[Tuple[string, RelationType, string], Tuple[string, RelationType, string]]],
+    score: float,
+    depth: int
+}
+
+type TransferredHypothesis {
+    source_conclusion: string,
+    source_domain: string,
+    target_hypothesis: string,
+    target_domain: string,
+    confidence: float,
+    analogy_score: float,
+    provenance: string,
+    is_hypothetical: bool
+}
+
+/// ---------- Structure extraction ----------
+
+fn extract_structure(graph: CausalGraph, domain: string) -> RelationalStructure {
+    let sub = graph.domain_subgraph(domain)
+    let nodes: List[string] = []
+    for n in sub.all_nodes() {
+        nodes.append(n.node_id)
+    }
+    let edges: List[Tuple[string, RelationType, string]] = []
+    for e in sub.all_edges() {
+        edges.append((e.source, e.relation, e.target))
+    }
+    let props: Dict[string, Dict[string, Any]] = {}
+    for n in sub.all_nodes() {
+        props[n.node_id] = n.properties
+    }
+    return RelationalStructure {
+        domain: domain, nodes: nodes, edges: edges, node_properties: props
+    }
+}
+
+fn extract_structure_around(graph: CausalGraph, concept: string, depth: int) -> RelationalStructure {
+    let concept_norm = concept.lower().strip()
+    let visited: Set[string] = set()
+    let frontier: Set[string] = set()
+    frontier.add(concept_norm)
+    let edges_found: List[Tuple[string, RelationType, string]] = []
+
+    for round_num in range(depth) {
+        let next_frontier: Set[string] = set()
+        for node in frontier {
+            if node in visited {
+                continue
+            }
+            visited.add(node)
+            for e in graph.outgoing(node) {
+                edges_found.append((e.source, e.relation, e.target))
+                next_frontier.add(e.target)
+            }
+            for e in graph.incoming(node) {
+                edges_found.append((e.source, e.relation, e.target))
+                next_frontier.add(e.source)
+            }
+        }
+        let new_frontier: Set[string] = set()
+        for n in next_frontier {
+            if n not in visited {
+                new_frontier.add(n)
+            }
+        }
+        frontier = new_frontier
+    }
+
+    let unique_edges: Set[string] = set()
+    let deduped_edges: List[Tuple[string, RelationType, string]] = []
+    for e in edges_found {
+        let key = e[0] + "|" + e[1].value + "|" + e[2]
+        if key not in unique_edges {
+            unique_edges.add(key)
+            deduped_edges.append(e)
+        }
+    }
+
+    let all_nodes: Set[string] = set()
+    for e in deduped_edges {
+        all_nodes.add(e[0])
+        all_nodes.add(e[2])
+    }
+
+    let node = graph.get_node(concept_norm)
+    let domain = ""
+    if node != None {
+        domain = node.domain
+    }
+    let props: Dict[string, Dict[string, Any]] = {}
+    for n in all_nodes {
+        let gn = graph.get_node(n)
+        if gn != None {
+            props[n] = gn.properties
+        }
+    }
+
+    let node_list: List[string] = []
+    for n in all_nodes {
+        node_list.append(n)
+    }
+
+    return RelationalStructure {
+        domain: domain, nodes: node_list,
+        edges: deduped_edges, node_properties: props
+    }
+}
+
+/// ---------- Structure Mapper ----------
+
+class StructureMapper {
+    fn __init__(self, min_shared_edges: int) {
+        if min_shared_edges == None {
+            min_shared_edges = 2
+        }
+        self._min_shared = min_shared_edges
+    }
+
+    fn map(self, source: RelationalStructure,
+           target: RelationalStructure) -> Optional[StructuralMapping] {
+        let shared_types: Set[RelationType] = set()
+        let src_types = structure_edge_types(source)
+        let tgt_types = structure_edge_types(target)
+        for t in src_types {
+            if t in tgt_types {
+                shared_types.add(t)
+            }
+        }
+        if len(shared_types) == 0 {
+            return None
+        }
+
+        let src_by_type: Dict[RelationType, List[Tuple[string, string]]] = {}
+        let tgt_by_type: Dict[RelationType, List[Tuple[string, string]]] = {}
+
+        for e in source.edges {
+            if e[1] in shared_types {
+                if e[1] not in src_by_type {
+                    src_by_type[e[1]] = []
+                }
+                src_by_type[e[1]].append((e[0], e[2]))
+            }
+        }
+        for e in target.edges {
+            if e[1] in shared_types {
+                if e[1] not in tgt_by_type {
+                    tgt_by_type[e[1]] = []
+                }
+                tgt_by_type[e[1]].append((e[0], e[2]))
+            }
+        }
+
+        let candidate_maps: Dict[string, Set[string]] = {}
+        for rtype in shared_types {
+            let src_pairs = src_by_type.get(rtype, [])
+            let tgt_pairs = tgt_by_type.get(rtype, [])
+            for sp in src_pairs {
+                for tp in tgt_pairs {
+                    if sp[0] not in candidate_maps {
+                        candidate_maps[sp[0]] = set()
+                    }
+                    candidate_maps[sp[0]].add(tp[0])
+                    if sp[1] not in candidate_maps {
+                        candidate_maps[sp[1]] = set()
+                    }
+                    candidate_maps[sp[1]].add(tp[1])
+                }
+            }
+        }
+
+        return self._greedy_align(source, target, candidate_maps, shared_types, src_by_type, tgt_by_type)
+    }
+
+    fn _greedy_align(self, source: RelationalStructure, target: RelationalStructure,
+                      candidates: Dict[string, Set[string]],
+                      shared_types: Set[RelationType],
+                      src_by_type: Dict[RelationType, List[Tuple[string, string]]],
+                      tgt_by_type: Dict[RelationType, List[Tuple[string, string]]]) -> Optional[StructuralMapping] {
+
+        let best_score = 0
+        let best_node_map: Dict[string, string] = {}
+        let best_alignments: List[Tuple[Tuple[string, RelationType, string], Tuple[string, RelationType, string]]] = []
+
+        let scored_seeds: List[Tuple[float, string, string]] = []
+        for src_node in candidates {
+            for tgt_node in candidates[src_node] {
+                let src_adj = structure_adjacency(source, src_node)
+                let tgt_adj = structure_adjacency(target, tgt_node)
+                let shared = 0
+                for sa in src_adj {
+                    for ta in tgt_adj {
+                        if sa[0] == ta[0] {
+                            shared += 1
+                        }
+                    }
+                }
+                if shared > 0 {
+                    scored_seeds.append((shared, src_node, tgt_node))
+                }
+            }
+        }
+
+        let sorted_seeds: List[Tuple[float, string, string]] = []
+        let remaining_seeds = list(scored_seeds)
+        while len(remaining_seeds) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining_seeds)) {
+                if remaining_seeds[i][0] > remaining_seeds[best_idx][0] {
+                    best_idx = i
+                }
+            }
+            sorted_seeds.append(remaining_seeds.pop(best_idx))
+        }
+
+        for si in range(min(20, len(sorted_seeds))) {
+            let seed = sorted_seeds[si]
+            let seed_src = seed[1]
+            let seed_tgt = seed[2]
+            let node_map: Dict[string, string] = {}
+            node_map[seed_src] = seed_tgt
+            let used_tgt: Set[string] = set()
+            used_tgt.add(seed_tgt)
+            let alignments: List[Tuple[Tuple[string, RelationType, string], Tuple[string, RelationType, string]]] = []
+
+            for rtype in shared_types {
+                for sp in src_by_type.get(rtype, []) {
+                    for tp in tgt_by_type.get(rtype, []) {
+                        let ss = sp[0]
+                        let st = sp[1]
+                        let ts = tp[0]
+                        let tt = tp[1]
+                        let s_ok = (ss in node_map and node_map[ss] == ts) or ss not in node_map
+                        let t_ok = (st in node_map and node_map[st] == tt) or st not in node_map
+                        let ts_free = ts not in used_tgt or (ss in node_map and node_map[ss] == ts)
+                        let tt_free = tt not in used_tgt or (st in node_map and node_map[st] == tt)
+
+                        if s_ok and t_ok and ts_free and tt_free {
+                            if ss not in node_map {
+                                node_map[ss] = ts
+                                used_tgt.add(ts)
+                            }
+                            if st not in node_map {
+                                node_map[st] = tt
+                                used_tgt.add(tt)
+                            }
+                            alignments.append(((ss, rtype, st), (ts, rtype, tt)))
+                        }
+                    }
+                }
+            }
+
+            if len(alignments) > best_score {
+                best_score = len(alignments)
+                best_node_map = dict(node_map)
+                best_alignments = list(alignments)
+            }
+        }
+
+        if best_score < self._min_shared {
+            return None
+        }
+
+        let depth = self._compute_depth(best_alignments, source)
+
+        return StructuralMapping {
+            source_domain: source.domain,
+            target_domain: target.domain,
+            node_map: best_node_map,
+            edge_alignments: best_alignments,
+            score: best_score,
+            depth: depth
+        }
+    }
+
+    fn _compute_depth(self, alignments: List[Tuple[Tuple[string, RelationType, string], Tuple[string, RelationType, string]]],
+                       source: RelationalStructure) -> int {
+        let adj: Dict[string, List[string]] = {}
+        for a in alignments {
+            let s = a[0][0]
+            let t = a[0][2]
+            if s not in adj {
+                adj[s] = []
+            }
+            adj[s].append(t)
+        }
+
+        let max_depth = 0
+        for start in adj {
+            let visited: Set[string] = set()
+            let stack: List[Tuple[string, int]] = [(start, 1)]
+            while len(stack) > 0 {
+                let item = stack.pop()
+                let node = item[0]
+                let d = item[1]
+                if node in visited {
+                    continue
+                }
+                visited.add(node)
+                if d > max_depth {
+                    max_depth = d
+                }
+                if node in adj {
+                    for nxt in adj[node] {
+                        if nxt not in visited {
+                            stack.append((nxt, d + 1))
+                        }
+                    }
+                }
+            }
+        }
+        return max_depth
+    }
+}
+
+/// ---------- Analogy Scorer ----------
+
+class AnalogyScorer {
+    fn score(self, mapping: StructuralMapping, source: RelationalStructure) -> float {
+        if mapping == None or structure_size(source) == 0 {
+            return 0.0
+        }
+        let src_size = structure_size(source)
+        if src_size < 1 {
+            src_size = 1
+        }
+        let coverage = mapping.score / src_size
+        let depth_bonus = mapping.depth / 4.0
+        if depth_bonus > 1.0 {
+            depth_bonus = 1.0
+        }
+        let alignment_count = mapping.score / 10.0
+        if alignment_count > 1.0 {
+            alignment_count = 1.0
+        }
+        let raw = coverage * 0.4 + depth_bonus * 0.4 + alignment_count * 0.2
+        if raw < 0.0 {
+            raw = 0.0
+        }
+        if raw > 1.0 {
+            raw = 1.0
+        }
+        return raw
+    }
+}
+
+/// ---------- Transfer Engine ----------
+
+class TransferEngine {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._scorer = AnalogyScorer()
+        self._mapper = StructureMapper(2)
+    }
+
+    fn transfer(self, source_domain: string, target_domain: string,
+                max_hypotheses: int) -> List[any] {
+        if max_hypotheses == None {
+            max_hypotheses = 10
+        }
+        let src_struct = extract_structure(self._graph, source_domain)
+        let tgt_struct = extract_structure(self._graph, target_domain)
+
+        if len(src_struct.edges) == 0 or len(tgt_struct.edges) == 0 {
+            return []
+        }
+
+        let mapping = self._mapper.map(src_struct, tgt_struct)
+        if mapping == None {
+            return []
+        }
+
+        let analogy_score = self._scorer.score(mapping, src_struct)
+        if analogy_score < 0.1 {
+            return []
+        }
+
+        let node_map = mapping.node_map
+        let mapped_src_targets: Set[string] = set()
+        for a in mapping.edge_alignments {
+            mapped_src_targets.add(a[0][0] + "|" + a[0][1].value + "|" + a[0][2])
+        }
+
+        let hypotheses: List[TransferredHypothesis] = []
+        for e in src_struct.edges {
+            let key = e[0] + "|" + e[1].value + "|" + e[2]
+            if key in mapped_src_targets {
+                continue
+            }
+            if e[0] in node_map or e[2] in node_map {
+                let mapped_s = node_map.get(e[0], "")
+                let mapped_t = node_map.get(e[2], "")
+                if mapped_s == "" or mapped_t == "" {
+                    continue
+                }
+
+                let edge_obj = self._graph.get_edge(e[0], e[1], e[2])
+                let base_conf = 0.5
+                if edge_obj != None {
+                    base_conf = edge_obj.confidence
+                }
+                let transfer_conf = base_conf * analogy_score * 0.7
+
+                hypotheses.append(TransferredHypothesis {
+                    source_conclusion: e[0] + " " + e[1].value + " " + e[2],
+                    source_domain: source_domain,
+                    target_hypothesis: mapped_s + " " + e[1].value + " " + mapped_t,
+                    target_domain: target_domain,
+                    confidence: transfer_conf,
+                    analogy_score: analogy_score,
+                    provenance: "Transferred from " + source_domain + " via structural analogy (score=" + str(round(analogy_score, 2)) + ", aligned=" + str(mapping.score) + " edges, depth=" + str(mapping.depth) + ")",
+                    is_hypothetical: true
+                })
+            }
+        }
+
+        let sorted_hyps: List[TransferredHypothesis] = []
+        let remaining = list(hypotheses)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i].confidence > remaining[best_idx].confidence {
+                    best_idx = i
+                }
+            }
+            sorted_hyps.append(remaining.pop(best_idx))
+        }
+
+        let limited: List[TransferredHypothesis] = []
+        for i in range(min(max_hypotheses, len(sorted_hyps))) {
+            limited.append(sorted_hyps[i])
+        }
+        return limited
+    }
+
+    fn transfer_between_concepts(self, concept_a: string, concept_b: string,
+                                  depth: int, max_hypotheses: int) -> List[any] {
+        if depth == None {
+            depth = 2
+        }
+        if max_hypotheses == None {
+            max_hypotheses = 10
+        }
+        let struct_a = extract_structure_around(self._graph, concept_a, depth)
+        let struct_b = extract_structure_around(self._graph, concept_b, depth)
+
+        if len(struct_a.edges) == 0 or len(struct_b.edges) == 0 {
+            return []
+        }
+
+        let mapping = self._mapper.map(struct_a, struct_b)
+        if mapping == None {
+            return []
+        }
+
+        let analogy_score = self._scorer.score(mapping, struct_a)
+        if analogy_score < 0.1 {
+            return []
+        }
+
+        let node_map = mapping.node_map
+        let mapped_edges: Set[string] = set()
+        for a in mapping.edge_alignments {
+            mapped_edges.add(a[0][0] + "|" + a[0][1].value + "|" + a[0][2])
+        }
+
+        let hypotheses: List[TransferredHypothesis] = []
+        for e in struct_a.edges {
+            let key = e[0] + "|" + e[1].value + "|" + e[2]
+            if key in mapped_edges {
+                continue
+            }
+            let mapped_s = node_map.get(e[0], "")
+            let mapped_t = node_map.get(e[2], "")
+            if mapped_s == "" or mapped_t == "" {
+                continue
+            }
+
+            let edge_obj = self._graph.get_edge(e[0], e[1], e[2])
+            let base_conf = 0.5
+            if edge_obj != None {
+                base_conf = edge_obj.confidence
+            }
+            let transfer_conf = base_conf * analogy_score * 0.7
+
+            hypotheses.append(TransferredHypothesis {
+                source_conclusion: e[0] + " " + e[1].value + " " + e[2],
+                source_domain: struct_a.domain,
+                target_hypothesis: mapped_s + " " + e[1].value + " " + mapped_t,
+                target_domain: struct_b.domain,
+                confidence: transfer_conf,
+                analogy_score: analogy_score,
+                provenance: "Transferred via concept analogy between '" + concept_a + "' and '" + concept_b + "' (score=" + str(round(analogy_score, 2)) + ")",
+                is_hypothetical: true
+            })
+        }
+
+        let sorted_hyps: List[TransferredHypothesis] = []
+        let remaining = list(hypotheses)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i].confidence > remaining[best_idx].confidence {
+                    best_idx = i
+                }
+            }
+            sorted_hyps.append(remaining.pop(best_idx))
+        }
+
+        let limited: List[TransferredHypothesis] = []
+        for i in range(min(max_hypotheses, len(sorted_hyps))) {
+            limited.append(sorted_hyps[i])
+        }
+        return limited
+    }
+}
+
+/// ---------- Gate ----------
+
+gate analogy_gate(data: raw[TransferredHypothesis]) -> validated[TransferredHypothesis] {
+    require confidence >= 0.3
+    validate structural_depth
+    validate mapping_quality
+}
+
+/// ---------- Exports ----------
+
+export RelationalStructure, NodeMapping, StructuralMapping, TransferredHypothesis
+export structure_size, structure_edge_types, structure_adjacency
+export extract_structure, extract_structure_around
+export StructureMapper, AnalogyScorer, TransferEngine
+export analogy_gate

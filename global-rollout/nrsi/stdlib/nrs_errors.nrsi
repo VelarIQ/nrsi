@@ -1,0 +1,154 @@
+/// NRSI Error Hierarchy — Standardized error classes for trust, validation, and governance.
+///
+/// Every error carries a suggestion field for actionable remediation.
+/// Ported from nrsip/nrs_errors.py.
+
+module nrs_errors
+
+/// ── Base Error ──
+
+class NRSIError {
+    fn init(self, message: string, suggestion: Optional[string]) {
+        self.message = message
+        self.suggestion = suggestion
+        if suggestion != nil {
+            self.full_message = message + " | Suggestion: " + suggestion
+        } else {
+            self.full_message = message
+        }
+    }
+
+    fn to_string(self) -> string {
+        return self.full_message
+    }
+}
+
+/// ── Validation Error ──
+
+class ValidationError(NRSIError) {
+    fn init(self, gate_name: string, reason: string,
+            confidence: Optional[float], required_confidence: Optional[float],
+            suggestion: Optional[string]) {
+        self.gate_name = gate_name
+        self.reason = reason
+        self.confidence = confidence
+        self.required_confidence = required_confidence
+        let msg = "ValidationError[" + gate_name + "]: " + reason
+        super.init(msg, suggestion)
+    }
+}
+
+/// ── Trust Error ──
+
+class TrustError(NRSIError) {
+    fn init(self, expected_trust: string, actual_trust: string,
+            operation: Optional[string], suggestion: Optional[string]) {
+        self.expected_trust = expected_trust
+        self.actual_trust = actual_trust
+        self.operation = operation
+        let msg = "TrustError: expected " + expected_trust + ", got " + actual_trust
+        if operation != nil {
+            msg = msg + " for " + operation
+        }
+        super.init(msg, suggestion)
+    }
+}
+
+/// ── Confidence Error ──
+
+class ConfidenceError(NRSIError) {
+    fn init(self, actual: float, required: float,
+            context: Optional[string], suggestion: Optional[string]) {
+        self.actual = actual
+        self.required = required
+        let msg = "ConfidenceError: " + to_string(actual) + " < required " + to_string(required)
+        if context != nil {
+            msg = msg + " (" + context + ")"
+        }
+        super.init(msg, suggestion)
+    }
+}
+
+/// ── Layer Violation Error ──
+
+class LayerViolationError(NRSIError) {
+    fn init(self, source_layer: int, target_layer: int,
+            source_name: Optional[string], target_name: Optional[string],
+            suggestion: Optional[string]) {
+        self.source_layer = source_layer
+        self.target_layer = target_layer
+        let src = source_name
+        if src == nil {
+            src = to_string(source_layer)
+        }
+        let tgt = target_name
+        if tgt == nil {
+            tgt = to_string(target_layer)
+        }
+        let msg = "LayerViolation: " + src + " -> " + tgt
+        super.init(msg, suggestion)
+    }
+}
+
+/// ── Knowledge Mutation Error ──
+
+class KnowledgeMutationError(NRSIError) {
+    fn init(self, pattern_name: string, fact_name: string,
+            suggestion: Optional[string]) {
+        self.pattern_name = pattern_name
+        self.fact_name = fact_name
+        let msg = "KnowledgeMutationError: cannot mutate " + pattern_name + "/" + fact_name
+        super.init(msg, suggestion)
+    }
+}
+
+/// ── Knowledge Not Found Error ──
+
+class KnowledgeNotFoundError(NRSIError) {
+    fn init(self, pattern_name: string, fact_name: string,
+            suggestion: Optional[string]) {
+        self.pattern_name = pattern_name
+        self.fact_name = fact_name
+        let msg = "KnowledgeNotFound: " + pattern_name + "/" + fact_name
+        super.init(msg, suggestion)
+    }
+}
+
+/// ── Governance Violation Error ──
+
+class GovernanceViolationError(NRSIError) {
+    fn init(self, policy_name: string, standard: string,
+            violation: string, suggestion: Optional[string]) {
+        self.policy_name = policy_name
+        self.standard = standard
+        self.violation = violation
+        let msg = "GovernanceViolation[" + policy_name + "]: " + standard + " — " + violation
+        super.init(msg, suggestion)
+    }
+}
+
+/// ── Audit Required Error ──
+
+class AuditRequiredError(NRSIError) {
+    fn init(self, operation: string, suggestion: Optional[string]) {
+        self.operation = operation
+        let msg = "AuditRequired: " + operation
+        super.init(msg, suggestion)
+    }
+}
+
+/// ── Channel Error ──
+
+class ChannelError(NRSIError) {
+    fn init(self, channel_name: string, reason: string,
+            suggestion: Optional[string]) {
+        self.channel_name = channel_name
+        self.reason = reason
+        let msg = "ChannelError[" + channel_name + "]: " + reason
+        super.init(msg, suggestion)
+    }
+}
+
+export NRSIError, ValidationError, TrustError, ConfidenceError
+export LayerViolationError, KnowledgeMutationError, KnowledgeNotFoundError
+export GovernanceViolationError, AuditRequiredError, ChannelError

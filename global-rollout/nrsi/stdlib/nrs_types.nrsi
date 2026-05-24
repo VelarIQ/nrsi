@@ -1,0 +1,305 @@
+/// NRSI Core Type System — trust levels, confidence, provenance, and wrapped data.
+///
+/// Every datum carries a trust level that must be elevated through explicit
+/// validation gates, never implicitly. Provenance is immutable and append-only.
+///
+/// Ported from nrsip/nrs_types.py.
+
+module nrs_types
+
+import TrustError, ConfidenceError from "nrs_errors"
+import time from "std/time"
+import uuid from "std/uuid"
+import math from "std/math"
+
+/// ── Trust Level ──
+
+enum TrustLevel {
+    RAW = 0,
+    VALIDATED = 1,
+    TRUSTED = 2,
+    CERTIFIED = 3
+}
+
+/// ── Confidence ──
+
+class Confidence {
+    fn init(self) {
+        raise "Confidence is a static-only class and cannot be instantiated"
+    }
+}
+
+let CONFIDENCE_ABSOLUTE = 1.0
+let CONFIDENCE_VERY_HIGH = 0.99
+let CONFIDENCE_HIGH = 0.95
+let CONFIDENCE_MEDIUM = 0.80
+let CONFIDENCE_LOW = 0.50
+let CONFIDENCE_NONE = 0.0
+
+let _CONFIDENCE_LABELS = [
+    Tuple(1.0, "ABSOLUTE"),
+    Tuple(0.99, "VERY_HIGH"),
+    Tuple(0.95, "HIGH"),
+    Tuple(0.80, "MEDIUM"),
+    Tuple(0.50, "LOW"),
+    Tuple(0.0, "NONE")
+]
+
+fn confidence_validate(value: float) -> float {
+    if math.isnan(value) {
+        raise "Confidence must be a finite number, got NaN"
+    }
+    if value < 0.0 {
+        raise "Confidence must be in [0.0, 1.0], got " + to_string(value)
+    }
+    if value > 1.0 {
+        raise "Confidence must be in [0.0, 1.0], got " + to_string(value)
+    }
+    return value
+}
+
+fn confidence_combine(values: List[float]) -> float {
+    if values.len() == 0 {
+        return CONFIDENCE_NONE
+    }
+    let result = 1.0
+    for v in values {
+        confidence_validate(v)
+        result = result * v
+    }
+    return result
+}
+
+fn confidence_label(value: float) -> string {
+    let v = confidence_validate(value)
+    for entry in _CONFIDENCE_LABELS {
+        if v >= entry[0] {
+            return entry[1]
+        }
+    }
+    return "NONE"
+}
+
+/// ── Provenance Entry ──
+
+type ProvenanceEntry {
+    timestamp: string,
+    action: string,
+    gate_name: string,
+    from_trust: TrustLevel,
+    to_trust: TrustLevel,
+    confidence: float,
+    reason: Optional[string],
+    actor: Optional[string]
+}
+
+/// ── NRSIData ──
+
+class NRSIData {
+    fn init(self, value: any, trust_level: TrustLevel, confidence: float,
+            provenance: Optional[List[ProvenanceEntry]], metadata: Optional[Map[string, any]]) {
+        confidence_validate(confidence)
+        self._value = value
+        self._trust_level = trust_level
+        self._confidence = confidence
+        if provenance != nil {
+            self._provenance = provenance.copy()
+        } else {
+            self._provenance = []
+        }
+        if metadata != nil {
+            self._metadata = metadata.copy()
+        } else {
+            self._metadata = {}
+        }
+        self._id = uuid.uuid4().hex
+    }
+
+    fn value(self) -> any {
+        return self._value
+    }
+
+    fn trust_level(self) -> TrustLevel {
+        return self._trust_level
+    }
+
+    fn confidence(self) -> float {
+        return self._confidence
+    }
+
+    fn confidence_label(self) -> string {
+        return confidence_label(self._confidence)
+    }
+
+    fn provenance(self) -> List[any] {
+        return self._provenance.copy()
+    }
+
+    fn id(self) -> string {
+        return self._id
+    }
+
+    fn is_raw(self) -> bool {
+        return self._trust_level == TrustLevel.RAW
+    }
+
+    fn is_validated(self) -> bool {
+        return self._trust_level.value >= TrustLevel.VALIDATED.value
+    }
+
+    fn is_trusted(self) -> bool {
+        return self._trust_level.value >= TrustLevel.TRUSTED.value
+    }
+
+    fn is_certified(self) -> bool {
+        return self._trust_level.value >= TrustLevel.CERTIFIED.value
+    }
+
+    fn elevate(self, to_level: TrustLevel, confidence: float,
+               gate_name: string, reason: Optional[string]) -> NRSIData {
+        if to_level.value <= self._trust_level.value {
+            raise TrustError(to_level.name, self._trust_level.name, "elevate",
+                "Target trust level must be strictly higher than current level")
+        }
+        confidence_validate(confidence)
+        let entry = ProvenanceEntry {
+            timestamp: iso_now(),
+            action: "elevate",
+            gate_name: gate_name,
+            from_trust: self._trust_level,
+            to_trust: to_level,
+            confidence: confidence,
+            reason: reason,
+            actor: nil
+        }
+        let new_prov = self._provenance.copy()
+        new_prov.append(entry)
+        let combined = confidence_combine([ self._confidence, confidence ])
+        let result = NRSIData()
+        result.init(self._value, to_level, combined, new_prov, self._metadata)
+        return result
+    }
+
+    fn downgrade(self, to_level: TrustLevel, reason: string,
+                 actor: Optional[string]) -> NRSIData {
+        if to_level.value >= self._trust_level.value {
+            raise TrustError(to_level.name, self._trust_level.name, "downgrade",
+                "Target trust level must be strictly lower than current level")
+        }
+        let entry = ProvenanceEntry {
+            timestamp: iso_now(),
+            action: "downgrade",
+            gate_name: "manual",
+            from_trust: self._trust_level,
+            to_trust: to_level,
+            confidence: self._confidence,
+            reason: reason,
+            actor: actor
+        }
+        let new_prov = self._provenance.copy()
+        new_prov.append(entry)
+        let result = NRSIData()
+        result.init(self._value, to_level, self._confidence, new_prov, self._metadata)
+        return result
+    }
+
+    fn require_trust(self, minimum: TrustLevel, operation: string) -> any {
+        if self._trust_level.value < minimum.value {
+            raise TrustError(minimum.name, self._trust_level.name, operation, nil)
+        }
+        return self._value
+    }
+
+    fn require_confidence(self, minimum: float, context: string) -> any {
+        confidence_validate(minimum)
+        if self._confidence < minimum {
+            let ctx = context
+            if ctx == "" {
+                ctx = nil
+            }
+            raise ConfidenceError(self._confidence, minimum, ctx, nil)
+        }
+        return self._value
+    }
+
+    fn trust_chain(self) -> string {
+        if self._provenance.len() == 0 {
+            return "[" + self._trust_level.name + " confidence=" + to_string(self._confidence) + "]"
+        }
+        let parts = []
+        parts.append("[" + self._provenance[0].from_trust.name + "]")
+        for entry in self._provenance {
+            parts.append("--(" + entry.gate_name + " " + to_string(entry.confidence) + ")--> [" + entry.to_trust.name + "]")
+        }
+        return parts.join(" ")
+    }
+}
+
+/// ── Constructor Helpers ──
+
+fn nrsi_raw(value: any, metadata: Optional[Map[string, any]]) -> NRSIData {
+    let d = NRSIData()
+    d.init(value, TrustLevel.RAW, CONFIDENCE_NONE, nil, metadata)
+    return d
+}
+
+fn nrsi_validated(value: any, confidence: float, gate_name: string,
+                  metadata: Optional[Map[string, any]]) -> NRSIData {
+    let entry = ProvenanceEntry {
+        timestamp: iso_now(),
+        action: "validate",
+        gate_name: gate_name,
+        from_trust: TrustLevel.RAW,
+        to_trust: TrustLevel.VALIDATED,
+        confidence: confidence,
+        reason: nil,
+        actor: nil
+    }
+    let d = NRSIData()
+    d.init(value, TrustLevel.VALIDATED, confidence,
+           [ entry ], metadata)
+    return d
+}
+
+fn nrsi_trusted(value: any, confidence: float, gate_name: string,
+                metadata: Optional[Map[string, any]]) -> NRSIData {
+    let entry = ProvenanceEntry {
+        timestamp: iso_now(),
+        action: "trust",
+        gate_name: gate_name,
+        from_trust: TrustLevel.RAW,
+        to_trust: TrustLevel.TRUSTED,
+        confidence: confidence,
+        reason: nil,
+        actor: nil
+    }
+    let d = NRSIData()
+    d.init(value, TrustLevel.TRUSTED, confidence,
+           [ entry ], metadata)
+    return d
+}
+
+fn nrsi_certified(value: any, confidence: float, gate_name: string,
+                  policy_name: string, metadata: Optional[Map[string, any]]) -> NRSIData {
+    let entry = ProvenanceEntry {
+        timestamp: iso_now(),
+        action: "certify",
+        gate_name: gate_name,
+        from_trust: TrustLevel.RAW,
+        to_trust: TrustLevel.CERTIFIED,
+        confidence: confidence,
+        reason: "policy:" + policy_name,
+        actor: nil
+    }
+    let d = NRSIData()
+    d.init(value, TrustLevel.CERTIFIED, confidence,
+           [ entry ], metadata)
+    return d
+}
+
+export TrustLevel
+export CONFIDENCE_ABSOLUTE, CONFIDENCE_VERY_HIGH, CONFIDENCE_HIGH
+export CONFIDENCE_MEDIUM, CONFIDENCE_LOW, CONFIDENCE_NONE
+export confidence_validate, confidence_combine, confidence_label
+export ProvenanceEntry, NRSIData
+export nrsi_raw, nrsi_validated, nrsi_trusted, nrsi_certified

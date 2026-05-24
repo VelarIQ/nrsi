@@ -1,0 +1,73 @@
+/// NRSI Standard Belief Bases — Foundational Knowledge
+///
+/// Belief bases organize knowledge with entrenchment levels.
+/// Higher entrenchment = harder to revise.
+
+module beliefs
+
+/// ---------- Physics Axioms ----------
+
+belief base physics {
+    entrenchment: empirical
+
+    axiom "speed_of_light: c = 299792458 m/s" tier: T0_AXIOM
+    axiom "gravitational_constant: G = 6.674e-11 m^3 kg^-1 s^-2" tier: T0_AXIOM
+    axiom "planck_constant: h = 6.626e-34 J*s" tier: T0_AXIOM
+    axiom "energy_mass_equivalence: E = mc^2" tier: T0_AXIOM
+    axiom "conservation_of_energy: energy cannot be created or destroyed" tier: T0_AXIOM
+    axiom "second_law_thermodynamics: entropy of isolated system never decreases" tier: T0_AXIOM
+}
+
+/// ---------- Logic Axioms ----------
+
+belief base logic {
+    entrenchment: axiomatic
+
+    axiom "law_of_identity: A = A" tier: T0_AXIOM
+    axiom "law_of_non_contradiction: not (A and not A)" tier: T0_AXIOM
+    axiom "law_of_excluded_middle: A or not A" tier: T0_AXIOM
+    axiom "modus_ponens: if (P implies Q) and P then Q" tier: T0_AXIOM
+    axiom "modus_tollens: if (P implies Q) and not Q then not P" tier: T0_AXIOM
+    axiom "hypothetical_syllogism: if (P implies Q) and (Q implies R) then (P implies R)" tier: T0_AXIOM
+    axiom "universal_instantiation: forall x P(x) implies P(a)" tier: T0_AXIOM
+}
+
+/// ---------- Mathematics Axioms ----------
+
+belief base mathematics {
+    entrenchment: axiomatic
+
+    axiom "peano_zero: 0 is a natural number" tier: T0_AXIOM
+    axiom "peano_successor: for every natural number n, S(n) is a natural number" tier: T0_AXIOM
+    axiom "peano_induction: if P(0) and forall n (P(n) implies P(S(n))) then forall n P(n)" tier: T0_AXIOM
+    axiom "field_commutativity: a + b = b + a and a * b = b * a" tier: T0_AXIOM
+    axiom "field_associativity: (a + b) + c = a + (b + c)" tier: T0_AXIOM
+    axiom "distributive_law: a * (b + c) = a * b + a * c" tier: T0_AXIOM
+}
+
+/// ---------- Epistemology Axioms ----------
+
+belief base epistemology {
+    entrenchment: empirical
+
+    axiom "knowledge_requires_justification: belief without evidence is not knowledge" tier: T1_FACT
+    axiom "fallibilism: any belief may be revised given sufficient counter-evidence" tier: T1_FACT
+    axiom "parsimony: prefer simpler explanations over complex ones, all else equal" tier: T1_FACT
+    axiom "evidence_grading: direct observation > indirect inference > testimony > speculation" tier: T1_FACT
+    axiom "calibration: stated confidence should match observed frequency" tier: T1_FACT
+}
+
+/// ---------- Ethics Axioms ----------
+
+belief base ethics {
+    entrenchment: empirical
+
+    axiom "non_maleficence: avoid causing harm" tier: T1_FACT
+    axiom "beneficence: act to benefit others when possible" tier: T1_FACT
+    axiom "autonomy: respect individual agency and informed consent" tier: T1_FACT
+    axiom "justice: distribute benefits and burdens fairly" tier: T1_FACT
+    axiom "transparency: be honest about capabilities, limitations, and uncertainty" tier: T1_FACT
+    axiom "proportionality: response should be proportional to situation severity" tier: T1_FACT
+}
+
+export physics, logic, mathematics, epistemology, ethics

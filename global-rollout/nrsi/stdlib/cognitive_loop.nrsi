@@ -1,0 +1,251 @@
+/// NRSI Cognitive Loop — Multi-Phase Reasoning Orchestrator
+///
+/// The top-level orchestration module that drives:
+///   1. Thinking → budget-controlled phase reasoning
+///   2. Tools   → schema-validated execution
+///   3. Context → token-aware compaction
+///   4. Verify  → build-test-scan completion gate
+///   5. Reason  → multi-strategy evidence resolution
+///
+/// Each iteration yields SSE events for live streaming to the client.
+/// The loop terminates when:
+///   - H-Score exceeds threshold (answer validated)
+///   - Budget exhausted
+///   - Max iterations reached (15)
+///   - Verification passes (for code tasks)
+///
+/// This module imports and orchestrates all cognitive engine submodules.
+
+module cognitive_loop
+
+import TrustLevel, NRSIData, EpistemicType, Confidence from "types"
+import factual_verify, corroborate from "gates"
+
+import ThinkingPhase, ThinkingConfig, PhaseBudget from "thinking"
+import enter_analyze, enter_plan, enter_execute from "thinking"
+import enter_validate, enter_synthesize from "thinking"
+import thinking_phase_verify from "thinking"
+
+import ReasoningStrategy, Evidence, ReasoningStep from "reasoning"
+import deductive_reasoning, inductive_reasoning from "reasoning"
+import abductive_reasoning, causal_reasoning from "reasoning"
+import resolve_conflict, accumulate_evidence from "reasoning"
+
+import VerificationPhase, PhaseStatus, PhaseResult from "verification"
+import dependency_gate, build_gate, test_gate from "verification"
+import lint_gate, security_gate, completion_gate from "verification"
+
+import ToolCapability, ToolResult from "tools"
+import tool_input_verify, tool_permission_check from "tools"
+import tool_output_verify from "tools"
+
+import MemoryFact, CompactionResult from "context"
+import memory_extraction, compaction_verify, vlt_storage from "context"
+import session_facts from "context"
+
+/// ---------- Loop Termination Reasons ----------
+
+enum LoopTermination {
+    VALIDATED,
+    BUDGET_EXHAUSTED,
+    MAX_ITERATIONS,
+    VERIFICATION_PASSED,
+    USER_CANCEL,
+    ERROR
+}
+
+/// ---------- Query State ----------
+
+type QueryState {
+    query: string,
+    domain: string,
+    tier: string,
+    iteration: int,
+    max_iterations: int,
+    h_score: float,
+    answer: string,
+    verified: bool,
+    termination: LoopTermination
+}
+
+/// ---------- Loop Event ----------
+
+type LoopEvent {
+    event_type: string,
+    phase: ThinkingPhase,
+    content: string,
+    iteration: int,
+    h_score: float,
+    timestamp: float
+}
+
+/// ---------- Cognitive Loop Gate ----------
+/// The loop itself must pass H-Score validation before delivering output
+
+gate loop_output_verify(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.50
+    require data.domain != "unknown"
+    validate answer_non_empty
+    validate h_score_threshold_met
+}
+
+/// ---------- Verification-Required Gate ----------
+/// For code tasks, output MUST pass the full verification pipeline
+
+gate code_verified_output(data: validated[NRSIData]) -> trusted[NRSIData] {
+    require confidence >= 0.85
+    validate verification_pipeline_passed
+    validate all_tests_green
+    validate no_critical_findings
+}
+
+/// ---------- Loop Orchestration Functions ----------
+
+fn initialize_loop(query: string, domain: string, tier: string) -> raw[NRSIData] {
+    let state = enter_analyze(query, tier)
+    return state
+}
+
+fn should_continue(state: QueryState) -> bool {
+    let MAX_ITERATIONS = 5
+    let MIN_CONFIDENCE = 0.75
+
+    if state.iteration >= MAX_ITERATIONS {
+        return false
+    }
+    if state.confidence >= MIN_CONFIDENCE and state.iteration >= 1 {
+        return false
+    }
+    if state.verified == true {
+        return false
+    }
+    let budget = tier_budget(state.tier)
+    if state.tokens_used >= budget {
+        return false
+    }
+    return true
+}
+
+fn select_reasoning_strategy(query: string, domain: string) -> ReasoningStrategy {
+    let query_lower = query.lower()
+
+    let causal_signals = ["why", "cause", "because", "leads to", "result of", "effect"]
+    for sig in causal_signals {
+        if sig in query_lower {
+            return ReasoningStrategy.CAUSAL
+        }
+    }
+
+    let inductive_signals = ["pattern", "trend", "usually", "most", "often", "generally", "data shows"]
+    for sig in inductive_signals {
+        if sig in query_lower {
+            return ReasoningStrategy.INDUCTIVE
+        }
+    }
+
+    let abductive_signals = ["explain", "hypothesis", "might be", "could be", "best explanation", "diagnose"]
+    for sig in abductive_signals {
+        if sig in query_lower {
+            return ReasoningStrategy.ABDUCTIVE
+        }
+    }
+
+    let analogical_signals = ["similar to", "like", "analogy", "compare", "resembles", "parallel"]
+    for sig in analogical_signals {
+        if sig in query_lower {
+            return ReasoningStrategy.ANALOGICAL
+        }
+    }
+
+    let deductive_domains = ["mathematical", "legal", "logical", "formal"]
+    if domain in deductive_domains {
+        return ReasoningStrategy.DEDUCTIVE
+    }
+
+    let causal_domains = ["medical", "healthcare", "telecom", "engineering"]
+    if domain in causal_domains {
+        return ReasoningStrategy.CAUSAL
+    }
+
+    return ReasoningStrategy.DEDUCTIVE
+}
+
+fn run_iteration(query: string, domain: string, iteration: int) -> validated[NRSIData] {
+    let plan = enter_plan(query, domain)
+    let execution = enter_execute(query, domain)
+    let validated = enter_validate(query, query)
+    return validated
+}
+
+fn finalize_loop(answer: string, h_score: float, domain: string) -> validated[NRSIData] {
+    let synthesis = enter_synthesize(answer, domain)
+    return synthesis
+}
+
+/// ---------- Lobe: Cognitive Processing ----------
+/// The cognitive loop as a first-class processing lobe
+
+lobe cognitive {
+    processor orchestrate(query: string, domain: string) -> validated[NRSIData] {
+        let strategy = select_reasoning_strategy(query, domain)
+        let tier = "T2"
+        let state = QueryState {
+            query: query,
+            domain: domain,
+            tier: tier,
+            iteration: 0,
+            confidence: 0.0,
+            verified: false,
+            tokens_used: 0
+        }
+        let best_result = nil
+        let iteration = 0
+        while should_continue(state) {
+            let iter_result = run_iteration(query, domain, iteration)
+            best_result = iter_result
+            state.iteration = iteration + 1
+            iteration = iteration + 1
+        }
+        if best_result == nil {
+            best_result = raw(query, domain)
+        }
+        return loop_output_verify(best_result)
+    }
+
+    processor verify_code(project: string, language: string) -> trusted[NRSIData] {
+        let deps = check_dependencies(project)
+        let build = run_build(project, language)
+        let tests = run_tests(project, language)
+        let lint = run_lint(project, language)
+        let security = run_security_scan(project, language)
+        let results = {
+            "dependencies": deps,
+            "build": build,
+            "tests": tests,
+            "lint": lint,
+            "security": security,
+            "language": language,
+            "project": project
+        }
+        let state = raw(to_string(results), "code")
+        let validated = factual_verify(state)
+        return code_verified_output(validated)
+    }
+
+    processor reason(query: string, strategy: string) -> validated[NRSIData] {
+        let selected = select_reasoning_strategy(query, "general")
+        let reasoning_context = {
+            "query": query,
+            "strategy": to_string(selected),
+            "requested_strategy": strategy
+        }
+        let data = raw(to_string(reasoning_context), "reasoning")
+        return factual_verify(data)
+    }
+}
+
+export LoopTermination, QueryState, LoopEvent
+export loop_output_verify, code_verified_output
+export initialize_loop, should_continue, select_reasoning_strategy
+export run_iteration, finalize_loop
+export cognitive

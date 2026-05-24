@@ -1,0 +1,57 @@
+/// NRSI Belief Revision — AGM Postulates as Axioms
+///
+/// Declares the AGM belief revision postulates as formal norms
+/// constraining how the system updates its beliefs.
+
+module revision
+
+import NRSIData from "types"
+
+/// ---------- AGM Postulates as Axioms ----------
+
+belief base agm_postulates {
+    entrenchment: axiomatic
+
+    axiom "closure: belief set is closed under logical consequence" tier: T0_AXIOM
+    axiom "success: new information is always included in revised set" tier: T0_AXIOM
+    axiom "inclusion: if not contradicting, revision is expansion" tier: T0_AXIOM
+    axiom "vacuity: if belief is consistent with new info, no removal needed" tier: T0_AXIOM
+    axiom "consistency: revised belief set is consistent if new info is consistent" tier: T0_AXIOM
+    axiom "extensionality: logically equivalent inputs yield same revision" tier: T0_AXIOM
+    axiom "minimal_change: revision removes as little as possible" tier: T0_AXIOM
+}
+
+/// ---------- Revision Norms ----------
+
+norm immutable_t0_axioms {
+    type: prohibition,
+    scope: global,
+    action: "revise_t0_axiom",
+    priority: 100,
+    condition: true
+}
+
+norm entrenchment_ordering {
+    type: obligation,
+    scope: global,
+    action: "respect_entrenchment",
+    priority: 90,
+    condition: true
+}
+
+norm revision_requires_evidence {
+    type: obligation,
+    scope: global,
+    action: "provide_evidence_for_revision",
+    priority: 85,
+    condition: true
+}
+
+/// ---------- Revision Gate ----------
+
+gate belief_revision(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.70
+    validate no_t0_violation
+    validate minimal_change
+    validate consistency_preserved
+}

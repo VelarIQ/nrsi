@@ -1,0 +1,378 @@
+/// NRSI Plasticity — Adaptive thresholds and weights without retraining.
+///
+/// Complete conversion of `nrsip/nrs_plasticity.py`.
+
+module plasticity
+
+import time from "std/time"
+import math from "std/math"
+
+/// ── Enumerations ────────────────────────────────────────────────────────
+
+enum PlasticityType {
+    HEBBIAN,
+    HOMEOSTATIC,
+    STRUCTURAL
+}
+
+/// ── Data Types ──────────────────────────────────────────────────────────
+
+type AdaptationEvent {
+    plasticity_type: PlasticityType,
+    target: string,
+    parameter: string,
+    old_value: float,
+    new_value: float,
+    reason: string,
+    timestamp: float
+}
+
+fn new_adaptation_event(plasticity_type: PlasticityType, target: string, parameter: string, old_value: float, new_value: float, reason: string) -> AdaptationEvent {
+    return AdaptationEvent {
+        plasticity_type: plasticity_type,
+        target: target,
+        parameter: parameter,
+        old_value: old_value,
+        new_value: new_value,
+        reason: reason,
+        timestamp: time.time()
+    }
+}
+
+fn adaptation_event_delta(ev: AdaptationEvent) -> float {
+    return ev.new_value - ev.old_value
+}
+
+/// ── Adaptive Threshold ─────────────────────────────────────────────────
+/// Threshold that adjusts homeostatically to maintain a target pass rate.
+
+class AdaptiveThreshold {
+    fn new(name: string, initial: float, target_pass_rate: float = 0.8, learning_rate: float = 0.01, min_value: float = 0.0, max_value: float = 1.0, window_size: int = 100) -> AdaptiveThreshold {
+        let t = AdaptiveThreshold {}
+        t._name = name
+        t._value = initial
+        t._initial = initial
+        t._target_pass_rate = target_pass_rate
+        t._learning_rate = learning_rate
+        t._min_value = min_value
+        t._max_value = max_value
+        t._window_size = window_size
+        t._history = []
+        t._total_records = 0
+        t._total_passes = 0
+        return t
+    }
+
+    fn value(self) -> float {
+        return self._value
+    }
+
+    fn current_pass_rate(self) -> float {
+        if len(self._history) == 0 {
+            return 0.0
+        }
+        let total = 0.0
+        for passed in self._history {
+            if passed {
+                total += 1.0
+            }
+        }
+        return total / len(self._history)
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        return {
+            "name": self._name,
+            "value": self._value,
+            "initial": self._initial,
+            "target_pass_rate": self._target_pass_rate,
+            "current_pass_rate": self.current_pass_rate(),
+            "learning_rate": self._learning_rate,
+            "window_size": self._window_size,
+            "history_length": len(self._history),
+            "total_records": self._total_records,
+            "total_passes": self._total_passes
+        }
+    }
+
+    fn record(self, passed: bool, value: float) -> Optional[AdaptationEvent] {
+        self._history.append(passed)
+        if len(self._history) > self._window_size {
+            self._history = self._history[len(self._history) - self._window_size:]
+        }
+        self._total_records += 1
+        if passed {
+            self._total_passes += 1
+        }
+
+        let min_required = 10
+        if self._window_size < 10 {
+            min_required = self._window_size
+        }
+        if len(self._history) < min_required {
+            return None
+        }
+
+        let current_rate = self.current_pass_rate()
+        let error = current_rate - self._target_pass_rate
+        let old_value = self._value
+
+        let adjustment = error * self._learning_rate
+        let new_val = self._value + adjustment
+        if new_val < self._min_value {
+            new_val = self._min_value
+        }
+        if new_val > self._max_value {
+            new_val = self._max_value
+        }
+        self._value = new_val
+
+        let diff = self._value - old_value
+        if diff < 0.0 { diff = -diff }
+        if diff < 1e-10 {
+            return None
+        }
+
+        return new_adaptation_event(
+            PlasticityType.HOMEOSTATIC,
+            self._name,
+            "threshold",
+            old_value,
+            self._value,
+            "pass_rate=" + str(current_rate) + ", target=" + str(self._target_pass_rate) + ", error=" + str(error)
+        )
+    }
+
+    fn check(self, value: float) -> bool {
+        return value >= self._value
+    }
+
+    fn reset(self) -> void {
+        self._value = self._initial
+        self._history = []
+        self._total_records = 0
+        self._total_passes = 0
+    }
+}
+
+/// ── Adaptive Weight ────────────────────────────────────────────────────
+/// Weight that strengthens on success and weakens on failure (Hebbian).
+
+class AdaptiveWeight {
+    fn new(name: string, initial: float = 1.0, learning_rate: float = 0.05, min_weight: float = 0.1, max_weight: float = 5.0, decay_rate: float = 0.001) -> AdaptiveWeight {
+        let w = AdaptiveWeight {}
+        w._name = name
+        w._value = initial
+        w._initial = initial
+        w._learning_rate = learning_rate
+        w._min_weight = min_weight
+        w._max_weight = max_weight
+        w._decay_rate = decay_rate
+        w._total_reinforcements = 0
+        w._successes = 0
+        return w
+    }
+
+    fn value(self) -> float {
+        return self._value
+    }
+
+    fn success_rate(self) -> float {
+        if self._total_reinforcements == 0 {
+            return 0.0
+        }
+        return self._successes / self._total_reinforcements
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        return {
+            "name": self._name,
+            "value": self._value,
+            "initial": self._initial,
+            "learning_rate": self._learning_rate,
+            "decay_rate": self._decay_rate,
+            "total_reinforcements": self._total_reinforcements,
+            "successes": self._successes,
+            "success_rate": self.success_rate()
+        }
+    }
+
+    fn reinforce(self, success: bool, magnitude: float) -> AdaptationEvent {
+        self._total_reinforcements += 1
+        let old_value = self._value
+        let delta = self._learning_rate * magnitude
+        let reason = ""
+        if success {
+            self._successes += 1
+            let new_val = self._value + delta
+            if new_val > self._max_weight {
+                new_val = self._max_weight
+            }
+            self._value = new_val
+            reason = "success reinforcement, magnitude=" + str(magnitude)
+        } else {
+            let new_val = self._value - delta
+            if new_val < self._min_weight {
+                new_val = self._min_weight
+            }
+            self._value = new_val
+            reason = "failure penalty, magnitude=" + str(magnitude)
+        }
+        return new_adaptation_event(
+            PlasticityType.HEBBIAN,
+            self._name,
+            "weight",
+            old_value,
+            self._value,
+            reason
+        )
+    }
+
+    fn apply_decay(self) -> Optional[AdaptationEvent] {
+        if self._decay_rate <= 0.0 {
+            return None
+        }
+        let old_value = self._value
+        let decay_amount = self._value * self._decay_rate
+        let new_val = self._value - decay_amount
+        if new_val < self._min_weight {
+            new_val = self._min_weight
+        }
+        self._value = new_val
+
+        let diff = self._value - old_value
+        if diff < 0.0 { diff = -diff }
+        if diff < 1e-10 {
+            return None
+        }
+
+        return new_adaptation_event(
+            PlasticityType.STRUCTURAL,
+            self._name,
+            "weight",
+            old_value,
+            self._value,
+            "decay_rate=" + str(self._decay_rate) + ", amount=" + str(decay_amount)
+        )
+    }
+}
+
+/// ── Plasticity Manager ─────────────────────────────────────────────────
+/// Central registry for adaptive thresholds and weights.
+
+class PlasticityManager {
+    fn __init__(self) {
+        self._thresholds = {}
+        self._weights = {}
+        self._events = []
+    }
+
+    fn add_threshold(self, name: string, initial: float, target_pass_rate: float = 0.8, learning_rate: float = 0.01, min_value: float = 0.0, max_value: float = 1.0, window_size: int = 100) -> AdaptiveThreshold {
+        let threshold = AdaptiveThreshold.new(name, initial, target_pass_rate, learning_rate, min_value, max_value, window_size)
+        self._thresholds[name] = threshold
+        return threshold
+    }
+
+    fn add_weight(self, name: string, initial: float = 1.0, learning_rate: float = 0.05, min_weight: float = 0.1, max_weight: float = 5.0, decay_rate: float = 0.001) -> AdaptiveWeight {
+        let weight = AdaptiveWeight.new(name, initial, learning_rate, min_weight, max_weight, decay_rate)
+        self._weights[name] = weight
+        return weight
+    }
+
+    fn record_outcome(self, threshold_name: string, passed: bool, value: float) -> Optional[AdaptationEvent] {
+        let threshold = self._thresholds.get(threshold_name)
+        if threshold == None {
+            raise KeyError("Threshold '" + threshold_name + "' not found")
+        }
+        let event = threshold.record(passed, value)
+        if event != None {
+            self._events.append(event)
+        }
+        return event
+    }
+
+    fn reinforce_weight(self, weight_name: string, success: bool, magnitude: float) -> Optional[AdaptationEvent] {
+        let weight = self._weights.get(weight_name)
+        if weight == None {
+            raise KeyError("Weight '" + weight_name + "' not found")
+        }
+        let event = weight.reinforce(success, magnitude)
+        self._events.append(event)
+        return event
+    }
+
+    fn get_threshold(self, name: string) -> AdaptiveThreshold {
+        if name not in self._thresholds {
+            raise KeyError("Threshold '" + name + "' not found")
+        }
+        return self._thresholds[name]
+    }
+
+    fn get_weight(self, name: string) -> AdaptiveWeight {
+        if name not in self._weights {
+            raise KeyError("Weight '" + name + "' not found")
+        }
+        return self._weights[name]
+    }
+
+    fn check_threshold(self, name: string, value: float) -> bool {
+        return self.get_threshold(name).check(value)
+    }
+
+    fn decay_all_weights(self) -> List[any] {
+        let events: List[AdaptationEvent] = []
+        for name in self._weights {
+            let weight = self._weights[name]
+            let event = weight.apply_decay()
+            if event != None {
+                events.append(event)
+                self._events.append(event)
+            }
+        }
+        return events
+    }
+
+    fn events(self) -> List[any] {
+        let copy = []
+        for ev in self._events {
+            copy.append(ev)
+        }
+        return copy
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        let threshold_stats = {}
+        for n in self._thresholds {
+            threshold_stats[n] = self._thresholds[n].stats()
+        }
+        let weight_stats = {}
+        for n in self._weights {
+            weight_stats[n] = self._weights[n].stats()
+        }
+
+        let events_by_type = {}
+        let type_names = ["HEBBIAN", "HOMEOSTATIC", "STRUCTURAL"]
+        for tname in type_names {
+            let count = 0
+            for e in self._events {
+                if str(e.plasticity_type) == tname {
+                    count += 1
+                }
+            }
+            events_by_type[tname] = count
+        }
+
+        return {
+            "thresholds": threshold_stats,
+            "weights": weight_stats,
+            "total_events": len(self._events),
+            "events_by_type": events_by_type
+        }
+    }
+}
+
+/// ── Exports ─────────────────────────────────────────────────────────────
+
+export PlasticityType, AdaptationEvent
+export new_adaptation_event, adaptation_event_delta
+export AdaptiveThreshold, AdaptiveWeight, PlasticityManager

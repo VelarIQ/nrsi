@@ -1,0 +1,186 @@
+/// NRSI Mode Classifier — Processing mode classification, confidence, and decision ID.
+///
+/// Classifies queries into DETERMINISTIC, PROBABILISTIC, or HYBRID modes
+/// based on signal words, domain risk, and policy constraints.
+///
+/// Ported from nrsip/mode_classifier.py.
+
+module mode_classifier
+
+import hashlib from "std/hashlib"
+import json from "std/json"
+
+/// ── Processing Mode ──
+
+enum ProcessingMode {
+    DETERMINISTIC = "DETERMINISTIC",
+    PROBABILISTIC = "PROBABILISTIC",
+    HYBRID = "HYBRID"
+}
+
+/// ── Mode Policy ──
+
+type ModePolicy {
+    high_risk_domains: List[string],
+    allow_probabilistic_in_high_risk: bool,
+    probabilistic_confidence_floor: float,
+    allow_context_override: bool,
+    policy_version: string
+}
+
+fn default_policy() -> ModePolicy {
+    return ModePolicy {
+        high_risk_domains: [ "medical", "legal", "financial", "safety" ],
+        allow_probabilistic_in_high_risk: false,
+        probabilistic_confidence_floor: 0.2,
+        allow_context_override: true,
+        policy_version: "1.0.0"
+    }
+}
+
+/// ── Signal Sets ──
+
+let CREATIVE_SIGNALS = {
+    "creative", "brainstorm", "imagine", "explore", "generate", "poem", "story"
+}
+
+let FACTUAL_SIGNALS = {
+    "fact", "verify", "calculate", "prove", "lookup", "exact", "deterministic"
+}
+
+/// ── Classify Mode ──
+
+fn classify_mode(query: string, domain: string, context_override: string,
+                 policy: Optional[ModePolicy]) -> Tuple[ProcessingMode, Map[string, any]] {
+    let p = policy
+    if p == nil {
+        p = default_policy()
+    }
+    let query_lower = query.lower()
+    let tokens = set()
+    for w in query_lower.split(" ") {
+        tokens.add(w)
+    }
+
+    let has_creative = false
+    for s in CREATIVE_SIGNALS {
+        if tokens.contains(s) {
+            has_creative = true
+            break
+        }
+    }
+
+    let has_factual = false
+    for s in FACTUAL_SIGNALS {
+        if tokens.contains(s) {
+            has_factual = true
+            break
+        }
+    }
+
+    let is_high_risk = false
+    if domain != "" {
+        let domain_lower = domain.lower()
+        for hr in p.high_risk_domains {
+            if domain_lower == hr {
+                is_high_risk = true
+                break
+            }
+        }
+    }
+
+    let inputs = {
+        "policy_version": p.policy_version,
+        "has_creative_signal": has_creative,
+        "has_factual_signal": has_factual,
+        "high_risk_domain": is_high_risk,
+        "domain": domain
+    }
+
+    if context_override != "" {
+        if p.allow_context_override {
+            let override_lower = context_override.lower()
+            if override_lower == "deterministic" {
+                inputs["override"] = context_override
+                inputs["mode_decision_reason"] = "explicit_mode_override"
+                return Tuple(ProcessingMode.DETERMINISTIC, inputs)
+            }
+            if override_lower == "probabilistic" {
+                inputs["override"] = context_override
+                inputs["mode_decision_reason"] = "explicit_mode_override"
+                return Tuple(ProcessingMode.PROBABILISTIC, inputs)
+            }
+            if override_lower == "hybrid" {
+                inputs["override"] = context_override
+                inputs["mode_decision_reason"] = "explicit_mode_override"
+                return Tuple(ProcessingMode.HYBRID, inputs)
+            }
+        }
+    }
+
+    if is_high_risk {
+        if has_creative {
+            if p.allow_probabilistic_in_high_risk {
+                inputs["mode_decision_reason"] = "high_risk_hybrid_creative_allowed"
+                return Tuple(ProcessingMode.HYBRID, inputs)
+            }
+        }
+        inputs["mode_decision_reason"] = "high_risk_deterministic_required"
+        return Tuple(ProcessingMode.DETERMINISTIC, inputs)
+    }
+
+    if has_creative {
+        if !has_factual {
+            inputs["mode_decision_reason"] = "creative_signal_probabilistic"
+            return Tuple(ProcessingMode.PROBABILISTIC, inputs)
+        }
+    }
+
+    if has_factual {
+        if !has_creative {
+            inputs["mode_decision_reason"] = "factual_signal_deterministic"
+            return Tuple(ProcessingMode.DETERMINISTIC, inputs)
+        }
+    }
+
+    if has_creative {
+        if has_factual {
+            inputs["mode_decision_reason"] = "mixed_signals_hybrid"
+            return Tuple(ProcessingMode.HYBRID, inputs)
+        }
+    }
+
+    inputs["mode_decision_reason"] = "default_hybrid"
+    return Tuple(ProcessingMode.HYBRID, inputs)
+}
+
+/// ── Compute Confidence ──
+
+fn compute_confidence(mode: ProcessingMode, query: string) -> float {
+    let base = 0.7
+    if mode == ProcessingMode.DETERMINISTIC {
+        base = 0.95
+    } else if mode == ProcessingMode.PROBABILISTIC {
+        base = 0.6
+    }
+    let length_factor = to_float(query.len()) / 200.0
+    if length_factor > 0.1 {
+        length_factor = 0.1
+    }
+    let result = base + length_factor
+    if result > 1.0 {
+        result = 1.0
+    }
+    return result
+}
+
+/// ── Mode Decision ID ──
+
+fn mode_decision_id(mode_inputs: Map[string, any]) -> string {
+    let canonical = json.dumps(mode_inputs, true)
+    return hashlib.sha256(canonical).hexdigest().slice(0, 16)
+}
+
+export ProcessingMode, ModePolicy, default_policy
+export CREATIVE_SIGNALS, FACTUAL_SIGNALS
+export classify_mode, compute_confidence, mode_decision_id

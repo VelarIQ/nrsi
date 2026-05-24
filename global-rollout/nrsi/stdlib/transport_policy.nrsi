@@ -1,0 +1,177 @@
+/// NRSIP transport policy: centralized configuration for all integrity controls.
+///
+/// Full implementation of `nrsip/transport_policy.py`.
+/// Defines the security posture for a deployment region.
+
+module transport_policy
+
+/// ---------- TransportPolicy ----------
+
+type TransportPolicy {
+    oqs_strict: bool,
+    allowed_bundles: FrozenSet[string],
+    min_bundle: string,
+    require_pq: bool,
+    replay_ttl_seconds: float,
+    sequence_window: int,
+    max_packet_age_ms: int,
+    max_clock_skew_ms: int,
+    max_ttl_hops: int,
+    min_ttl_hops: int,
+    required_tier: string,
+    session_ttl_seconds: int,
+    key_rotation_interval_seconds: int,
+    rate_limit_rps: int,
+    circuit_breaker_threshold: int,
+    circuit_breaker_reset_seconds: float,
+    canary_percentage: int
+}
+
+fn default_transport_policy() -> TransportPolicy {
+    return TransportPolicy {
+        oqs_strict: true,
+        allowed_bundles: frozenset(["MLKEM1024_X25519_DILITHIUM3", "MLKEM768_X25519_DILITHIUM2"]),
+        min_bundle: "MLKEM768_X25519_DILITHIUM2",
+        require_pq: true,
+        replay_ttl_seconds: 300.0,
+        sequence_window: 1024,
+        max_packet_age_ms: 60000,
+        max_clock_skew_ms: 20000,
+        max_ttl_hops: 8,
+        min_ttl_hops: 1,
+        required_tier: "T1",
+        session_ttl_seconds: 900,
+        key_rotation_interval_seconds: 86400,
+        rate_limit_rps: 1000,
+        circuit_breaker_threshold: 5,
+        circuit_breaker_reset_seconds: 30.0,
+        canary_percentage: 5
+    }
+}
+
+/// ---------- Preset policies ----------
+
+let OQS_STRICT_POLICY = TransportPolicy {
+    oqs_strict: true,
+    allowed_bundles: frozenset(["MLKEM1024_X25519_DILITHIUM3", "MLKEM768_X25519_DILITHIUM2"]),
+    min_bundle: "MLKEM768_X25519_DILITHIUM2",
+    require_pq: true,
+    replay_ttl_seconds: 300.0,
+    sequence_window: 1024,
+    max_packet_age_ms: 60000,
+    max_clock_skew_ms: 20000,
+    max_ttl_hops: 8,
+    min_ttl_hops: 1,
+    required_tier: "T1",
+    session_ttl_seconds: 900,
+    key_rotation_interval_seconds: 86400,
+    rate_limit_rps: 1000,
+    circuit_breaker_threshold: 5,
+    circuit_breaker_reset_seconds: 30.0,
+    canary_percentage: 5
+}
+
+let PERMISSIVE_POLICY = TransportPolicy {
+    oqs_strict: false,
+    allowed_bundles: frozenset([
+        "MLKEM1024_X25519_DILITHIUM3",
+        "MLKEM768_X25519_DILITHIUM2",
+        "X25519_ED25519"
+    ]),
+    min_bundle: "MLKEM768_X25519_DILITHIUM2",
+    require_pq: false,
+    replay_ttl_seconds: 300.0,
+    sequence_window: 1024,
+    max_packet_age_ms: 60000,
+    max_clock_skew_ms: 20000,
+    max_ttl_hops: 8,
+    min_ttl_hops: 1,
+    required_tier: "T1",
+    session_ttl_seconds: 900,
+    key_rotation_interval_seconds: 86400,
+    rate_limit_rps: 1000,
+    circuit_breaker_threshold: 5,
+    circuit_breaker_reset_seconds: 30.0,
+    canary_percentage: 5
+}
+
+/// ---------- TransportPolicyEnforcer ----------
+
+class TransportPolicyEnforcer {
+    fn new(self, policy: Optional[TransportPolicy]) {
+        if policy != None {
+            self.policy = policy
+        } else {
+            self.policy = OQS_STRICT_POLICY
+        }
+    }
+
+    fn validate_bundle(self, bundle: string) -> Dict[string, Any] {
+        let ok = bundle in self.policy.allowed_bundles
+        let reason = ""
+        if !ok {
+            reason = "bundle " + bundle + " not in allowed set"
+        }
+        if self.policy.require_pq and !starts_with(bundle, "MLKEM") {
+            ok = false
+            reason = "PQ required but " + bundle + " is not MLKEM-based"
+        }
+        return {"allowed": ok, "reason": reason, "bundle": bundle}
+    }
+
+    fn select_best_bundle(self, offered: List[string]) -> string {
+        let preferred = [
+            "MLKEM1024_X25519_DILITHIUM3",
+            "MLKEM768_X25519_DILITHIUM2"
+        ]
+        for pref in preferred {
+            if pref in offered and pref in self.policy.allowed_bundles {
+                return pref
+            }
+        }
+        for b in offered {
+            if b in self.policy.allowed_bundles {
+                return b
+            }
+        }
+        raise ValueError("no acceptable bundle offered")
+    }
+
+    fn validate_clock_skew(self, client_time_ms: int, now_ms: int) -> Dict[string, Any] {
+        let skew = abs(now_ms - client_time_ms)
+        let ok = skew <= self.policy.max_clock_skew_ms
+        return {
+            "allowed": ok,
+            "skew_ms": skew,
+            "max_ms": self.policy.max_clock_skew_ms
+        }
+    }
+
+    fn validate_ttl(self, ttl_hops: int) -> Dict[string, Any] {
+        let ok = self.policy.min_ttl_hops <= ttl_hops and ttl_hops <= self.policy.max_ttl_hops
+        return {"allowed": ok, "ttl_hops": ttl_hops}
+    }
+
+    fn to_config_dict(self) -> Dict[string, Any] {
+        return {
+            "oqs_strict": self.policy.oqs_strict,
+            "allowed_bundles": sorted(self.policy.allowed_bundles),
+            "min_bundle": self.policy.min_bundle,
+            "require_pq": self.policy.require_pq,
+            "replay_ttl_seconds": self.policy.replay_ttl_seconds,
+            "sequence_window": self.policy.sequence_window,
+            "max_packet_age_ms": self.policy.max_packet_age_ms,
+            "max_clock_skew_ms": self.policy.max_clock_skew_ms,
+            "max_ttl_hops": self.policy.max_ttl_hops,
+            "required_tier": self.policy.required_tier,
+            "session_ttl_seconds": self.policy.session_ttl_seconds,
+            "key_rotation_interval_seconds": self.policy.key_rotation_interval_seconds,
+            "rate_limit_rps": self.policy.rate_limit_rps,
+            "canary_percentage": self.policy.canary_percentage
+        }
+    }
+}
+
+export TransportPolicy, default_transport_policy
+export OQS_STRICT_POLICY, PERMISSIVE_POLICY
+export TransportPolicyEnforcer

@@ -1,0 +1,505 @@
+/// NRSI Metacognition — Governance, Audit & Safety Gates.
+///
+/// Three responsibilities:
+///
+/// 1. **Audit Spine** — every metacognitive decision (plan, critique,
+///    lesson, policy delta) is recorded with evidence IDs and provenance
+///    so the full chain is reconstructible.
+///
+/// 2. **Rollback Controller** — strategy policy changes are versioned and
+///    reversible.  A rollback replays inverse deltas and logs the reason.
+///
+/// 3. **Safety Gates** — enforce hard boundaries that aggressive learning
+///    must never cross, regardless of lesson confidence:
+///    - high-risk domain policy cannot be auto-adapted.
+///    - refusal thresholds cannot be lowered.
+///    - validation bypasses are forbidden.
+///    - transport integrity rules are immutable.
+
+module metacognition_governance
+
+from "metacognition_types" import CritiqueVerdict, LessonRecord, PolicyDelta, ProcessingMode, ReasoningPlan, SafetyClass, SelfAssessment, StrategyPolicySnapshot, _now_ms, _uid, policy_delta_new, policy_delta_to_dict
+
+/// ── Audit Event Types ──────────────────────────────────────────────
+
+enum AuditEventType {
+    PLAN_CREATED = "plan_created",
+    CRITIQUE_COMPLETED = "critique_completed",
+    REVISION_TRIGGERED = "revision_triggered",
+    CLARIFICATION_SENT = "clarification_sent",
+    ANSWER_FINALIZED = "answer_finalized",
+    REFUSAL_ISSUED = "refusal_issued",
+    LESSON_EXTRACTED = "lesson_extracted",
+    POLICY_DELTA_APPLIED = "policy_delta_applied",
+    POLICY_DELTA_REJECTED = "policy_delta_rejected",
+    POLICY_ROLLBACK = "policy_rollback",
+    SAFETY_GATE_BLOCKED = "safety_gate_blocked",
+    HUMAN_REVIEW_QUEUED = "human_review_queued"
+}
+
+/// ── Audit Record ───────────────────────────────────────────────────
+
+type AuditRecord {
+    record_id: string,
+    event_type: AuditEventType,
+    session_id: string,
+    user_id: string,
+    episode_id: string,
+    description: string,
+    evidence_ids: List[string],
+    payload: Dict[string, Any],
+    safety_class: SafetyClass,
+    timestamp_ms: int
+}
+
+fn audit_record_new(event_type: AuditEventType, user_id: string,
+                    description: string) -> AuditRecord {
+    return AuditRecord {
+        record_id: _uid("aud-"),
+        event_type: event_type,
+        session_id: "",
+        user_id: user_id,
+        episode_id: "",
+        description: description,
+        evidence_ids: [],
+        payload: {},
+        safety_class: SafetyClass.AUTO_ADAPTIVE,
+        timestamp_ms: _now_ms()
+    }
+}
+
+fn audit_record_to_dict(r: AuditRecord) -> Dict[string, Any] {
+    return {
+        "record_id": r.record_id,
+        "event_type": r.event_type.value,
+        "session_id": r.session_id,
+        "user_id": r.user_id,
+        "episode_id": r.episode_id,
+        "description": r.description,
+        "evidence_ids": r.evidence_ids,
+        "payload": r.payload,
+        "safety_class": r.safety_class.value,
+        "timestamp_ms": r.timestamp_ms
+    }
+}
+
+/// ── Audit Spine ────────────────────────────────────────────────────
+
+class AuditSpine {
+    fn __init__(self, max_records: int) {
+        if max_records == None {
+            max_records = 10000
+        }
+        self._log: List[AuditRecord] = []
+        self._max = max_records
+    }
+
+    fn record(self, event: AuditRecord) {
+        self._log.append(event)
+        if len(self._log) > self._max {
+            let start = len(self._log) - self._max
+            let trimmed: List[AuditRecord] = []
+            for i in range(start, len(self._log)) {
+                trimmed.append(self._log[i])
+            }
+            self._log = trimmed
+        }
+    }
+
+    fn record_plan(self, plan: ReasoningPlan, user_id: string,
+                   episode_id: string) {
+        let ar = audit_record_new(AuditEventType.PLAN_CREATED, user_id,
+            "Plan " + plan.plan_id + ": mode=" + plan.chosen_mode.value +
+            ", steps=" + str(len(plan.steps)) +
+            ", confidence=" + str(round(plan.planner_confidence, 2)))
+        ar.session_id = plan.session_id
+        ar.episode_id = episode_id
+        ar.evidence_ids = [plan.plan_id]
+        ar.payload = plan.to_dict()
+        self.record(ar)
+    }
+
+    fn record_critique(self, assessment: SelfAssessment, user_id: string,
+                       session_id: string, episode_id: string) {
+        let ar = audit_record_new(AuditEventType.CRITIQUE_COMPLETED, user_id,
+            "Critique round " + str(assessment.revision_round) +
+            ": verdict=" + assessment.verdict.value +
+            ", findings=" + str(len(assessment.critique_findings)) +
+            ", confidence=" + str(round(assessment.overall_confidence, 2)))
+        ar.session_id = session_id
+        ar.episode_id = episode_id
+        ar.evidence_ids = [assessment.assessment_id]
+        ar.payload = assessment.to_dict()
+        self.record(ar)
+    }
+
+    fn record_lesson(self, lesson: LessonRecord) {
+        let desc = lesson.description
+        if len(desc) > 100 {
+            desc = desc[:100]
+        }
+        let ar = audit_record_new(AuditEventType.LESSON_EXTRACTED, lesson.user_id,
+            "Lesson " + lesson.lesson_id + ": " + lesson.lesson_type + " — " + desc)
+        ar.episode_id = lesson.episode_id
+        ar.evidence_ids = lesson.evidence_ids
+        ar.payload = lesson.to_dict()
+        ar.safety_class = lesson.safety_class
+        self.record(ar)
+    }
+
+    fn record_policy_delta(self, delta: PolicyDelta, user_id: string,
+                           accepted: bool) {
+        let event_type = AuditEventType.POLICY_DELTA_APPLIED
+        if not accepted {
+            event_type = AuditEventType.POLICY_DELTA_REJECTED
+        }
+        let status = "accepted"
+        if not accepted {
+            status = "rejected"
+        }
+        let ar = audit_record_new(event_type, user_id,
+            "Delta: " + delta.field_changed + " " +
+            str(delta.old_value) + " -> " + str(delta.new_value) +
+            " (" + status + ")")
+        if delta.lesson_id != "" {
+            ar.evidence_ids = [delta.lesson_id]
+        }
+        ar.payload = policy_delta_to_dict(delta)
+        ar.safety_class = delta.safety_class
+        self.record(ar)
+    }
+
+    fn record_rollback(self, user_id: string, from_version: int,
+                       to_version: int, reason: string) {
+        let ar = audit_record_new(AuditEventType.POLICY_ROLLBACK, user_id,
+            "Rollback v" + str(from_version) + " -> v" + str(to_version) + ": " + reason)
+        ar.payload = {
+            "from_version": from_version,
+            "to_version": to_version,
+            "reason": reason
+        }
+        self.record(ar)
+    }
+
+    fn record_safety_block(self, user_id: string, gate_name: string,
+                           description: string,
+                           delta: Optional[PolicyDelta]) {
+        let ar = audit_record_new(AuditEventType.SAFETY_GATE_BLOCKED, user_id,
+            "Safety gate '" + gate_name + "' blocked: " + description)
+        if delta != None {
+            ar.payload = policy_delta_to_dict(delta)
+        }
+        ar.safety_class = SafetyClass.REVIEW_REQUIRED
+        self.record(ar)
+    }
+
+    fn query(self, user_id: string, event_type: Optional[AuditEventType],
+             limit: int) -> List[any] {
+        let results = self._log
+        if user_id != "" {
+            let filtered: List[AuditRecord] = []
+            for r in results {
+                if r.user_id == user_id {
+                    filtered.append(r)
+                }
+            }
+            results = filtered
+        }
+        if event_type != None {
+            let filtered: List[AuditRecord] = []
+            for r in results {
+                if r.event_type == event_type {
+                    filtered.append(r)
+                }
+            }
+            results = filtered
+        }
+        let start = max(0, len(results) - limit)
+        let sliced: List[AuditRecord] = []
+        let i = len(results) - 1
+        while i >= start and len(sliced) < limit {
+            sliced.append(results[i])
+            i -= 1
+        }
+        return sliced
+    }
+}
+
+/// ── Safety Gates ───────────────────────────────────────────────────
+
+let IMMUTABLE_FIELDS: Set[string] = {
+    "transport_integrity", "signing_policy", "hop_chain_validation",
+    "pqc_key_exchange", "replay_protection"
+}
+
+let HIGH_RISK_DOMAIN_LOCKOUT: Set[string] = {
+    "medical", "legal", "financial", "safety", "defense"
+}
+
+class SafetyGateResult {
+    fn __init__(self, allowed: bool, gate_name: string, reason: string) {
+        self.allowed = allowed
+        self.gate_name = gate_name
+        self.reason = reason
+    }
+}
+
+class SafetyGateChain {
+    fn __init__(self, audit: AuditSpine) {
+        self.audit = audit
+    }
+
+    fn evaluate(self, delta: PolicyDelta, user_id: string,
+                current_strategy: StrategyPolicySnapshot) -> SafetyGateResult {
+        let result = self._gate_immutable_field(delta, user_id, current_strategy)
+        if not result.allowed {
+            self.audit.record_safety_block(user_id, result.gate_name, result.reason, delta)
+            return result
+        }
+
+        result = self._gate_review_required(delta, user_id, current_strategy)
+        if not result.allowed {
+            self.audit.record_safety_block(user_id, result.gate_name, result.reason, delta)
+            return result
+        }
+
+        result = self._gate_high_risk_domain(delta, user_id, current_strategy)
+        if not result.allowed {
+            self.audit.record_safety_block(user_id, result.gate_name, result.reason, delta)
+            return result
+        }
+
+        result = self._gate_refusal_threshold(delta, user_id, current_strategy)
+        if not result.allowed {
+            self.audit.record_safety_block(user_id, result.gate_name, result.reason, delta)
+            return result
+        }
+
+        result = self._gate_validation_bypass(delta, user_id, current_strategy)
+        if not result.allowed {
+            self.audit.record_safety_block(user_id, result.gate_name, result.reason, delta)
+            return result
+        }
+
+        result = self._gate_max_delta_magnitude(delta, user_id, current_strategy)
+        if not result.allowed {
+            self.audit.record_safety_block(user_id, result.gate_name, result.reason, delta)
+            return result
+        }
+
+        result = self._gate_delta_frequency(delta, user_id, current_strategy)
+        if not result.allowed {
+            self.audit.record_safety_block(user_id, result.gate_name, result.reason, delta)
+            return result
+        }
+
+        return SafetyGateResult(true, "all_passed", "")
+    }
+
+    fn _gate_immutable_field(self, delta: PolicyDelta, user_id: string,
+                             strategy: StrategyPolicySnapshot) -> SafetyGateResult {
+        let base_field = delta.field_changed.split(".")[0]
+        if base_field in IMMUTABLE_FIELDS {
+            return SafetyGateResult(false, "immutable_field",
+                "Field '" + delta.field_changed + "' is immutable (transport integrity)")
+        }
+        return SafetyGateResult(true, "immutable_field", "")
+    }
+
+    fn _gate_review_required(self, delta: PolicyDelta, user_id: string,
+                             strategy: StrategyPolicySnapshot) -> SafetyGateResult {
+        if delta.safety_class == SafetyClass.REVIEW_REQUIRED {
+            return SafetyGateResult(false, "review_required",
+                "Delta requires human review: " + delta.field_changed)
+        }
+        return SafetyGateResult(true, "review_required", "")
+    }
+
+    fn _gate_high_risk_domain(self, delta: PolicyDelta, user_id: string,
+                              strategy: StrategyPolicySnapshot) -> SafetyGateResult {
+        let field = delta.field_changed
+        if field.startswith("domain_mode_hints.") {
+            let domain = field.split(".", 1)[1]
+            if domain.lower() in HIGH_RISK_DOMAIN_LOCKOUT {
+                if delta.new_value != ProcessingMode.DETERMINISTIC.value {
+                    return SafetyGateResult(false, "high_risk_domain",
+                        "Cannot set non-deterministic mode for '" + domain + "'")
+                }
+            }
+        }
+        return SafetyGateResult(true, "high_risk_domain", "")
+    }
+
+    fn _gate_refusal_threshold(self, delta: PolicyDelta, user_id: string,
+                               strategy: StrategyPolicySnapshot) -> SafetyGateResult {
+        if delta.field_changed == "critique_strictness" {
+            if is_number(delta.new_value) and delta.new_value < 0.20 {
+                return SafetyGateResult(false, "refusal_threshold",
+                    "Critique strictness cannot go below 0.20 (got " + str(delta.new_value) + ")")
+            }
+        }
+        return SafetyGateResult(true, "refusal_threshold", "")
+    }
+
+    fn _gate_validation_bypass(self, delta: PolicyDelta, user_id: string,
+                               strategy: StrategyPolicySnapshot) -> SafetyGateResult {
+        let bypass_fields: Set[string] = {
+            "skip_validation", "bypass_hscore", "disable_povi",
+            "disable_tvs", "allow_unvalidated"
+        }
+        if delta.field_changed in bypass_fields {
+            return SafetyGateResult(false, "validation_bypass",
+                "Cannot disable validation via '" + delta.field_changed + "'")
+        }
+        return SafetyGateResult(true, "validation_bypass", "")
+    }
+
+    fn _gate_max_delta_magnitude(self, delta: PolicyDelta, user_id: string,
+                                 strategy: StrategyPolicySnapshot) -> SafetyGateResult {
+        if is_number(delta.old_value) and is_number(delta.new_value) {
+            let magnitude = abs(delta.new_value - delta.old_value)
+            if is_float(delta.old_value) and magnitude > 0.3 {
+                return SafetyGateResult(false, "max_delta_magnitude",
+                    "Delta magnitude " + str(round(magnitude, 2)) +
+                    " exceeds max 0.30 for '" + delta.field_changed + "'")
+            }
+        }
+        return SafetyGateResult(true, "max_delta_magnitude", "")
+    }
+
+    fn _gate_delta_frequency(self, delta: PolicyDelta, user_id: string,
+                             strategy: StrategyPolicySnapshot) -> SafetyGateResult {
+        let recent_window_ms = 60 * 60 * 1000
+        let cutoff = _now_ms() - recent_window_ms
+        let recent_count = 0
+        for d in strategy.deltas {
+            if d.field_changed == delta.field_changed and d.timestamp_ms > cutoff {
+                recent_count += 1
+            }
+        }
+        if recent_count >= 5 {
+            return SafetyGateResult(false, "delta_frequency",
+                "Field '" + delta.field_changed + "' changed " +
+                str(recent_count) + " times in the last hour")
+        }
+        return SafetyGateResult(true, "delta_frequency", "")
+    }
+}
+
+/// ── Rollback Controller ────────────────────────────────────────────
+
+class RollbackController {
+    fn __init__(self, audit: AuditSpine) {
+        self.audit = audit
+    }
+
+    fn rollback(self, strategy: StrategyPolicySnapshot,
+                target_version: int, reason: string) -> StrategyPolicySnapshot {
+        if target_version >= strategy.version {
+            return strategy
+        }
+
+        let from_version = strategy.version
+        let deltas_to_reverse = strategy.rollback_to(target_version)
+
+        for delta in deltas_to_reverse {
+            let inverse = policy_delta_new(
+                delta.field_changed, delta.new_value, delta.old_value,
+                delta.lesson_id, "rollback: " + reason,
+                delta.safety_class
+            )
+            self._apply_inverse(strategy, inverse)
+            strategy.apply_delta(inverse)
+        }
+
+        self.audit.record_rollback(
+            strategy.user_id, from_version, target_version, reason)
+        return strategy
+    }
+
+    fn _apply_inverse(self, strategy: StrategyPolicySnapshot,
+                      inverse: PolicyDelta) {
+        let field = inverse.field_changed
+        let value = inverse.new_value
+
+        let simple_fields: Set[string] = {
+            "verbosity_preference", "clarification_threshold",
+            "evidence_retrieval_threshold", "critique_strictness",
+            "revision_budget", "decomposition_preference",
+            "proactive_clarification"
+        }
+        if field in simple_fields {
+            if field == "verbosity_preference" {
+                strategy.verbosity_preference = value
+            } else if field == "clarification_threshold" {
+                strategy.clarification_threshold = value
+            } else if field == "evidence_retrieval_threshold" {
+                strategy.evidence_retrieval_threshold = value
+            } else if field == "critique_strictness" {
+                strategy.critique_strictness = value
+            } else if field == "revision_budget" {
+                strategy.revision_budget = value
+            } else if field == "decomposition_preference" {
+                strategy.decomposition_preference = value
+            } else if field == "proactive_clarification" {
+                strategy.proactive_clarification = value
+            }
+        } else if field.startswith("domain_mode_hints.") {
+            let domain = field.split(".", 1)[1]
+            if value == None {
+                strategy.domain_mode_hints.pop(domain, None)
+            } else {
+                strategy.domain_mode_hints[domain] = value
+            }
+        } else if field.startswith("routing_overrides.") {
+            let key = field.split(".", 1)[1]
+            if value == None {
+                strategy.routing_overrides.pop(key, None)
+            } else {
+                strategy.routing_overrides[key] = value
+            }
+        } else if field == "default_mode" {
+            if value != None {
+                strategy.default_mode = ProcessingMode(value)
+            } else {
+                strategy.default_mode = ProcessingMode.DETERMINISTIC
+            }
+        }
+    }
+}
+
+/// ── Governance Facade ──────────────────────────────────────────────
+
+class MetacognitionGovernance {
+    fn __init__(self) {
+        self.audit = AuditSpine(None)
+        self.safety = SafetyGateChain(self.audit)
+        self.rollback = RollbackController(self.audit)
+    }
+
+    fn check_delta(self, delta: PolicyDelta, user_id: string,
+                   strategy: StrategyPolicySnapshot) -> SafetyGateResult {
+        return self.safety.evaluate(delta, user_id, strategy)
+    }
+
+    fn apply_delta_if_safe(self, delta: PolicyDelta, user_id: string,
+                           strategy: StrategyPolicySnapshot) -> bool {
+        let result = self.check_delta(delta, user_id, strategy)
+        self.audit.record_policy_delta(delta, user_id, result.allowed)
+        return result.allowed
+    }
+
+    fn rollback_strategy(self, strategy: StrategyPolicySnapshot,
+                         target_version: int,
+                         reason: string) -> StrategyPolicySnapshot {
+        return self.rollback.rollback(strategy, target_version, reason)
+    }
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export AuditEventType, AuditRecord, AuditSpine
+export SafetyGateResult, SafetyGateChain
+export RollbackController
+export MetacognitionGovernance
+export IMMUTABLE_FIELDS, HIGH_RISK_DOMAIN_LOCKOUT

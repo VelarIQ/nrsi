@@ -1,0 +1,952 @@
+/// NRSI Metacognition — Engine (Planner, Self-Model, Critique, Revision).
+///
+/// Implements the full metacognitive control loop:
+///
+///     UserInput -> MemoryLoad -> EpisodicRecall -> GoalUpdate -> Plan
+///       -> StrategyCheck -> DraftGeneration -> SelfCritique
+///       -> RevisionDecision --revise--> Plan (loop)
+///                          --clarify-> ClarifyingQuestion
+///                          --finalize-> FinalAnswer
+///       -> OutcomeEvaluation -> LessonWriter -> StrategyAdaptation
+///       -> AuditSpine
+
+module metacognition_engine
+
+
+import time from "std/time"
+from "metacognition_types" import ClaimConfidence, ConversationEpisode, CritiqueFinding, CritiqueVerdict, GoalState, LessonRecord, PlanAction, ProcessingMode, ReasoningPlan, ReasoningStep, SafetyClass, SelfAssessment, StrategyPolicySnapshot, SubGoal, UserModel, _now_ms, _uid
+from "metacognition_memory" import MetacognitionMemory
+
+/// ── Configuration ──────────────────────────────────────────────────
+
+let HIGH_RISK_DOMAINS: Set[string] = {"medical", "legal", "financial", "safety", "defense"}
+
+let _ASSERTION_PATTERNS: List[string] = [
+    "is ", "are ", "was ", "were ", "means ", "requires ", "involves ",
+    "suggests ", "implies ", "shows ", "demonstrates ", "indicates ",
+    "causes ", "prevents ", "produces ", "equals "
+]
+
+let _CREATIVE_SIGNALS: Set[string] = {
+    "creative", "brainstorm", "imagine", "explore", "generate",
+    "poem", "story", "write", "compose", "invent"
+}
+let _FACTUAL_SIGNALS: Set[string] = {
+    "fact", "verify", "calculate", "prove", "lookup", "exact",
+    "deterministic", "define", "explain", "how", "why", "what"
+}
+
+let _UNCERTAINTY_MARKERS: List[string] = [
+    "I think", "probably", "not sure", "might be", "could be",
+    "uncertain", "approximately", "roughly", "it seems"
+]
+
+/// ── Planner ────────────────────────────────────────────────────────
+
+class MetacognitivePlanner {
+    fn plan(self, query: string, episode: ConversationEpisode,
+            user: UserModel, goal: GoalState,
+            recalled_episodes: List[ConversationEpisode],
+            recalled_lessons: List[LessonRecord],
+            strategy: StrategyPolicySnapshot,
+            domain: string) -> ReasoningPlan {
+        let rp = ReasoningPlan()
+        rp.session_id = episode.session_id
+        rp.query = query
+        rp.max_revision_rounds = strategy.revision_budget
+
+        let is_high_risk = domain.lower() in HIGH_RISK_DOMAINS
+        let query_lower = query.lower()
+        let tokens: Set[string] = set()
+        for w in query_lower.split() {
+            tokens.add(w)
+        }
+
+        let has_creative = false
+        for w in tokens {
+            if w in _CREATIVE_SIGNALS {
+                has_creative = true
+                break
+            }
+        }
+        let has_factual = false
+        for w in tokens {
+            if w in _FACTUAL_SIGNALS {
+                has_factual = true
+                break
+            }
+        }
+
+        let domain_hint = strategy.domain_mode_hints.get(domain)
+        if domain_hint != None {
+            rp.chosen_mode = ProcessingMode(domain_hint)
+        } else if is_high_risk {
+            rp.chosen_mode = ProcessingMode.DETERMINISTIC
+        } else if has_creative and not has_factual {
+            rp.chosen_mode = ProcessingMode.PROBABILISTIC
+        } else if has_creative and has_factual {
+            rp.chosen_mode = ProcessingMode.HYBRID
+        } else {
+            rp.chosen_mode = strategy.default_mode
+        }
+
+        let word_count = len(query.split())
+        let has_question_mark = "?" in query
+        let is_vague = word_count < 4 and not has_question_mark
+
+        if is_vague and strategy.proactive_clarification {
+            let confidence_gap = strategy.clarification_threshold
+            if len(recalled_episodes) == 0 and goal.primary_objective == "" {
+                rp.clarification_needed = true
+                let step = ReasoningStep {
+                    action: PlanAction.ASK_CLARIFICATION,
+                    description: "Query is ambiguous and no prior context available",
+                    target_mode: None,
+                    retrieval_hints: [],
+                    estimated_confidence: confidence_gap
+                }
+                rp.steps.append(step)
+                rp.planner_confidence = confidence_gap
+                return rp
+            }
+        }
+
+        let lesson_confidence = 0.0
+        for l in recalled_lessons {
+            if l.confidence > lesson_confidence {
+                lesson_confidence = l.confidence
+            }
+        }
+        let episode_relevance = len(recalled_episodes) / max(1, 5)
+        let memory_support = max(lesson_confidence, episode_relevance)
+
+        if memory_support < strategy.evidence_retrieval_threshold {
+            rp.evidence_needed = true
+            let hints: List[string] = []
+            if len(goal.assumptions) > 0 {
+                for i in range(min(3, len(goal.assumptions))) {
+                    hints.append(goal.assumptions[i])
+                }
+            } else {
+                hints = [query]
+            }
+            let step = ReasoningStep {
+                action: PlanAction.RETRIEVE_EVIDENCE,
+                description: "Insufficient memory support; retrieve external evidence",
+                target_mode: None,
+                retrieval_hints: hints,
+                estimated_confidence: memory_support
+            }
+            rp.steps.append(step)
+        }
+
+        let conjunctions = 0
+        for w in ["and", "also", "plus", "then"] {
+            if w in tokens {
+                conjunctions += 1
+            }
+        }
+        if conjunctions >= 2 or word_count > 40 {
+            rp.decomposition_strategy = "multi_part"
+            let step = ReasoningStep {
+                action: PlanAction.DECOMPOSE_TASK,
+                description: "Complex query detected; decompose into sub-questions",
+                target_mode: None,
+                retrieval_hints: [],
+                estimated_confidence: 0.5
+            }
+            rp.steps.append(step)
+        }
+
+        let answer_conf = 0.6
+        if len(recalled_lessons) > 0 {
+            answer_conf += 0.2
+        }
+        let answer_step = ReasoningStep {
+            action: PlanAction.ANSWER_DIRECT,
+            description: "Generate primary answer",
+            target_mode: rp.chosen_mode,
+            retrieval_hints: [],
+            estimated_confidence: answer_conf
+        }
+        rp.steps.append(answer_step)
+
+        let min_conf = 0.5
+        for s in rp.steps {
+            if s.estimated_confidence < min_conf {
+                min_conf = s.estimated_confidence
+            }
+        }
+        rp.planner_confidence = min_conf
+
+        return rp
+    }
+}
+
+/// ── Self-Model (introspection layer) ───────────────────────────────
+
+class SelfModel {
+    fn assess_pre_generation(self, plan: ReasoningPlan,
+                             episode: ConversationEpisode,
+                             user: UserModel,
+                             strategy: StrategyPolicySnapshot) -> SelfAssessment {
+        let sa = SelfAssessment()
+        sa.plan_id = plan.plan_id
+        sa.overall_confidence = plan.planner_confidence
+
+        if plan.evidence_needed {
+            sa.uncertainty_sources.append("insufficient_memory_support")
+            sa.memory_sufficiency = 0.4
+        }
+
+        if plan.clarification_needed {
+            sa.uncertainty_sources.append("ambiguous_query")
+            sa.memory_sufficiency = min(sa.memory_sufficiency, 0.3)
+        }
+
+        if episode.turn_count() > 10 {
+            sa.uncertainty_sources.append("long_conversation_drift_risk")
+        }
+
+        if user.interaction_count == 0 {
+            sa.uncertainty_sources.append("unknown_user_preferences")
+        }
+
+        let mode_mismatch = false
+        if plan.chosen_mode == ProcessingMode.PROBABILISTIC {
+            for t in ["exact", "precise", "verify"] {
+                if t in plan.query.lower() {
+                    mode_mismatch = true
+                    break
+                }
+            }
+        }
+        sa.strategy_appropriate = not mode_mismatch
+
+        return sa
+    }
+}
+
+/// ── Critique Engine ────────────────────────────────────────────────
+
+class CritiqueEngine {
+    fn critique(self, draft: string, query: string, plan: ReasoningPlan,
+                pre_assessment: SelfAssessment,
+                episode: ConversationEpisode, user: UserModel,
+                strategy: StrategyPolicySnapshot,
+                domain: string) -> SelfAssessment {
+        let sa = SelfAssessment()
+        sa.plan_id = plan.plan_id
+        sa.revision_round = pre_assessment.revision_round + 1
+        sa.overall_confidence = pre_assessment.overall_confidence
+
+        let sentences: List[string] = []
+        let raw_sents = draft.replace("\n", ". ").split(".")
+        for s in raw_sents {
+            let stripped = s.strip()
+            if len(stripped) > 20 {
+                sentences.append(stripped)
+            }
+        }
+        for sent in sentences {
+            let is_assertion = false
+            for p in _ASSERTION_PATTERNS {
+                if p in sent.lower() {
+                    is_assertion = true
+                    break
+                }
+            }
+            if is_assertion {
+                let has_hedging = false
+                for m in _UNCERTAINTY_MARKERS {
+                    if m in sent {
+                        has_hedging = true
+                        break
+                    }
+                }
+                let conf = 0.7
+                if has_hedging {
+                    conf = 0.4
+                }
+                let ur = ""
+                if has_hedging {
+                    ur = "hedged_language"
+                }
+                let cc = ClaimConfidence {
+                    claim_text: sent[:200],
+                    confidence: conf,
+                    source: "draft_analysis",
+                    uncertainty_reason: ur
+                }
+                sa.claim_confidences.append(cc)
+            }
+        }
+
+        let weak_claims: List[ClaimConfidence] = []
+        for c in sa.claim_confidences {
+            if c.confidence < 0.5 {
+                weak_claims.append(c)
+            }
+        }
+        if len(weak_claims) > 0 {
+            let sev = "medium"
+            if len(weak_claims) >= 3 {
+                sev = "high"
+            }
+            let cf = CritiqueFinding {
+                category: "unsupported_claims",
+                severity: sev,
+                description: str(len(weak_claims)) + " claims have low confidence",
+                suggested_action: CritiqueVerdict.REVISE
+            }
+            sa.critique_findings.append(cf)
+        }
+
+        let wc = len(draft.split())
+        if user.preferred_length == "brief" and wc > 200 {
+            let cf = CritiqueFinding {
+                category: "verbosity_mismatch",
+                severity: "low",
+                description: "User prefers brief answers but draft is " + str(wc) + " words",
+                suggested_action: CritiqueVerdict.REVISE
+            }
+            sa.critique_findings.append(cf)
+        } else if user.preferred_length == "detailed" and wc < 50 {
+            let cf = CritiqueFinding {
+                category: "verbosity_mismatch",
+                severity: "low",
+                description: "User prefers detailed answers but draft is too short",
+                suggested_action: CritiqueVerdict.REVISE
+            }
+            sa.critique_findings.append(cf)
+        }
+
+        let start = max(0, len(episode.claims) - 6)
+        for i in range(start, len(episode.claims)) {
+            let prior_claim = episode.claims[i]
+            let prior_lower = prior_claim.lower()
+            let draft_lower = draft.lower()
+            let neg_patterns = [
+                "not " + prior_lower[:30],
+                "isn't " + prior_lower[:30],
+                "doesn't " + prior_lower[:30]
+            ]
+            for neg in neg_patterns {
+                if neg in draft_lower {
+                    let cf = CritiqueFinding {
+                        category: "contradiction",
+                        severity: "high",
+                        description: "Draft contradicts prior claim: " + prior_claim[:100],
+                        suggested_action: CritiqueVerdict.REVISE
+                    }
+                    sa.critique_findings.append(cf)
+                    break
+                }
+            }
+        }
+
+        let is_high_risk = domain.lower() in HIGH_RISK_DOMAINS
+        if is_high_risk and plan.chosen_mode != ProcessingMode.DETERMINISTIC {
+            let cf = CritiqueFinding {
+                category: "policy_violation",
+                severity: "critical",
+                description: "High-risk domain '" + domain + "' requires deterministic mode",
+                suggested_action: CritiqueVerdict.ESCALATE
+            }
+            sa.critique_findings.append(cf)
+        }
+
+        if draft == "" or len(draft.strip()) < 10 {
+            let cf = CritiqueFinding {
+                category: "empty_response",
+                severity: "critical",
+                description: "Draft response is empty or trivially short",
+                suggested_action: CritiqueVerdict.REVISE
+            }
+            sa.critique_findings.append(cf)
+        }
+
+        let strictness = strategy.critique_strictness
+        if sa.overall_confidence < strictness {
+            let cf = CritiqueFinding {
+                category: "low_confidence",
+                severity: "medium",
+                description: "Overall confidence " + str(round(sa.overall_confidence, 2)) +
+                    " < threshold " + str(round(strictness, 2)),
+                suggested_action: CritiqueVerdict.REVISE
+            }
+            sa.critique_findings.append(cf)
+        }
+
+        sa.verdict = self._compute_verdict(sa, plan)
+        return sa
+    }
+
+    fn _compute_verdict(self, sa: SelfAssessment,
+                        plan: ReasoningPlan) -> CritiqueVerdict {
+        if sa.has_critical_findings() {
+            let has_policy = false
+            for f in sa.critique_findings {
+                if f.category == "policy_violation" {
+                    has_policy = true
+                    break
+                }
+            }
+            if has_policy {
+                return CritiqueVerdict.ESCALATE
+            }
+            return CritiqueVerdict.REVISE
+        }
+
+        let high_findings: List[CritiqueFinding] = []
+        for f in sa.critique_findings {
+            if f.severity == "high" {
+                high_findings.append(f)
+            }
+        }
+        if len(high_findings) > 0 and sa.revision_round < plan.max_revision_rounds {
+            return CritiqueVerdict.REVISE
+        }
+
+        let medium_findings: List[CritiqueFinding] = []
+        for f in sa.critique_findings {
+            if f.severity == "medium" {
+                medium_findings.append(f)
+            }
+        }
+        if len(medium_findings) >= 3 and sa.revision_round < plan.max_revision_rounds {
+            return CritiqueVerdict.REVISE
+        }
+
+        return CritiqueVerdict.FINALIZE
+    }
+}
+
+/// ── Revision Controller ────────────────────────────────────────────
+
+type RevisionDirective {
+    action: CritiqueVerdict,
+    constraints: List[string],
+    mode_override: Optional[ProcessingMode],
+    focus_areas: List[string],
+    clarification_question: string
+}
+
+class RevisionController {
+    fn decide(self, assessment: SelfAssessment, plan: ReasoningPlan,
+              query: string) -> RevisionDirective {
+        let directive = RevisionDirective {
+            action: assessment.verdict,
+            constraints: [],
+            mode_override: None,
+            focus_areas: [],
+            clarification_question: ""
+        }
+
+        if assessment.verdict == CritiqueVerdict.FINALIZE {
+            return directive
+        }
+
+        if assessment.verdict == CritiqueVerdict.CLARIFY {
+            directive.clarification_question = self._generate_clarification(
+                assessment, query)
+            return directive
+        }
+
+        if assessment.verdict == CritiqueVerdict.ESCALATE {
+            directive.mode_override = ProcessingMode.DETERMINISTIC
+            directive.constraints.append("switch_to_deterministic")
+            for f in assessment.critique_findings {
+                if f.severity == "critical" {
+                    directive.focus_areas.append(f.description)
+                }
+            }
+            return directive
+        }
+
+        if assessment.verdict == CritiqueVerdict.REVISE {
+            for f in assessment.critique_findings {
+                if f.severity == "high" or f.severity == "critical" {
+                    directive.focus_areas.append(f.description)
+                }
+                if f.category == "unsupported_claims" {
+                    directive.constraints.append("add_evidence_or_hedge")
+                }
+                if f.category == "verbosity_mismatch" {
+                    directive.constraints.append("adjust_length")
+                }
+                if f.category == "contradiction" {
+                    directive.constraints.append("resolve_contradiction")
+                }
+                if f.category == "low_confidence" {
+                    directive.constraints.append("increase_evidence")
+                }
+            }
+            return directive
+        }
+
+        if assessment.verdict == CritiqueVerdict.REFUSE {
+            directive.constraints.append("refuse_with_explanation")
+            return directive
+        }
+
+        return directive
+    }
+
+    fn _generate_clarification(self, assessment: SelfAssessment,
+                               query: string) -> string {
+        if "ambiguous_query" in assessment.uncertainty_sources {
+            return "Could you clarify what you mean by \"" + query + "\"? I want to make sure I address what you're actually asking."
+        }
+        if "insufficient_memory_support" in assessment.uncertainty_sources {
+            return "I'd like to give you an accurate answer. Could you provide more context about what aspect of this you're interested in?"
+        }
+        return "Could you tell me a bit more about what you're looking for?"
+    }
+}
+
+/// ── Goal Tracker ───────────────────────────────────────────────────
+
+class GoalTracker {
+    fn update_from_turn(self, goal: GoalState, query: string,
+                        episode: ConversationEpisode) -> GoalState {
+        let q_lower = query.lower().strip()
+
+        if goal.primary_objective == "" {
+            goal.primary_objective = self._infer_objective(query)
+        }
+
+        let add_signals = ["also", "and also", "another thing", "plus"]
+        for w in add_signals {
+            if w in q_lower {
+                let sg = SubGoal {
+                    description: query[:200],
+                    status: "open",
+                    blockers: []
+                }
+                goal.subgoals.append(sg)
+                break
+            }
+        }
+
+        let done_signals = ["done", "thanks", "that's all", "perfect"]
+        for w in done_signals {
+            if w in q_lower {
+                let all_open = goal.open_subgoals()
+                if len(all_open) == 0 {
+                    goal.status = "completed"
+                } else {
+                    for sg in all_open {
+                        sg.status = "complete"
+                    }
+                    goal.status = "completed"
+                }
+                break
+            }
+        }
+
+        let abandon_signals = ["never mind", "forget it", "skip", "cancel"]
+        for w in abandon_signals {
+            if w in q_lower {
+                goal.status = "abandoned"
+                break
+            }
+        }
+
+        goal.confidence_to_complete = max(0.0, min(1.0, goal.progress_pct()))
+        goal.updated_at_ms = _now_ms()
+        return goal
+    }
+
+    fn _infer_objective(self, query: string) -> string {
+        let q = query.strip()
+        if len(q) > 120 {
+            return q[:120] + "..."
+        }
+        return q
+    }
+}
+
+/// ── Episode Summarizer ─────────────────────────────────────────────
+
+class EpisodeSummarizer {
+    fn __init__(self) {
+        self._STOP_WORDS: Set[string] = {
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "has",
+            "have", "had", "do", "does", "did", "will", "can", "may", "in",
+            "of", "to", "for", "on", "with", "at", "by", "from", "as", "or",
+            "and", "but", "not", "it", "its", "this", "that", "i", "you", "we",
+            "they", "my", "your", "me", "so", "if", "all", "no", "any"
+        }
+    }
+
+    fn summarize(self, episode: ConversationEpisode) -> Dict[string, Any] {
+        let user_turns: List[string] = []
+        let asst_turns: List[string] = []
+        for t in episode.turns {
+            if t.role == "user" {
+                user_turns.append(t.content)
+            } else if t.role == "assistant" {
+                asst_turns.append(t.content)
+            }
+        }
+
+        let themes = self._extract_themes(episode.turns)
+        let claims = self._extract_claims(asst_turns)
+        let all_texts: List[string] = []
+        for t in user_turns {
+            all_texts.append(t)
+        }
+        for t in asst_turns {
+            all_texts.append(t)
+        }
+        let entities = self._extract_entities(all_texts)
+
+        let topic_str = "general conversation"
+        if len(themes) > 0 {
+            let top_themes: List[string] = []
+            for i in range(min(4, len(themes))) {
+                top_themes.append(themes[i])
+            }
+            topic_str = ", ".join(top_themes)
+        }
+        let summary = "Discussed " + topic_str + " over " + str(episode.turn_count()) + " turns."
+
+        let limited_entities: List[string] = []
+        for i in range(min(20, len(entities))) {
+            limited_entities.append(entities[i])
+        }
+        let limited_claims: List[string] = []
+        for i in range(min(10, len(claims))) {
+            limited_claims.append(claims[i])
+        }
+        let limited_themes: List[string] = []
+        for i in range(min(10, len(themes))) {
+            limited_themes.append(themes[i])
+        }
+
+        return {
+            "summary": summary,
+            "entities": limited_entities,
+            "claims": limited_claims,
+            "themes": limited_themes
+        }
+    }
+
+    fn _extract_themes(self, turns: List[Any]) -> List[any] {
+        let word_freq: Dict[string, int] = {}
+        for turn in turns {
+            for w in turn.content.lower().split() {
+                let cleaned = w.strip(".,!?;:\"'()-")
+                if len(cleaned) > 3 and cleaned not in self._STOP_WORDS {
+                    word_freq[cleaned] = word_freq.get(cleaned, 0) + 1
+                }
+            }
+        }
+        let freq_words: List[string] = []
+        for w in word_freq {
+            if word_freq[w] >= 2 {
+                freq_words.append(w)
+            }
+        }
+        let sorted_words: List[string] = []
+        let remaining = list(freq_words)
+        while len(remaining) > 0 and len(sorted_words) < 10 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if word_freq[remaining[i]] > word_freq[remaining[best_idx]] {
+                    best_idx = i
+                }
+            }
+            sorted_words.append(remaining.pop(best_idx))
+        }
+        return sorted_words
+    }
+
+    fn _extract_claims(self, asst_turns: List[string]) -> List[any] {
+        let claims: List[string] = []
+        let start = max(0, len(asst_turns) - 4)
+        for i in range(start, len(asst_turns)) {
+            let text = asst_turns[i]
+            for sent in text.split(". ") {
+                let s = sent.strip()
+                if len(s) > 30 {
+                    let is_assertion = false
+                    for p in _ASSERTION_PATTERNS {
+                        if p in s.lower() {
+                            is_assertion = true
+                            break
+                        }
+                    }
+                    if is_assertion {
+                        claims.append(s[:200])
+                    }
+                }
+            }
+        }
+        let start_idx = max(0, len(claims) - 10)
+        let result: List[string] = []
+        for i in range(start_idx, len(claims)) {
+            result.append(claims[i])
+        }
+        return result
+    }
+
+    fn _extract_entities(self, texts: List[string]) -> List[any] {
+        let entities: List[string] = []
+        for text in texts {
+            for word in text.split() {
+                let clean = word.strip(".,!?;:\"'()-")
+                if clean != "" and clean[0].isupper() and len(clean) > 2 {
+                    if clean.lower() not in self._STOP_WORDS {
+                        if clean not in entities {
+                            entities.append(clean)
+                        }
+                    }
+                }
+            }
+        }
+        let result: List[string] = []
+        for i in range(min(20, len(entities))) {
+            result.append(entities[i])
+        }
+        return result
+    }
+}
+
+/// ── MetacognitiveResult ────────────────────────────────────────────
+
+type MetacognitiveResult {
+    final_answer: string,
+    plan: ReasoningPlan,
+    assessments: List[SelfAssessment],
+    episode: ConversationEpisode,
+    goal: GoalState,
+    user_model: UserModel,
+    strategy: StrategyPolicySnapshot,
+    revision_rounds: int,
+    clarification_question: string,
+    is_clarification: bool,
+    processing_time_ms: float
+}
+
+/// ── Orchestrator (full metacognitive loop) ─────────────────────────
+
+class MetacognitionOrchestrator {
+    let MAX_LATENCY_MS = 5000
+
+    fn __init__(self, memory: MetacognitionMemory,
+                generate_fn: Optional[Callable]) {
+        self.memory = memory
+        if generate_fn != None {
+            self.generate_fn = generate_fn
+        } else {
+            self.generate_fn = self._default_generate
+        }
+        self.planner = MetacognitivePlanner()
+        self.self_model = SelfModel()
+        self.critique = CritiqueEngine()
+        self.revision_ctrl = RevisionController()
+        self.goal_tracker = GoalTracker()
+        self.summarizer = EpisodeSummarizer()
+    }
+
+    fn process(self, query: string, session_id: string, user_id: string,
+               domain: string,
+               episode_id: Optional[string]) -> MetacognitiveResult {
+        let t0 = time.monotonic()
+
+        let user = self.memory.get_or_create_user(user_id)
+        user.touch()
+
+        let episode: ConversationEpisode = ConversationEpisode()
+        if episode_id != None and episode_id != "" {
+            let loaded = self.memory.store.load_episode(episode_id)
+            if loaded != None {
+                episode = loaded
+            } else {
+                episode = self.memory.start_episode(session_id, user_id)
+            }
+        } else {
+            episode = self.memory.start_episode(session_id, user_id)
+        }
+
+        episode.append_turn("user", query, None)
+
+        let goal = self.memory.get_or_create_goal(session_id)
+        goal = self.goal_tracker.update_from_turn(goal, query, episode)
+
+        let recalled_episodes = self.memory.recall_similar_episodes(user_id, query, 5)
+        let recalled_lessons = self.memory.recall_relevant_lessons(user_id, query, 5)
+
+        let strategy = self.memory.get_or_create_strategy(user_id)
+
+        let plan = self.planner.plan(
+            query, episode, user, goal,
+            recalled_episodes, recalled_lessons,
+            strategy, domain)
+
+        let pre_assessment = self.self_model.assess_pre_generation(
+            plan, episode, user, strategy)
+
+        if plan.clarification_needed {
+            let directive = self.revision_ctrl.decide(pre_assessment, plan, query)
+            let elapsed = (time.monotonic() - t0) * 1000
+            return MetacognitiveResult {
+                final_answer: "",
+                plan: plan,
+                assessments: [pre_assessment],
+                episode: episode,
+                goal: goal,
+                user_model: user,
+                strategy: strategy,
+                revision_rounds: 0,
+                clarification_question: directive.clarification_question,
+                is_clarification: true,
+                processing_time_ms: elapsed
+            }
+        }
+
+        let assessments: List[SelfAssessment] = [pre_assessment]
+        let draft = ""
+        let revision_rounds = 0
+
+        for _ in range(plan.max_revision_rounds + 1) {
+            let elapsed_ms = (time.monotonic() - t0) * 1000
+            if elapsed_ms > self.MAX_LATENCY_MS {
+                break
+            }
+
+            draft = self.generate_fn(query, plan, assessments[len(assessments) - 1])
+
+            let post_assessment = self.critique.critique(
+                draft, query, plan,
+                assessments[len(assessments) - 1],
+                episode, user, strategy, domain)
+            assessments.append(post_assessment)
+
+            if post_assessment.verdict == CritiqueVerdict.FINALIZE {
+                break
+            }
+
+            if post_assessment.verdict == CritiqueVerdict.CLARIFY {
+                let directive = self.revision_ctrl.decide(post_assessment, plan, query)
+                let elapsed = (time.monotonic() - t0) * 1000
+                return MetacognitiveResult {
+                    final_answer: "",
+                    plan: plan,
+                    assessments: assessments,
+                    episode: episode,
+                    goal: goal,
+                    user_model: user,
+                    strategy: strategy,
+                    revision_rounds: revision_rounds,
+                    clarification_question: directive.clarification_question,
+                    is_clarification: true,
+                    processing_time_ms: elapsed
+                }
+            }
+
+            if post_assessment.verdict == CritiqueVerdict.REFUSE {
+                draft = self._refusal_text(post_assessment, query)
+                break
+            }
+
+            if post_assessment.verdict == CritiqueVerdict.REVISE or post_assessment.verdict == CritiqueVerdict.ESCALATE {
+                let directive = self.revision_ctrl.decide(post_assessment, plan, query)
+                if directive.mode_override != None {
+                    plan.chosen_mode = directive.mode_override
+                }
+                revision_rounds += 1
+            }
+        }
+
+        episode.append_turn("assistant", draft, None)
+
+        let summary_data = self.summarizer.summarize(episode)
+        episode.summary = summary_data["summary"]
+        episode.entities = summary_data["entities"]
+        episode.claims = summary_data["claims"]
+        episode.running_themes = summary_data["themes"]
+
+        self.memory.store.save_episode(episode)
+        self.memory.update_goal(goal)
+        self.memory.update_user(user)
+
+        let elapsed = (time.monotonic() - t0) * 1000
+        return MetacognitiveResult {
+            final_answer: draft,
+            plan: plan,
+            assessments: assessments,
+            episode: episode,
+            goal: goal,
+            user_model: user,
+            strategy: strategy,
+            revision_rounds: revision_rounds,
+            clarification_question: "",
+            is_clarification: false,
+            processing_time_ms: elapsed
+        }
+    }
+
+    fn _default_generate(self, query: string, plan: ReasoningPlan,
+                         assessment: SelfAssessment) -> string {
+        let mode = plan.chosen_mode
+        let domain = plan.domain
+        let steps = plan.steps
+        let step_summaries: List[string] = []
+        for s in steps {
+            step_summaries.append(s.action + ": " + s.description)
+        }
+        let plan_text = "; ".join(step_summaries) if len(step_summaries) > 0 else "no steps"
+        let conf = assessment.overall_confidence
+        let gaps = assessment.knowledge_gaps
+
+        let answer = "Based on " + mode + " reasoning in domain '" + domain + "'"
+        if len(step_summaries) > 0 {
+            answer = answer + " (plan: " + plan_text + ")"
+        }
+        answer = answer + ": "
+
+        if conf < 0.3 {
+            answer = answer + "I have low confidence in answering '" + query + "'. "
+            if len(gaps) > 0 {
+                answer = answer + "Knowledge gaps: " + ", ".join(gaps[:3]) + ". "
+            }
+            answer = answer + "Consider providing more context."
+        } else if conf < 0.6 {
+            answer = answer + "Partial analysis of '" + query + "' suggests further investigation is needed. "
+            if len(gaps) > 0 {
+                answer = answer + "Gaps identified: " + ", ".join(gaps[:3]) + "."
+            }
+        } else {
+            answer = answer + "Analysis of '" + query + "' completed with confidence " + to_string(round(conf, 2)) + "."
+        }
+        return answer
+    }
+
+    fn _refusal_text(self, assessment: SelfAssessment,
+                     query: string) -> string {
+        let reasons: List[string] = []
+        for f in assessment.critique_findings {
+            if f.severity == "critical" {
+                reasons.append(f.description)
+            }
+        }
+        let reason_str = "insufficient confidence"
+        if len(reasons) > 0 {
+            reason_str = "; ".join(reasons)
+        }
+        return ("I'm not able to provide a reliable answer to this question. " +
+                "Reason: " + reason_str + ". " +
+                "Could you rephrase or provide more context?")
+    }
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export MetacognitivePlanner, SelfModel, CritiqueEngine
+export RevisionDirective, RevisionController
+export GoalTracker, EpisodeSummarizer
+export MetacognitiveResult, MetacognitionOrchestrator
+export HIGH_RISK_DOMAINS

@@ -1,0 +1,606 @@
+/// NRSI — Epistemic Awareness Engine.
+///
+/// The system knows exactly what it knows, what it doesn't know,
+/// when it's speculating vs stating facts, how reliable its knowledge
+/// is per domain, and what would change its mind.
+/// All transformer-free.
+
+module reasoning_epistemic
+
+from "reasoning_graph" import CausalGraph, GraphEdge, RelationType
+from "reasoning_bayesian" import GraphConfidenceManager, BayesianUpdater
+
+/// ---------- Types ----------
+
+type KnowledgeBoundary {
+    concept: string,
+    known_relations: int,
+    known_properties: List[string],
+    unknown_aspects: List[string],
+    confidence_range: Tuple[float, float],
+    domain: string,
+    depth: int,
+    is_well_known: bool,
+    is_peripheral: bool
+}
+
+type DomainProfile {
+    domain: string,
+    node_count: int,
+    edge_count: int,
+    avg_confidence: float,
+    min_confidence: float,
+    max_confidence: float,
+    coverage_score: float,
+    weakest_areas: List[string],
+    strongest_areas: List[string]
+}
+
+type EpistemicState {
+    query: string,
+    know_well: List[string],
+    know_partially: List[string],
+    dont_know: List[string],
+    speculating_about: List[string],
+    overall_certainty: float,
+    domain_profiles: Dict[string, DomainProfile],
+    sensitivity: List[Dict[string, Any]],
+    honest_assessment: string
+}
+
+/// ---------- Sort helpers ----------
+
+fn _sort_edges_by_confidence_asc(edges: List[GraphEdge]) -> List[any] {
+    let sorted_list: List[GraphEdge] = []
+    let remaining = list(edges)
+    while len(remaining) > 0 {
+        let best_idx = 0
+        let best_conf = remaining[0].confidence
+        for i in range(1, len(remaining)) {
+            if remaining[i].confidence < best_conf {
+                best_conf = remaining[i].confidence
+                best_idx = i
+            }
+        }
+        sorted_list.append(remaining.pop(best_idx))
+    }
+    return sorted_list
+}
+
+fn _sort_edges_by_confidence_desc(edges: List[GraphEdge]) -> List[any] {
+    let sorted_list: List[GraphEdge] = []
+    let remaining = list(edges)
+    while len(remaining) > 0 {
+        let best_idx = 0
+        let best_conf = remaining[0].confidence
+        for i in range(1, len(remaining)) {
+            if remaining[i].confidence > best_conf {
+                best_conf = remaining[i].confidence
+                best_idx = i
+            }
+        }
+        sorted_list.append(remaining.pop(best_idx))
+    }
+    return sorted_list
+}
+
+/// ---------- Epistemic Awareness Engine ----------
+
+class EpistemicEngine {
+    fn __init__(self, graph: CausalGraph, confidence_mgr: Optional[GraphConfidenceManager]) {
+        self._graph = graph
+        if confidence_mgr != None {
+            self._confidence = confidence_mgr
+        } else {
+            self._confidence = GraphConfidenceManager(graph)
+        }
+    }
+
+    fn assess_knowledge(self, concept: string) -> KnowledgeBoundary {
+        let concept_norm = concept.lower().strip()
+        let outgoing = self._graph.outgoing(concept_norm)
+        let incoming = self._graph.incoming(concept_norm)
+        let all_edges: List[GraphEdge] = []
+        for e in outgoing {
+            all_edges.append(e)
+        }
+        for e in incoming {
+            all_edges.append(e)
+        }
+
+        let known_props: List[string] = []
+        for e in outgoing {
+            known_props.append(e.relation.value + " → " + e.target)
+        }
+        for e in incoming {
+            known_props.append(e.source + " → " + e.relation.value)
+        }
+
+        let confs: List[float] = []
+        if len(all_edges) > 0 {
+            for e in all_edges {
+                confs.append(e.confidence)
+            }
+        } else {
+            confs.append(0.0)
+        }
+        let min_conf = confs[0]
+        let max_conf = confs[0]
+        for c in confs {
+            if c < min_conf {
+                min_conf = c
+            }
+            if c > max_conf {
+                max_conf = c
+            }
+        }
+        let conf_range = (min_conf, max_conf)
+
+        let unknown = self._identify_gaps(concept_norm, all_edges)
+
+        let domains: Set[string] = set()
+        for e in all_edges {
+            if e.domain != "" {
+                domains.add(e.domain)
+            }
+        }
+        let domain = ""
+        if len(domains) > 0 {
+            let best_count = 0
+            for d in domains {
+                let count = 0
+                for e in all_edges {
+                    if e.domain == d {
+                        count += 1
+                    }
+                }
+                if count > best_count {
+                    best_count = count
+                    domain = d
+                }
+            }
+        }
+
+        let depth = self._measure_depth(concept_norm, 5)
+
+        let limited_props: List[string] = []
+        for i in range(min(10, len(known_props))) {
+            limited_props.append(known_props[i])
+        }
+
+        return KnowledgeBoundary {
+            concept: concept_norm,
+            known_relations: len(all_edges),
+            known_properties: limited_props,
+            unknown_aspects: unknown,
+            confidence_range: conf_range,
+            domain: domain,
+            depth: depth,
+            is_well_known: len(all_edges) >= 5 and conf_range[0] >= 0.5,
+            is_peripheral: len(all_edges) <= 1
+        }
+    }
+
+    fn assess_query(self, concepts: List[string]) -> EpistemicState {
+        let know_well: List[string] = []
+        let know_partially: List[string] = []
+        let dont_know: List[string] = []
+        let speculating: List[string] = []
+
+        for c in concepts {
+            let boundary = self.assess_knowledge(c)
+            if boundary.is_well_known {
+                know_well.append(c)
+            } else if boundary.known_relations > 0 {
+                if boundary.confidence_range[1] < 0.4 {
+                    speculating.append(c)
+                } else {
+                    know_partially.append(c)
+                }
+            } else {
+                dont_know.append(c)
+            }
+        }
+
+        let domains = self.profile_domains()
+
+        let sensitivity: List[Dict[string, Any]] = []
+        let sens_candidates: List[string] = []
+        for c in know_well {
+            sens_candidates.append(c)
+        }
+        for c in know_partially {
+            sens_candidates.append(c)
+        }
+        for i in range(min(5, len(sens_candidates))) {
+            let sens = self._sensitivity_analysis(sens_candidates[i])
+            if sens != None {
+                sensitivity.append(sens)
+            }
+        }
+
+        let total = len(know_well) + len(know_partially) + len(dont_know) + len(speculating)
+        let certainty = 0.0
+        if total > 0 {
+            certainty = len(know_well) / total
+        }
+
+        let assessment = self._generate_honest_assessment(
+            know_well, know_partially, dont_know, speculating, certainty)
+
+        return EpistemicState {
+            query: " ".join(concepts),
+            know_well: know_well,
+            know_partially: know_partially,
+            dont_know: dont_know,
+            speculating_about: speculating,
+            overall_certainty: certainty,
+            domain_profiles: domains,
+            sensitivity: sensitivity,
+            honest_assessment: assessment
+        }
+    }
+
+    fn profile_domains(self) -> Dict[string, DomainProfile] {
+        let domain_edges: Dict[string, List[GraphEdge]] = {}
+        let domain_nodes: Dict[string, Set[string]] = {}
+
+        for edge in self._graph.all_edges() {
+            let d = edge.domain
+            if d == "" {
+                d = "unknown"
+            }
+            if d not in domain_edges {
+                domain_edges[d] = []
+                domain_nodes[d] = set()
+            }
+            domain_edges[d].append(edge)
+            domain_nodes[d].add(edge.source)
+            domain_nodes[d].add(edge.target)
+        }
+
+        let profiles: Dict[string, DomainProfile] = {}
+        for domain in domain_edges {
+            let edges = domain_edges[domain]
+            let confs: List[float] = []
+            for e in edges {
+                confs.append(e.confidence)
+            }
+            let avg = 0.0
+            let total = 0.0
+            for c in confs {
+                total += c
+            }
+            avg = total / len(confs)
+
+            let min_c = confs[0]
+            let max_c = confs[0]
+            for c in confs {
+                if c < min_c {
+                    min_c = c
+                }
+                if c > max_c {
+                    max_c = c
+                }
+            }
+
+            let weak = _sort_edges_by_confidence_asc(edges)
+            let strong = _sort_edges_by_confidence_desc(edges)
+
+            let node_count = len(domain_nodes[domain])
+            let coverage = node_count / 50.0
+            if coverage > 1.0 {
+                coverage = 1.0
+            }
+
+            let weakest: List[string] = []
+            for i in range(min(3, len(weak))) {
+                let e = weak[i]
+                weakest.append(e.source + "→" + e.target + " (" + str(round(e.confidence, 2)) + ")")
+            }
+            let strongest: List[string] = []
+            for i in range(min(3, len(strong))) {
+                let e = strong[i]
+                strongest.append(e.source + "→" + e.target + " (" + str(round(e.confidence, 2)) + ")")
+            }
+
+            profiles[domain] = DomainProfile {
+                domain: domain,
+                node_count: node_count,
+                edge_count: len(edges),
+                avg_confidence: avg,
+                min_confidence: min_c,
+                max_confidence: max_c,
+                coverage_score: coverage,
+                weakest_areas: weakest,
+                strongest_areas: strongest
+            }
+        }
+
+        return profiles
+    }
+
+    fn what_would_change_my_mind(self, concept: string) -> Dict[string, Any] {
+        let concept_norm = concept.lower().strip()
+        let edges: List[GraphEdge] = []
+        for e in self._graph.outgoing(concept_norm) {
+            edges.append(e)
+        }
+        for e in self._graph.incoming(concept_norm) {
+            edges.append(e)
+        }
+
+        if len(edges) == 0 {
+            return {"concept": concept_norm, "status": "no knowledge to change"}
+        }
+
+        let changeables: List[Dict[string, Any]] = []
+        for e in edges {
+            if e.confidence < 0.7 {
+                let contrary_strength_needed = 0.7 - e.confidence + 0.1
+                changeables.append({
+                    "claim": e.source + " " + e.relation.value + " " + e.target,
+                    "current_confidence": e.confidence,
+                    "evidence_needed": "Contradictory evidence with strength >= " + str(round(contrary_strength_needed, 2)) + " would make this uncertain"
+                })
+            }
+        }
+
+        let strong_claims: List[GraphEdge] = []
+        for e in edges {
+            if e.confidence >= 0.7 {
+                strong_claims.append(e)
+            }
+        }
+        for e in strong_claims {
+            changeables.append({
+                "claim": e.source + " " + e.relation.value + " " + e.target,
+                "current_confidence": e.confidence,
+                "evidence_needed": "Multiple strong contradictory sources would be needed to overturn this"
+            })
+        }
+
+        let limited: List[Dict[string, Any]] = []
+        for i in range(min(10, len(changeables))) {
+            limited.append(changeables[i])
+        }
+
+        return {
+            "concept": concept_norm,
+            "total_claims": len(edges),
+            "changeable_claims": len(changeables),
+            "details": limited
+        }
+    }
+
+    fn knowledge_map(self) -> Dict[string, Any] {
+        let domains = self.profile_domains()
+        let total_nodes = self._graph.node_count()
+        let total_edges = self._graph.edge_count()
+
+        let edges = self._graph.all_edges()
+        let confs: List[float] = []
+        if len(edges) > 0 {
+            for e in edges {
+                confs.append(e.confidence)
+            }
+        } else {
+            confs.append(0.0)
+        }
+
+        let well_known = 0
+        let partially = 0
+        let speculative = 0
+        for c in confs {
+            if c >= 0.7 {
+                well_known += 1
+            } else if c >= 0.3 {
+                partially += 1
+            } else {
+                speculative += 1
+            }
+        }
+
+        let max_edges = total_edges
+        if max_edges < 1 {
+            max_edges = 1
+        }
+
+        let domain_summary: Dict[string, Any] = {}
+        let sorted_domains: List[Tuple[string, DomainProfile]] = []
+        for k in domains {
+            sorted_domains.append((k, domains[k]))
+        }
+        let count = 0
+        for item in sorted_domains {
+            if count >= 10 {
+                break
+            }
+            domain_summary[item[0]] = {
+                "nodes": item[1].node_count,
+                "edges": item[1].edge_count,
+                "avg_confidence": str(round(item[1].avg_confidence, 2))
+            }
+            count += 1
+        }
+
+        return {
+            "total_concepts": total_nodes,
+            "total_relations": total_edges,
+            "well_established": well_known,
+            "partially_known": partially,
+            "speculative": speculative,
+            "domains": domain_summary
+        }
+    }
+
+    fn _identify_gaps(self, concept: string, edges: List[GraphEdge]) -> List[any] {
+        let gaps: List[string] = []
+        let existing_relations: Set[RelationType] = set()
+        for e in edges {
+            existing_relations.add(e.relation)
+        }
+
+        let expected = [RelationType.IS_A, RelationType.CAUSES, RelationType.PART_OF]
+        for rel in expected {
+            if rel not in existing_relations {
+                gaps.append("No " + rel.value + " relation known")
+            }
+        }
+
+        let has_effects = false
+        let has_causes = false
+        for e in edges {
+            if e.source == concept and (e.relation == RelationType.CAUSES or e.relation == RelationType.PRODUCES) {
+                has_effects = true
+            }
+            if e.target == concept and (e.relation == RelationType.CAUSES or e.relation == RelationType.PRODUCES) {
+                has_causes = true
+            }
+        }
+
+        if not has_effects {
+            gaps.append("Unknown effects/consequences")
+        }
+        if not has_causes {
+            gaps.append("Unknown causes/origins")
+        }
+
+        return gaps
+    }
+
+    fn _measure_depth(self, concept: string, max_depth: int) -> int {
+        let visited: Set[string] = set()
+        visited.add(concept)
+        let frontier: Set[string] = set()
+        frontier.add(concept)
+        let depth = 0
+
+        while len(frontier) > 0 and depth < max_depth {
+            let next_frontier: Set[string] = set()
+            for c in frontier {
+                for e in self._graph.outgoing(c) {
+                    if e.target not in visited {
+                        visited.add(e.target)
+                        next_frontier.add(e.target)
+                    }
+                }
+            }
+            if len(next_frontier) == 0 {
+                break
+            }
+            frontier = next_frontier
+            depth += 1
+        }
+
+        return depth
+    }
+
+    fn _sensitivity_analysis(self, concept: string) -> Optional[Dict[string, Any]] {
+        let edges = self._graph.outgoing(concept)
+        if len(edges) == 0 {
+            return None
+        }
+
+        let sensitivities: List[Dict[string, Any]] = []
+        for e in edges {
+            let downstream = self._graph.outgoing(e.target)
+            let impact = 1 + len(downstream)
+            let risk = "low"
+            if e.confidence < 0.5 and impact > 2 {
+                risk = "high"
+            }
+            sensitivities.append({
+                "edge": e.source + " → " + e.target,
+                "confidence": e.confidence,
+                "downstream_impact": impact,
+                "risk": risk
+            })
+        }
+
+        let sorted_sens: List[Dict[string, Any]] = []
+        let remaining = list(sensitivities)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            let best_impact = remaining[0]["downstream_impact"]
+            for i in range(1, len(remaining)) {
+                if remaining[i]["downstream_impact"] > best_impact {
+                    best_impact = remaining[i]["downstream_impact"]
+                    best_idx = i
+                }
+            }
+            sorted_sens.append(remaining.pop(best_idx))
+        }
+
+        let top3: List[Dict[string, Any]] = []
+        for i in range(min(3, len(sorted_sens))) {
+            top3.append(sorted_sens[i])
+        }
+
+        return {
+            "concept": concept,
+            "most_sensitive": top3
+        }
+    }
+
+    fn _generate_honest_assessment(self, know_well: List[string],
+                                    know_partially: List[string],
+                                    dont_know: List[string],
+                                    speculating: List[string],
+                                    certainty: float) -> string {
+        let parts: List[string] = []
+
+        if len(know_well) > 0 {
+            let items: List[string] = []
+            for i in range(min(3, len(know_well))) {
+                items.append(know_well[i])
+            }
+            parts.append("I have strong knowledge about: " + ", ".join(items))
+        }
+        if len(know_partially) > 0 {
+            let items: List[string] = []
+            for i in range(min(3, len(know_partially))) {
+                items.append(know_partially[i])
+            }
+            parts.append("I have partial knowledge about: " + ", ".join(items))
+        }
+        if len(dont_know) > 0 {
+            let items: List[string] = []
+            for i in range(min(3, len(dont_know))) {
+                items.append(dont_know[i])
+            }
+            parts.append("I have no knowledge about: " + ", ".join(items))
+        }
+        if len(speculating) > 0 {
+            let items: List[string] = []
+            for i in range(min(3, len(speculating))) {
+                items.append(speculating[i])
+            }
+            parts.append("I would be speculating about: " + ", ".join(items))
+        }
+
+        if certainty >= 0.7 {
+            parts.append("I can answer this question with reasonable confidence.")
+        } else if certainty >= 0.3 {
+            parts.append("My answer will be partly based on inference rather than direct knowledge.")
+        } else {
+            parts.append("I should be transparent that my knowledge here is limited.")
+        }
+
+        return " ".join(parts)
+    }
+}
+
+/// ---------- Gate ----------
+
+gate epistemic_gate(data: raw[EpistemicState]) -> validated[EpistemicState] {
+    require confidence >= 0.5
+    validate boundary_check
+    validate gap_analysis
+}
+
+/// ---------- Exports ----------
+
+export KnowledgeBoundary, DomainProfile, EpistemicState
+export EpistemicEngine
+export epistemic_gate

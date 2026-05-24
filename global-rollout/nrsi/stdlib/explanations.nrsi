@@ -1,0 +1,82 @@
+/// NRSI Explanations — Explanation Graph Types and Norms
+///
+/// Declares node/edge kinds for explanation graphs,
+/// levels of explanation detail, and transparency norms.
+
+module explanations
+
+import NRSIData, TrustLevel from "types"
+
+/// ---------- Explanation Types ----------
+
+enum ExplanationLevel {
+    SUMMARY,
+    STANDARD,
+    DETAILED,
+    TECHNICAL,
+    TRACE
+}
+
+enum NodeKind {
+    CLAIM,
+    EVIDENCE,
+    INFERENCE,
+    AXIOM,
+    ASSUMPTION,
+    CONCLUSION
+}
+
+enum EdgeKind {
+    SUPPORTS,
+    CONTRADICTS,
+    DERIVES,
+    QUALIFIES,
+    ANALOGIZES
+}
+
+type ExplanationNode {
+    kind: NodeKind,
+    content: String,
+    confidence: Float
+}
+
+type ExplanationEdge {
+    kind: EdgeKind,
+    source: String,
+    target: String,
+    strength: Float
+}
+
+/// ---------- Explanation Norms ----------
+
+norm provide_explanation_on_request {
+    type: obligation,
+    scope: global,
+    action: "generate_explanation",
+    priority: 80,
+    condition: user_requests_explanation
+}
+
+norm trace_available_for_audit {
+    type: obligation,
+    scope: global,
+    action: "retain_trace_level",
+    priority: 90,
+    condition: trust >= TrustLevel.VALIDATED
+}
+
+norm no_opaque_conclusions {
+    type: prohibition,
+    scope: global,
+    action: "output_without_provenance",
+    priority: 85,
+    condition: true
+}
+
+/// ---------- Explanation Gate ----------
+
+gate explanation_quality(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.50
+    validate nodes_connected
+    validate conclusion_supported
+}

@@ -1,0 +1,360 @@
+/// NRSI Reasoning — Goal Decomposition & Planning.
+///
+/// Means-end analysis, subgoal generation, plan evaluation, precondition
+/// checking, and action sequencing over the causal knowledge graph.
+///
+/// All transformer-free.  No external ML dependencies.
+
+module reasoning_planning
+
+from "reasoning_graph" import CausalGraph, GraphEdge, RelationType
+from "reasoning_inference" import InferenceEngine, PathFinder
+
+/// ── Action Status ──────────────────────────────────────────────────
+
+enum ActionStatus {
+    PENDING = "pending",
+    READY = "ready",
+    IN_PROGRESS = "in_progress",
+    COMPLETED = "completed",
+    BLOCKED = "blocked",
+    FAILED = "failed"
+}
+
+/// ── Plan Types ─────────────────────────────────────────────────────
+
+type PlanAction {
+    action_id: string,
+    description: string,
+    preconditions: List[string],
+    effects: List[string],
+    cost: float,
+    confidence: float,
+    status: ActionStatus,
+    depends_on: List[string]
+}
+
+class Plan {
+    fn __init__(self, goal: string) {
+        self.goal = goal
+        self.actions: List[PlanAction] = []
+        self.preconditions_met: List[string] = []
+        self.preconditions_unmet: List[string] = []
+        self.total_cost = 0.0
+        self.success_probability = 0.0
+        self.reasoning_trace: List[string] = []
+    }
+
+    fn is_feasible(self) -> bool {
+        return len(self.preconditions_unmet) == 0 and len(self.actions) > 0
+    }
+
+    fn action_count(self) -> int {
+        return len(self.actions)
+    }
+}
+
+/// ── Means-End Analyzer ─────────────────────────────────────────────
+
+class MeansEndAnalyzer {
+    fn __init__(self, graph: CausalGraph, max_depth: int) {
+        if max_depth == None {
+            max_depth = 6
+        }
+        self._graph = graph
+        self._engine = InferenceEngine(graph, max_depth, 0.1)
+        self._pathfinder = PathFinder(graph, max_depth, 0.05)
+    }
+
+    fn analyze(self, current_state: List[string],
+               goal: string) -> Dict[string, Any] {
+        let goal_clean = goal.lower().strip()
+        let current: Set[string] = set()
+        for s in current_state {
+            current.add(s.lower().strip())
+        }
+
+        if goal_clean in current {
+            return {
+                "status": "already_achieved",
+                "goal": goal_clean,
+                "explanation": "'" + goal_clean + "' is already in the current state."
+            }
+        }
+
+        let paths_to_goal: List[Any] = []
+        for state_concept in current {
+            let found = self._pathfinder.find_paths(state_concept, goal_clean, 3)
+            for p in found {
+                paths_to_goal.append(p)
+            }
+        }
+
+        if len(paths_to_goal) == 0 {
+            let backward = self._engine.backward(goal_clean, 10)
+            let potential_enablers: List[string] = []
+            for r in backward {
+                potential_enablers.append(r.conclusion)
+            }
+            let limited: List[string] = []
+            for i in range(min(5, len(potential_enablers))) {
+                limited.append(potential_enablers[i])
+            }
+            let top3: List[string] = []
+            for i in range(min(3, len(potential_enablers))) {
+                top3.append(potential_enablers[i])
+            }
+            return {
+                "status": "no_direct_path",
+                "goal": goal_clean,
+                "potential_enablers": limited,
+                "explanation": "No direct path from current state to '" + goal_clean +
+                    "'. Possible enablers: " + str(top3)
+            }
+        }
+
+        let sorted_paths: List[Any] = []
+        let remaining = list(paths_to_goal)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i].confidence > remaining[best_idx].confidence {
+                    best_idx = i
+                }
+            }
+            sorted_paths.append(remaining.pop(best_idx))
+        }
+        let best = sorted_paths[0]
+
+        return {
+            "status": "path_found",
+            "goal": goal_clean,
+            "best_path": best.path,
+            "confidence": best.confidence,
+            "depth": best.depth,
+            "alternatives": len(paths_to_goal),
+            "explanation": "Found " + str(len(paths_to_goal)) + " path(s). Best: " +
+                " → ".join(best.path) + " (confidence " +
+                str(round(best.confidence, 3)) + ")"
+        }
+    }
+}
+
+/// ── Subgoal Generator ──────────────────────────────────────────────
+
+class SubgoalGenerator {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn decompose(self, goal: string, current_state: Optional[List[string]],
+                 max_subgoals: int) -> List[any] {
+        if max_subgoals == None {
+            max_subgoals = 10
+        }
+        let goal_clean = goal.lower().strip()
+        let current: Set[string] = set()
+        if current_state != None {
+            for s in current_state {
+                current.add(s.lower().strip())
+            }
+        }
+        let subgoals: List[string] = []
+        let visited: Set[string] = set()
+        let queue: List[string] = [goal_clean]
+
+        while len(queue) > 0 and len(subgoals) < max_subgoals {
+            let concept = queue.pop(0)
+            if concept in visited {
+                continue
+            }
+            visited.add(concept)
+
+            for edge in self._graph.incoming(concept, RelationType.REQUIRES) {
+                if edge.source not in current and edge.source not in visited {
+                    subgoals.append(edge.source)
+                    queue.append(edge.source)
+                }
+            }
+
+            for edge in self._graph.incoming(concept, RelationType.ENABLES) {
+                if edge.source not in current and edge.source not in visited {
+                    subgoals.append(edge.source)
+                    queue.append(edge.source)
+                }
+            }
+
+            for edge in self._graph.incoming(concept, RelationType.CAUSES) {
+                if edge.source not in current and edge.source not in visited {
+                    subgoals.append(edge.source)
+                }
+            }
+        }
+
+        return subgoals
+    }
+
+    fn find_blockers(self, goal: string) -> List[any] {
+        let goal_clean = goal.lower().strip()
+        let blockers: List[string] = []
+        for edge in self._graph.incoming(goal_clean, RelationType.PREVENTS) {
+            blockers.append(edge.source)
+        }
+        for edge in self._graph.incoming(goal_clean, RelationType.INHIBITS) {
+            blockers.append(edge.source)
+        }
+        return blockers
+    }
+}
+
+/// ── Plan Builder ───────────────────────────────────────────────────
+
+class PlanBuilder {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._analyzer = MeansEndAnalyzer(graph, 6)
+        self._subgoals = SubgoalGenerator(graph)
+    }
+
+    fn build_plan(self, goal: string,
+                  current_state: Optional[List[string]]) -> Plan {
+        let current: List[string] = []
+        if current_state != None {
+            current = current_state
+        }
+        let current_set: Set[string] = set()
+        for s in current {
+            current_set.add(s.lower().strip())
+        }
+        let goal_clean = goal.lower().strip()
+        let plan = Plan(goal_clean)
+
+        if goal_clean in current_set {
+            plan.reasoning_trace.append("Goal '" + goal_clean + "' already achieved.")
+            plan.success_probability = 1.0
+            return plan
+        }
+
+        let analysis = self._analyzer.analyze(current, goal_clean)
+        plan.reasoning_trace.append("Means-end: " + analysis["status"])
+
+        if analysis["status"] == "path_found" {
+            let path = analysis["best_path"]
+            for i in range(len(path) - 1) {
+                let src = path[i]
+                let tgt = path[i + 1]
+                let edge: Optional[GraphEdge] = None
+                for e in self._graph.outgoing(src) {
+                    if e.target == tgt {
+                        edge = e
+                        break
+                    }
+                }
+
+                let rel_str = "→"
+                let edge_conf = 0.5
+                if edge != None {
+                    rel_str = edge.relation.value
+                    edge_conf = edge.confidence
+                }
+
+                let preconds: List[string] = []
+                if src not in current_set {
+                    preconds = [src]
+                }
+                let deps: List[string] = []
+                if i > 0 {
+                    deps = ["step-" + str(i)]
+                }
+
+                let action = PlanAction {
+                    action_id: "step-" + str(i + 1),
+                    description: src + " " + rel_str + " " + tgt,
+                    preconditions: preconds,
+                    effects: [tgt],
+                    cost: 1.0,
+                    confidence: edge_conf,
+                    status: ActionStatus.PENDING,
+                    depends_on: deps
+                }
+
+                if src in current_set or i == 0 {
+                    action.status = ActionStatus.READY
+                    plan.preconditions_met.append(src)
+                } else {
+                    plan.preconditions_unmet.append(src)
+                }
+
+                plan.actions.append(action)
+                plan.total_cost += action.cost
+            }
+
+            plan.success_probability = analysis["confidence"]
+        }
+
+        let subgoals = self._subgoals.decompose(goal_clean, current, 10)
+        if len(subgoals) > 0 {
+            let limited: List[string] = []
+            for i in range(min(5, len(subgoals))) {
+                limited.append(subgoals[i])
+            }
+            plan.reasoning_trace.append("Subgoals identified: " + str(limited))
+        }
+
+        let blockers = self._subgoals.find_blockers(goal_clean)
+        if len(blockers) > 0 {
+            plan.reasoning_trace.append("Blockers: " + str(blockers))
+            for b in blockers {
+                if b in current_set {
+                    plan.preconditions_unmet.append("remove:" + b)
+                }
+            }
+        }
+
+        return plan
+    }
+
+    fn evaluate_plan(self, plan: Plan) -> Dict[string, Any] {
+        return {
+            "feasible": plan.is_feasible(),
+            "actions": plan.action_count(),
+            "success_probability": plan.success_probability,
+            "total_cost": plan.total_cost,
+            "unmet_preconditions": plan.preconditions_unmet,
+            "reasoning": plan.reasoning_trace
+        }
+    }
+}
+
+/// ── Goal Planner (Unified) ─────────────────────────────────────────
+
+class GoalPlanner {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._builder = PlanBuilder(graph)
+    }
+
+    fn plan(self, goal: string,
+            current_state: Optional[List[string]]) -> Plan {
+        return self._builder.build_plan(goal, current_state)
+    }
+
+    fn evaluate(self, plan: Plan) -> Dict[string, Any] {
+        return self._builder.evaluate_plan(plan)
+    }
+
+    fn what_do_i_need(self, goal: string) -> List[any] {
+        let gen = SubgoalGenerator(self._graph)
+        return gen.decompose(goal, None, 10)
+    }
+
+    fn what_blocks_me(self, goal: string) -> List[any] {
+        let gen = SubgoalGenerator(self._graph)
+        return gen.find_blockers(goal)
+    }
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export ActionStatus, PlanAction, Plan
+export MeansEndAnalyzer, SubgoalGenerator, PlanBuilder, GoalPlanner

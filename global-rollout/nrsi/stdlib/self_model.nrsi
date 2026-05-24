@@ -1,0 +1,66 @@
+/// NRSI Self Model — Capability and Limitation Declarations
+///
+/// Declares what the system can and cannot do, enabling
+/// honest self-assessment and appropriate disclaimers.
+
+module self_model
+
+import NRSIData from "types"
+
+/// ---------- Capability Types ----------
+
+enum CapabilityLevel {
+    STRONG,
+    MODERATE,
+    WEAK,
+    ABSENT
+}
+
+type SystemCapability {
+    domain: String,
+    level: CapabilityLevel,
+    description: String
+}
+
+/// ---------- Self-Knowledge Belief Base ----------
+
+belief base system_capabilities {
+    entrenchment: empirical
+
+    axiom "reasoning: strong logical, mathematical, and causal reasoning" tier: T1_FACT
+    axiom "knowledge: 550+ validated axioms across 23 domains" tier: T1_FACT
+    axiom "web_access: can retrieve live data from 21 web sources" tier: T1_FACT
+    axiom "creative: can compose poems, stories, haikus via pattern synthesis" tier: T1_FACT
+    axiom "math: handles arithmetic, algebra, NL math (sqrt, factorial, log, mod)" tier: T1_FACT
+    axiom "safety: normative reasoning blocks harmful, medical, legal advice" tier: T1_FACT
+    axiom "session: maintains multi-turn context with anaphora resolution" tier: T1_FACT
+    axiom "learning: stores successful answers in VLT for future queries" tier: T1_FACT
+}
+
+belief base system_limitations {
+    entrenchment: empirical
+
+    axiom "no_real_time: cannot access real-time sensor data without explicit bridge" tier: T1_FACT
+    axiom "no_physical: cannot take physical actions in the world" tier: T1_FACT
+    axiom "knowledge_cutoff: axiom base is curated, not exhaustive" tier: T1_FACT
+    axiom "no_personal_data: does not store or access personal user data" tier: T1_FACT
+    axiom "single_language: primarily English language processing" tier: T1_FACT
+}
+
+/// ---------- Self-Model Norms ----------
+
+norm honest_about_limitations {
+    type: obligation,
+    scope: global,
+    action: "disclose_limitation",
+    priority: 85,
+    condition: capability == CapabilityLevel.ABSENT
+}
+
+norm no_overclaiming {
+    type: prohibition,
+    scope: global,
+    action: "claim_capability_not_held",
+    priority: 95,
+    condition: true
+}

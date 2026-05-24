@@ -1,0 +1,558 @@
+/// NRSI — Web Knowledge Intelligence.
+///
+/// Connects the cognitive system to the web: gap-driven search,
+/// web fact extraction, source credibility, gated ingestion,
+/// Bayesian evidence, and curiosity-driven learning.
+/// All transformer-free.
+
+module reasoning_web
+
+
+import time from "std/time"
+from "reasoning_graph" import CausalGraph, GraphEdge, RelationType
+from "reasoning_nlp" import EnhancedFactExtractor, ExtractedTriple
+from "reasoning_governance" import KnowledgeIngestionGate, GateVerdict
+from "reasoning_bayesian" import GraphConfidenceManager, Evidence, EvidenceType, BayesianUpdater
+from "web_retrieval" import WebRetrievalEngine, SearchResult, RetrievedFact
+
+/// ---------- Domain trust tiers ----------
+
+let _DOMAIN_TIERS: Dict[string, float] = {
+    "gov": 0.9,
+    "edu": 0.85,
+    "org": 0.7,
+    "nature.com": 0.9,
+    "science.org": 0.9,
+    "sciencedirect.com": 0.85,
+    "springer.com": 0.85,
+    "pubmed.ncbi.nlm.nih.gov": 0.9,
+    "who.int": 0.9,
+    "cdc.gov": 0.9,
+    "nasa.gov": 0.9,
+    "wikipedia.org": 0.6,
+    "britannica.com": 0.7,
+    "reuters.com": 0.75,
+    "bbc.com": 0.7,
+    "nytimes.com": 0.7,
+    "arxiv.org": 0.8,
+    "stackoverflow.com": 0.5,
+    "reddit.com": 0.3,
+    "medium.com": 0.35,
+    "quora.com": 0.3
+}
+
+/// ---------- Types ----------
+
+type SourceCredibility {
+    domain: string,
+    base_trust: float,
+    successful_extractions: int,
+    failed_extractions: int,
+    facts_accepted: int,
+    facts_rejected: int,
+    last_accessed: float
+}
+
+fn source_effective_trust(s: SourceCredibility) -> float {
+    let total = s.facts_accepted + s.facts_rejected
+    if total == 0 {
+        return s.base_trust
+    }
+    let acceptance_rate = s.facts_accepted / total
+    return (s.base_trust + acceptance_rate) / 2.0
+}
+
+type WebExtractedFact {
+    triple: ExtractedTriple,
+    source_url: string,
+    source_credibility: float,
+    extraction_method: string,
+    raw_text: string,
+    content_hash: string
+}
+
+type WebIntegrationResult {
+    queries_executed: int,
+    pages_fetched: int,
+    facts_extracted: int,
+    facts_accepted: int,
+    facts_rejected: int,
+    new_concepts: List[string],
+    sources_used: List[string],
+    time_ms: float
+}
+
+fn integration_acceptance_rate(r: WebIntegrationResult) -> float {
+    let total = r.facts_accepted + r.facts_rejected
+    if total > 0 {
+        return r.facts_accepted / total
+    }
+    return 0.0
+}
+
+fn _new_web_integration_result() -> WebIntegrationResult {
+    return WebIntegrationResult {
+        queries_executed: 0, pages_fetched: 0,
+        facts_extracted: 0, facts_accepted: 0, facts_rejected: 0,
+        new_concepts: [], sources_used: [], time_ms: 0.0
+    }
+}
+
+/// ---------- Source Credibility Tracker ----------
+
+class SourceCredibilityTracker {
+    fn __init__(self) {
+        self._sources: Dict[string, SourceCredibility] = {}
+    }
+
+    fn rate_url(self, url: string) -> float {
+        let domain = self._extract_domain(url)
+        let cred = self._get_or_create(domain)
+        return source_effective_trust(cred)
+    }
+
+    fn record_outcome(self, url: string, accepted: bool) {
+        let domain = self._extract_domain(url)
+        let cred = self._get_or_create(domain)
+        if accepted {
+            cred.facts_accepted += 1
+        } else {
+            cred.facts_rejected += 1
+        }
+        cred.last_accessed = time.time()
+    }
+
+    fn get_profile(self, url: string) -> SourceCredibility {
+        let domain = self._extract_domain(url)
+        return self._get_or_create(domain)
+    }
+
+    fn top_sources(self, n: int) -> List[any] {
+        let all: List[SourceCredibility] = []
+        for k in self._sources {
+            all.append(self._sources[k])
+        }
+        let sorted_list: List[SourceCredibility] = []
+        let remaining = list(all)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            let best_trust = source_effective_trust(remaining[0])
+            for i in range(1, len(remaining)) {
+                let t = source_effective_trust(remaining[i])
+                if t > best_trust {
+                    best_trust = t
+                    best_idx = i
+                }
+            }
+            sorted_list.append(remaining.pop(best_idx))
+        }
+        let limited: List[SourceCredibility] = []
+        for i in range(min(n, len(sorted_list))) {
+            limited.append(sorted_list[i])
+        }
+        return limited
+    }
+
+    fn _extract_domain(self, url: string) -> string {
+        let parts = url.split("://")
+        if len(parts) > 1 {
+            let host = parts[1].split("/")[0]
+            if host.startswith("www.") {
+                host = host[4:]
+            }
+            return host
+        }
+        return url
+    }
+
+    fn _get_or_create(self, domain: string) -> SourceCredibility {
+        if domain not in self._sources {
+            let base = 0.5
+            for pattern in _DOMAIN_TIERS {
+                if domain.endswith(pattern) or pattern in domain {
+                    base = _DOMAIN_TIERS[pattern]
+                    break
+                }
+            }
+            self._sources[domain] = SourceCredibility {
+                domain: domain, base_trust: base,
+                successful_extractions: 0, failed_extractions: 0,
+                facts_accepted: 0, facts_rejected: 0,
+                last_accessed: time.time()
+            }
+        }
+        return self._sources[domain]
+    }
+}
+
+/// ---------- Search Query Generator ----------
+
+class SearchQueryGenerator {
+    fn from_gaps(self, concept: string, missing_relations: List[string]) -> List[any] {
+        let queries: List[string] = []
+        for gap in missing_relations {
+            let gap_lower = gap.lower()
+            if "causes" in gap_lower or "effects" in gap_lower {
+                queries.append("what causes " + concept)
+                queries.append("effects of " + concept)
+            } else if "is_a" in gap_lower {
+                queries.append("what is " + concept)
+                queries.append(concept + " definition classification")
+            } else if "part_of" in gap_lower {
+                queries.append(concept + " components parts")
+            } else if "prevents" in gap_lower {
+                queries.append("how to prevent " + concept)
+            } else if "enables" in gap_lower {
+                queries.append("what enables " + concept)
+            } else {
+                let cleaned = gap.replace("No ", "").replace(" relation known", "")
+                queries.append(concept + " " + cleaned)
+            }
+        }
+
+        if len(queries) == 0 {
+            queries = [
+                "what is " + concept,
+                concept + " causes effects",
+                concept + " facts science"
+            ]
+        }
+
+        let limited: List[string] = []
+        for i in range(min(5, len(queries))) {
+            limited.append(queries[i])
+        }
+        return limited
+    }
+
+    fn from_concepts(self, concepts: List[string], query_context: string) -> List[any] {
+        let queries: List[string] = []
+
+        if len(concepts) >= 2 {
+            queries.append("relationship between " + concepts[0] + " and " + concepts[1])
+            queries.append("how does " + concepts[0] + " affect " + concepts[1])
+        }
+
+        for i in range(min(3, len(concepts))) {
+            queries.append(concepts[i] + " facts evidence scientific")
+        }
+
+        if query_context != "" {
+            queries.insert(0, query_context)
+        }
+
+        let limited: List[string] = []
+        for i in range(min(5, len(queries))) {
+            limited.append(queries[i])
+        }
+        return limited
+    }
+
+    fn for_curiosity(self, weak_domains: List[string],
+                      frontier_concepts: List[string]) -> List[any] {
+        let queries: List[string] = []
+        for i in range(min(2, len(weak_domains))) {
+            queries.append(weak_domains[i] + " key facts principles")
+        }
+        for i in range(min(3, len(frontier_concepts))) {
+            queries.append(frontier_concepts[i] + " causes effects relationships")
+        }
+        let limited: List[string] = []
+        for i in range(min(5, len(queries))) {
+            limited.append(queries[i])
+        }
+        return limited
+    }
+}
+
+/// ---------- Web Fact Extractor ----------
+
+class WebFactExtractor {
+    fn __init__(self) {
+        self._nlp = EnhancedFactExtractor()
+    }
+
+    fn extract(self, text: string, source_url: string,
+               credibility: float, domain: string) -> List[any] {
+        if domain == "" {
+            domain = "web"
+        }
+        let cleaned = self._clean_web_text(text)
+        let fact_id = "web-" + hashlib_md5(source_url)[:8]
+        let triples = self._nlp.extract_from_text(
+            cleaned, credibility * 0.8, fact_id, domain)
+
+        let results: List[WebExtractedFact] = []
+        for triple in triples {
+            let hash_input = triple.subject + "|" + triple.relation.value + "|" + triple.obj
+            results.append(WebExtractedFact {
+                triple: triple,
+                source_url: source_url,
+                source_credibility: credibility,
+                extraction_method: "nlp_pipeline",
+                raw_text: cleaned[:200],
+                content_hash: hashlib_sha256(hash_input)[:16]
+            })
+        }
+        return results
+    }
+
+    fn _clean_web_text(self, text: string) -> string {
+        let cleaned = regex_replace(text, "https?://\\S+", "")
+        cleaned = regex_replace(cleaned, "[^\\w\\s.,;:!?'\"\\-]", " ")
+        cleaned = regex_replace(cleaned, "\\s+", " ").strip()
+        if len(cleaned) > 5000 {
+            cleaned = cleaned[:5000]
+        }
+        return cleaned
+    }
+}
+
+/// ---------- Web Knowledge Integrator ----------
+
+class WebKnowledgeIntegrator {
+    fn __init__(self, graph: CausalGraph, web_engine: WebRetrievalEngine,
+                gate: KnowledgeIngestionGate,
+                confidence_mgr: Optional[GraphConfidenceManager]) {
+        self._graph = graph
+        self._web = web_engine
+        self._gate = gate
+        if confidence_mgr != None {
+            self._confidence = confidence_mgr
+        } else {
+            self._confidence = GraphConfidenceManager(graph)
+        }
+        self._credibility = SourceCredibilityTracker()
+        self._query_gen = SearchQueryGenerator()
+        self._extractor = WebFactExtractor()
+        self._seen_hashes: Set[string] = set()
+    }
+
+    fn credibility_tracker(self) -> SourceCredibilityTracker {
+        return self._credibility
+    }
+
+    fn fill_gaps(self, concept: string, missing_relations: List[string],
+                 max_queries: int) -> WebIntegrationResult {
+        let t0 = time.time()
+        let result = _new_web_integration_result()
+
+        let queries = self._query_gen.from_gaps(concept, missing_relations)
+        for i in range(min(max_queries, len(queries))) {
+            let r = self._execute_query(queries[i], 5)
+            result.queries_executed += 1
+            result.pages_fetched += r.pages_fetched
+            result.facts_extracted += r.facts_extracted
+            result.facts_accepted += r.facts_accepted
+            result.facts_rejected += r.facts_rejected
+            for c in r.new_concepts {
+                result.new_concepts.append(c)
+            }
+            for s in r.sources_used {
+                result.sources_used.append(s)
+            }
+        }
+
+        result.time_ms = (time.time() - t0) * 1000.0
+        return result
+    }
+
+    fn research_query(self, query: string, max_results: int) -> WebIntegrationResult {
+        let t0 = time.time()
+        let result = self._execute_query(query, max_results)
+        result.time_ms = (time.time() - t0) * 1000.0
+        return result
+    }
+
+    fn research_concepts(self, concepts: List[string], context: string,
+                          max_queries: int) -> WebIntegrationResult {
+        let t0 = time.time()
+        let result = _new_web_integration_result()
+
+        let queries = self._query_gen.from_concepts(concepts, context)
+        for i in range(min(max_queries, len(queries))) {
+            let r = self._execute_query(queries[i], 5)
+            result.queries_executed += 1
+            result.pages_fetched += r.pages_fetched
+            result.facts_extracted += r.facts_extracted
+            result.facts_accepted += r.facts_accepted
+            result.facts_rejected += r.facts_rejected
+            for c in r.new_concepts {
+                result.new_concepts.append(c)
+            }
+            for s in r.sources_used {
+                result.sources_used.append(s)
+            }
+        }
+
+        result.time_ms = (time.time() - t0) * 1000.0
+        return result
+    }
+
+    fn curiosity_explore(self, weak_domains: List[string],
+                          frontier_concepts: List[string],
+                          max_queries: int) -> WebIntegrationResult {
+        let t0 = time.time()
+        let result = _new_web_integration_result()
+
+        let queries = self._query_gen.for_curiosity(weak_domains, frontier_concepts)
+        for i in range(min(max_queries, len(queries))) {
+            let r = self._execute_query(queries[i], 5)
+            result.queries_executed += 1
+            result.pages_fetched += r.pages_fetched
+            result.facts_extracted += r.facts_extracted
+            result.facts_accepted += r.facts_accepted
+            result.facts_rejected += r.facts_rejected
+            for c in r.new_concepts {
+                result.new_concepts.append(c)
+            }
+            for s in r.sources_used {
+                result.sources_used.append(s)
+            }
+        }
+
+        result.time_ms = (time.time() - t0) * 1000.0
+        return result
+    }
+
+    fn _execute_query(self, query: string, max_results: int) -> WebIntegrationResult {
+        let result = _new_web_integration_result()
+        result.queries_executed = 1
+
+        let retrieved = self._web.retrieve_facts(query, max_results)
+        result.pages_fetched = len(retrieved)
+
+        for fact in retrieved {
+            let credibility = self._credibility.rate_url(fact.source_url)
+
+            let web_facts = self._extractor.extract(
+                fact.text, fact.source_url, credibility, "web")
+
+            for wf in web_facts {
+                if wf.content_hash in self._seen_hashes {
+                    continue
+                }
+                self._seen_hashes.add(wf.content_hash)
+
+                result.facts_extracted += 1
+                let triple = wf.triple
+
+                let decision = self._gate.evaluate(
+                    triple.subject, triple.obj, triple.relation,
+                    triple.confidence * credibility,
+                    "web_retrieval", "web",
+                    "[" + fact.source_url + "] " + fact.text[:100])
+
+                if decision.verdict == GateVerdict.ACCEPT {
+                    self._graph.add_edge(
+                        triple.subject, triple.obj, triple.relation,
+                        triple.confidence * credibility,
+                        "web", "web:" + fact.source_url, triple.fact_id)
+
+                    let edge_id = triple.subject.lower() + "|" + triple.relation.value + "|" + triple.obj.lower()
+                    let ev_type = EvidenceType.CONVERSATIONAL
+                    if credibility >= 0.8 {
+                        ev_type = EvidenceType.DIRECT_OBSERVATION
+                    }
+                    let ev = Evidence {
+                        evidence_id: "web-" + wf.content_hash,
+                        evidence_type: ev_type,
+                        supports: true,
+                        strength: credibility,
+                        source: fact.source_url,
+                        description: fact.text[:200]
+                    }
+                    self._confidence.add_evidence_for_edge(edge_id, ev, true)
+
+                    result.facts_accepted += 1
+                    result.new_concepts.append(triple.subject)
+                    result.new_concepts.append(triple.obj)
+                    self._credibility.record_outcome(fact.source_url, true)
+                } else {
+                    result.facts_rejected += 1
+                    self._credibility.record_outcome(fact.source_url, false)
+                }
+            }
+
+            if fact.source_url not in result.sources_used {
+                result.sources_used.append(fact.source_url)
+            }
+        }
+
+        return result
+    }
+}
+
+/// ---------- Web-Augmented Reasoner ----------
+
+class WebAugmentedReasoner {
+    fn __init__(self, integrator: WebKnowledgeIntegrator) {
+        self._integrator = integrator
+    }
+
+    fn augment_for_gaps(self, concepts: List[string], gaps: List[string],
+                         query_context: string) -> WebIntegrationResult {
+        let total = _new_web_integration_result()
+
+        for i in range(min(3, len(concepts))) {
+            let concept = concepts[i]
+            let concept_gaps: List[string] = []
+            for g in gaps {
+                if concept.lower() in g.lower() {
+                    concept_gaps.append(g)
+                }
+            }
+            if len(concept_gaps) == 0 {
+                for j in range(min(2, len(gaps))) {
+                    concept_gaps.append(gaps[j])
+                }
+            }
+
+            let r = self._integrator.fill_gaps(concept, concept_gaps, 2)
+            total.queries_executed += r.queries_executed
+            total.pages_fetched += r.pages_fetched
+            total.facts_extracted += r.facts_extracted
+            total.facts_accepted += r.facts_accepted
+            total.facts_rejected += r.facts_rejected
+            for c in r.new_concepts {
+                total.new_concepts.append(c)
+            }
+            for s in r.sources_used {
+                total.sources_used.append(s)
+            }
+        }
+
+        if query_context != "" {
+            let r = self._integrator.research_query(query_context, 3)
+            total.queries_executed += r.queries_executed
+            total.pages_fetched += r.pages_fetched
+            total.facts_extracted += r.facts_extracted
+            total.facts_accepted += r.facts_accepted
+            total.facts_rejected += r.facts_rejected
+            for c in r.new_concepts {
+                total.new_concepts.append(c)
+            }
+            for s in r.sources_used {
+                total.sources_used.append(s)
+            }
+        }
+
+        return total
+    }
+}
+
+/// ---------- Gate ----------
+
+gate web_knowledge_gate(data: raw[WebIntegrationResult]) -> validated[WebIntegrationResult] {
+    require confidence >= 0.4
+    validate source_credibility
+    validate ingestion_gate
+}
+
+/// ---------- Exports ----------
+
+export SourceCredibility, WebExtractedFact, WebIntegrationResult
+export source_effective_trust, integration_acceptance_rate
+export SourceCredibilityTracker, SearchQueryGenerator, WebFactExtractor
+export WebKnowledgeIntegrator, WebAugmentedReasoner
+export web_knowledge_gate

@@ -1,0 +1,540 @@
+/// NRSI Metacognition — Learning & Strategy Adaptation.
+///
+/// Two cooperating subsystems:
+///
+/// 1. **Outcome Learning Engine** — after every interaction, converts user
+///    corrections, satisfaction signals, and validator outcomes into
+///    reusable LessonRecords.
+///
+/// 2. **Strategy Adapter** — consumes lessons and adjusts the
+///    StrategyPolicySnapshot over time.  Adaptation is partitioned into
+///    three safety classes:
+///
+///    - auto_adaptive: preference, framing, retrieval ordering, clarification
+///      heuristics.  Applied immediately, no gate.
+///    - gated_adaptive: low-risk routing changes, planner defaults,
+///      summarisation strategy, critique thresholds.  Applied only if a
+///      lightweight validator passes.
+///    - review_required: high-risk domain policy, refusal thresholds,
+///      validation bypasses.  Never applied without explicit operator review.
+
+module metacognition_learning
+
+from "metacognition_types" import ConversationEpisode, CritiqueVerdict, EpisodeOutcome, GoalState, LessonRecord, PolicyDelta, ProcessingMode, ReasoningPlan, SafetyClass, SelfAssessment, StrategyPolicySnapshot, UserModel, _now_ms, _uid, policy_delta_new
+from "metacognition_memory" import MetacognitionMemory
+
+/// ── Outcome signals ────────────────────────────────────────────────
+
+type OutcomeSignal {
+    signal_type: string,
+    description: string,
+    confidence: float,
+    metadata: Dict[string, Any],
+    timestamp_ms: int
+}
+
+fn outcome_signal_new(signal_type: string, description: string,
+                      confidence: float, metadata: Dict[string, Any]) -> OutcomeSignal {
+    let md = metadata
+    if md == None {
+        md = {}
+    }
+    return OutcomeSignal {
+        signal_type: signal_type,
+        description: description,
+        confidence: confidence,
+        metadata: md,
+        timestamp_ms: _now_ms()
+    }
+}
+
+/// ── Outcome Learning Engine ────────────────────────────────────────
+
+class OutcomeLearningEngine {
+    let CORRECTION_LESSON_CONFIDENCE = 0.85
+    let SATISFACTION_LESSON_CONFIDENCE = 0.60
+    let VALIDATOR_LESSON_CONFIDENCE = 0.75
+    let ABANDONMENT_LESSON_CONFIDENCE = 0.50
+
+    fn __init__(self, memory: MetacognitionMemory) {
+        self.memory = memory
+    }
+
+    fn process_outcome(self, episode: ConversationEpisode,
+                       user: UserModel, plan: ReasoningPlan,
+                       assessments: List[SelfAssessment],
+                       signals: List[OutcomeSignal]) -> List[any] {
+        let lessons: List[LessonRecord] = []
+
+        for signal in signals {
+            let extracted = self._extract_from_signal(
+                signal, episode, user, plan, assessments)
+            for l in extracted {
+                lessons.append(l)
+            }
+        }
+
+        let implicit = self._extract_implicit_lessons(
+            episode, user, plan, assessments)
+        for l in implicit {
+            lessons.append(l)
+        }
+
+        for lesson in lessons {
+            self.memory.store_lesson(lesson)
+        }
+
+        return lessons
+    }
+
+    fn _extract_from_signal(self, signal: OutcomeSignal,
+                            episode: ConversationEpisode,
+                            user: UserModel, plan: ReasoningPlan,
+                            assessments: List[SelfAssessment]) -> List[any] {
+        let lessons: List[LessonRecord] = []
+
+        if signal.signal_type == "correction" {
+            let lr = LessonRecord()
+            lr.episode_id = episode.episode_id
+            lr.user_id = user.user_id
+            lr.lesson_type = "factual_correction"
+            lr.description = signal.description
+            lr.domain = signal.metadata.get("domain", "")
+            lr.scope = "user"
+            lr.reuse_conditions = ["same_user", "similar_query"]
+            lr.safety_class = self._classify_correction_safety(signal)
+            lr.confidence = self.CORRECTION_LESSON_CONFIDENCE
+            lr.evidence_ids = [episode.episode_id]
+            lessons.append(lr)
+
+            user.record_correction(
+                signal.metadata.get("original", ""),
+                signal.metadata.get("corrected", ""),
+                signal.metadata.get("domain", "")
+            )
+
+        } else if signal.signal_type == "satisfaction" {
+            let satisfaction = signal.confidence
+            if satisfaction > 0.8 {
+                let lr = LessonRecord()
+                lr.episode_id = episode.episode_id
+                lr.user_id = user.user_id
+                lr.lesson_type = "positive_strategy"
+                let decomp = plan.decomposition_strategy
+                if decomp == "" {
+                    decomp = "none"
+                }
+                lr.description = ("Strategy worked well: mode=" +
+                    plan.chosen_mode.value + ", decomposition=" + decomp)
+                lr.scope = "user"
+                lr.reuse_conditions = ["same_user", "similar_domain"]
+                lr.safety_class = SafetyClass.AUTO_ADAPTIVE
+                lr.confidence = self.SATISFACTION_LESSON_CONFIDENCE
+                lr.evidence_ids = [episode.episode_id]
+                lessons.append(lr)
+            } else if satisfaction < 0.3 {
+                let lr = LessonRecord()
+                lr.episode_id = episode.episode_id
+                lr.user_id = user.user_id
+                lr.lesson_type = "negative_strategy"
+                let decomp = plan.decomposition_strategy
+                if decomp == "" {
+                    decomp = "none"
+                }
+                lr.description = ("Strategy underperformed: mode=" +
+                    plan.chosen_mode.value + ", decomposition=" + decomp)
+                lr.scope = "user"
+                lr.reuse_conditions = ["same_user", "similar_domain"]
+                lr.safety_class = SafetyClass.AUTO_ADAPTIVE
+                lr.confidence = self.SATISFACTION_LESSON_CONFIDENCE
+                lr.evidence_ids = [episode.episode_id]
+                lessons.append(lr)
+            }
+
+        } else if signal.signal_type == "validator" {
+            let passed = signal.metadata.get("passed", true)
+            if not passed {
+                let lr = LessonRecord()
+                lr.episode_id = episode.episode_id
+                lr.user_id = user.user_id
+                lr.lesson_type = "validator_failure"
+                lr.description = signal.description
+                lr.domain = signal.metadata.get("domain", "")
+                lr.scope = "global"
+                lr.reuse_conditions = ["any_user", "same_domain"]
+                lr.safety_class = SafetyClass.GATED_ADAPTIVE
+                lr.confidence = self.VALIDATOR_LESSON_CONFIDENCE
+                lr.evidence_ids = [episode.episode_id]
+                lessons.append(lr)
+            }
+
+        } else if signal.signal_type == "abandonment" {
+            let lr = LessonRecord()
+            lr.episode_id = episode.episode_id
+            lr.user_id = user.user_id
+            lr.lesson_type = "interaction_abandoned"
+            let desc = signal.description
+            if desc == "" {
+                desc = "User abandoned interaction"
+            }
+            lr.description = desc
+            lr.scope = "user"
+            lr.reuse_conditions = ["same_user"]
+            lr.safety_class = SafetyClass.AUTO_ADAPTIVE
+            lr.confidence = self.ABANDONMENT_LESSON_CONFIDENCE
+            lr.evidence_ids = [episode.episode_id]
+            lessons.append(lr)
+
+        } else if signal.signal_type == "timeout" {
+            let lr = LessonRecord()
+            lr.episode_id = episode.episode_id
+            lr.user_id = user.user_id
+            lr.lesson_type = "latency_issue"
+            lr.description = "Response exceeded latency budget"
+            lr.scope = "global"
+            lr.reuse_conditions = ["any_user"]
+            lr.safety_class = SafetyClass.AUTO_ADAPTIVE
+            lr.confidence = 0.70
+            lr.evidence_ids = [episode.episode_id]
+            lessons.append(lr)
+        }
+
+        return lessons
+    }
+
+    fn _extract_implicit_lessons(self, episode: ConversationEpisode,
+                                 user: UserModel, plan: ReasoningPlan,
+                                 assessments: List[SelfAssessment]) -> List[any] {
+        let lessons: List[LessonRecord] = []
+
+        let revision_count = 0
+        for a in assessments {
+            if a.verdict == CritiqueVerdict.REVISE or a.verdict == CritiqueVerdict.ESCALATE {
+                revision_count += 1
+            }
+        }
+        if revision_count >= 2 {
+            let lr = LessonRecord()
+            lr.episode_id = episode.episode_id
+            lr.user_id = user.user_id
+            lr.lesson_type = "excessive_revision"
+            lr.description = ("Required " + str(revision_count) +
+                " revision rounds; initial plan confidence was " +
+                str(round(plan.planner_confidence, 2)))
+            lr.scope = "user"
+            lr.reuse_conditions = ["same_user", "similar_query_complexity"]
+            lr.safety_class = SafetyClass.GATED_ADAPTIVE
+            lr.confidence = 0.65
+            lr.evidence_ids = [episode.episode_id]
+            lessons.append(lr)
+        }
+
+        if plan.clarification_needed {
+            let lr = LessonRecord()
+            lr.episode_id = episode.episode_id
+            lr.user_id = user.user_id
+            lr.lesson_type = "clarification_pattern"
+            lr.description = "System needed to ask for clarification"
+            lr.scope = "user"
+            lr.reuse_conditions = ["same_user", "similar_ambiguity"]
+            lr.safety_class = SafetyClass.AUTO_ADAPTIVE
+            lr.confidence = 0.60
+            lr.evidence_ids = [episode.episode_id]
+            lessons.append(lr)
+        }
+
+        for domain in user.expertise_estimates {
+            let expertise = user.expertise_estimates[domain]
+            if expertise > 0.7 {
+                for a in assessments {
+                    let has_verbosity = false
+                    for f in a.critique_findings {
+                        if f.category == "verbosity_mismatch" {
+                            has_verbosity = true
+                            break
+                        }
+                    }
+                    if has_verbosity {
+                        let lr = LessonRecord()
+                        lr.episode_id = episode.episode_id
+                        lr.user_id = user.user_id
+                        lr.lesson_type = "expertise_verbosity_mismatch"
+                        lr.description = "User is expert in " + domain + ", reduce explanation depth"
+                        lr.domain = domain
+                        lr.scope = "user"
+                        lr.reuse_conditions = ["same_user", "same_domain"]
+                        lr.safety_class = SafetyClass.AUTO_ADAPTIVE
+                        lr.confidence = 0.70
+                        lr.evidence_ids = [episode.episode_id]
+                        lessons.append(lr)
+                        break
+                    }
+                }
+            }
+        }
+
+        return lessons
+    }
+
+    fn _classify_correction_safety(self, signal: OutcomeSignal) -> SafetyClass {
+        let domain = signal.metadata.get("domain", "").lower()
+        let high_risk: Set[string] = {"medical", "legal", "financial", "safety", "defense"}
+        if domain in high_risk {
+            return SafetyClass.REVIEW_REQUIRED
+        }
+        return SafetyClass.GATED_ADAPTIVE
+    }
+}
+
+/// ── Satisfaction Detector ──────────────────────────────────────────
+
+class SatisfactionDetector {
+    fn __init__(self) {
+        self._POSITIVE: Set[string] = {
+            "thanks", "thank", "perfect", "great", "awesome", "excellent",
+            "exactly", "yes", "correct", "right", "good", "helpful", "love",
+            "nice", "wonderful", "fantastic"
+        }
+        self._NEGATIVE: Set[string] = {
+            "wrong", "incorrect", "no", "bad", "terrible", "awful", "hate",
+            "useless", "not what", "that's not", "you're wrong", "doesn't"
+        }
+        self._CORRECTION: Set[string] = {
+            "actually", "no,", "that's wrong", "incorrect", "correction",
+            "not quite", "that's not right"
+        }
+    }
+
+    fn detect(self, user_text: string) -> OutcomeSignal {
+        let text_lower = user_text.lower()
+        let tokens: Set[string] = set()
+        for w in text_lower.split() {
+            tokens.add(w)
+        }
+
+        let pos_count = 0
+        for w in tokens {
+            if w in self._POSITIVE {
+                pos_count += 1
+            }
+        }
+        let neg_count = 0
+        for w in tokens {
+            if w in self._NEGATIVE {
+                neg_count += 1
+            }
+        }
+
+        let has_correction = false
+        for c in self._CORRECTION {
+            if c in text_lower {
+                has_correction = true
+                break
+            }
+        }
+
+        if has_correction {
+            let desc = "User corrected: " + user_text[:200]
+            return outcome_signal_new(
+                "correction", desc, 0.2,
+                {"original": "", "corrected": user_text[:200]}
+            )
+        }
+
+        let total = pos_count + neg_count
+        if total == 0 {
+            return outcome_signal_new("satisfaction", "neutral", 0.5, {})
+        }
+
+        let denom = total
+        if denom < 1 {
+            denom = 1
+        }
+        let satisfaction = pos_count / denom
+        let label = "negative"
+        if satisfaction > 0.5 {
+            label = "positive"
+        }
+        return outcome_signal_new("satisfaction", label, satisfaction, {})
+    }
+}
+
+/// ── Strategy Adapter ───────────────────────────────────────────────
+
+class StrategyAdapter {
+    let BATCH_SIZE = 10
+    let MIN_LESSONS_FOR_ADAPTATION = 3
+
+    fn __init__(self, memory: MetacognitionMemory) {
+        self.memory = memory
+        self.REVIEW_QUEUE: List[Tuple[LessonRecord, string]] = []
+    }
+
+    fn adapt(self, user_id: string,
+             lessons: List[LessonRecord]) -> StrategyPolicySnapshot {
+        let strategy = self.memory.get_or_create_strategy(user_id)
+
+        let auto_lessons: List[LessonRecord] = []
+        let gated_lessons: List[LessonRecord] = []
+        let review_lessons: List[LessonRecord] = []
+
+        for l in lessons {
+            if l.safety_class == SafetyClass.AUTO_ADAPTIVE and not l.invalidated {
+                auto_lessons.append(l)
+            } else if l.safety_class == SafetyClass.GATED_ADAPTIVE and not l.invalidated {
+                gated_lessons.append(l)
+            } else if l.safety_class == SafetyClass.REVIEW_REQUIRED and not l.invalidated {
+                review_lessons.append(l)
+            }
+        }
+
+        for lesson in auto_lessons {
+            self._apply_auto(strategy, lesson)
+        }
+
+        for lesson in gated_lessons {
+            if self._gate_validates(lesson, strategy) {
+                self._apply_gated(strategy, lesson)
+            }
+        }
+
+        for lesson in review_lessons {
+            self.REVIEW_QUEUE.append((lesson, user_id))
+        }
+
+        self.memory.save_strategy(strategy)
+        return strategy
+    }
+
+    fn _apply_auto(self, strategy: StrategyPolicySnapshot,
+                   lesson: LessonRecord) {
+        if lesson.lesson_type == "positive_strategy" {
+            lesson.mark_applied()
+            return
+        }
+
+        if lesson.lesson_type == "negative_strategy" {
+            lesson.mark_applied()
+            return
+        }
+
+        if lesson.lesson_type == "expertise_verbosity_mismatch" {
+            let old = strategy.verbosity_preference
+            let new_val = max(0.0, old - 0.1)
+            strategy.apply_delta(policy_delta_new(
+                "verbosity_preference", old, new_val,
+                lesson.lesson_id, lesson.description,
+                SafetyClass.AUTO_ADAPTIVE
+            ))
+            strategy.verbosity_preference = new_val
+            lesson.mark_applied()
+        }
+
+        if lesson.lesson_type == "clarification_pattern" {
+            let old = strategy.clarification_threshold
+            let new_val = min(0.8, old + 0.05)
+            strategy.apply_delta(policy_delta_new(
+                "clarification_threshold", old, new_val,
+                lesson.lesson_id, lesson.description,
+                SafetyClass.AUTO_ADAPTIVE
+            ))
+            strategy.clarification_threshold = new_val
+            lesson.mark_applied()
+        }
+
+        if lesson.lesson_type == "interaction_abandoned" {
+            let old = strategy.proactive_clarification
+            if not old {
+                strategy.apply_delta(policy_delta_new(
+                    "proactive_clarification", false, true,
+                    lesson.lesson_id,
+                    "Abandonment suggests need for proactive clarification",
+                    SafetyClass.AUTO_ADAPTIVE
+                ))
+                strategy.proactive_clarification = true
+            }
+            lesson.mark_applied()
+        }
+
+        if lesson.lesson_type == "latency_issue" {
+            let old = strategy.revision_budget
+            let new_val = max(1, old - 1)
+            if new_val != old {
+                strategy.apply_delta(policy_delta_new(
+                    "revision_budget", old, new_val,
+                    lesson.lesson_id,
+                    "Latency exceeded; reduce revision budget",
+                    SafetyClass.AUTO_ADAPTIVE
+                ))
+                strategy.revision_budget = new_val
+            }
+            lesson.mark_applied()
+        }
+    }
+
+    fn _gate_validates(self, lesson: LessonRecord,
+                       strategy: StrategyPolicySnapshot) -> bool {
+        if lesson.confidence < 0.5 {
+            return false
+        }
+        if lesson.applied_count > 5 {
+            return false
+        }
+        if lesson.lesson_type == "excessive_revision" {
+            return strategy.revision_budget > 1
+        }
+        if lesson.lesson_type == "validator_failure" {
+            return lesson.confidence >= 0.70
+        }
+        return true
+    }
+
+    fn _apply_gated(self, strategy: StrategyPolicySnapshot,
+                    lesson: LessonRecord) {
+        if lesson.lesson_type == "excessive_revision" {
+            let old = strategy.critique_strictness
+            let new_val = max(0.3, old - 0.05)
+            strategy.apply_delta(policy_delta_new(
+                "critique_strictness", old, new_val,
+                lesson.lesson_id, lesson.description,
+                SafetyClass.GATED_ADAPTIVE
+            ))
+            strategy.critique_strictness = new_val
+            lesson.mark_applied()
+
+        } else if lesson.lesson_type == "validator_failure" {
+            let domain = lesson.domain
+            if domain != "" {
+                let old_hint = strategy.domain_mode_hints.get(domain)
+                let new_hint = ProcessingMode.DETERMINISTIC.value
+                strategy.apply_delta(policy_delta_new(
+                    "domain_mode_hints." + domain, old_hint, new_hint,
+                    lesson.lesson_id,
+                    "Validator failure in " + domain + "; force deterministic",
+                    SafetyClass.GATED_ADAPTIVE
+                ))
+                strategy.domain_mode_hints[domain] = new_hint
+            }
+            lesson.mark_applied()
+
+        } else if lesson.lesson_type == "factual_correction" {
+            let old = strategy.evidence_retrieval_threshold
+            let new_val = min(0.9, old + 0.05)
+            strategy.apply_delta(policy_delta_new(
+                "evidence_retrieval_threshold", old, new_val,
+                lesson.lesson_id,
+                "User correction suggests more evidence needed",
+                SafetyClass.GATED_ADAPTIVE
+            ))
+            strategy.evidence_retrieval_threshold = new_val
+            lesson.mark_applied()
+        }
+    }
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export OutcomeSignal, outcome_signal_new
+export OutcomeLearningEngine
+export SatisfactionDetector
+export StrategyAdapter

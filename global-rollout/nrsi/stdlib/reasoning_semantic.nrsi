@@ -1,0 +1,490 @@
+/// NRSI Reasoning — Semantic Understanding & Attention.
+///
+/// Lightweight distributional word vectors (hash-projected, no pretrained
+/// embeddings), concept normalization, spreading activation for subgraph
+/// focusing, and semantic query-to-graph mapping.
+///
+/// Fixes the 'hearing' problem: the system can reason but couldn't
+/// understand what you were asking.
+///
+/// All transformer-free.  No external ML dependencies.
+
+module reasoning_semantic
+
+import math from "std/math"
+import hashlib from "std/hashlib"
+import re from "std/re"
+
+from "reasoning_graph" import CausalGraph, GraphEdge, GraphNode, RelationType
+
+/// ── Stop Words ──────────────────────────────────────────────────────
+
+let _STOP: Set[string] = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "has",
+    "have", "had", "do", "does", "did", "will", "can", "may", "in",
+    "of", "to", "for", "on", "with", "at", "by", "from", "as", "or",
+    "and", "but", "not", "it", "its", "this", "that", "so", "if",
+    "they", "them", "their", "these", "those", "there", "here",
+    "which", "what", "when", "where", "who", "how", "also", "very",
+    "each", "both", "many", "such", "some", "other", "than",
+    "would", "could", "should", "about", "between", "just"
+}
+
+fn _tokenize(text: string) -> List[any] {
+    let raw = re.findall("[a-z0-9]+(?:'[a-z]+)?", text.lower())
+    let result: List[string] = []
+    for w in raw {
+        if w not in _STOP and len(w) > 1 {
+            result.append(w)
+        }
+    }
+    return result
+}
+
+/// ── Hash-Projected Word Vectors ────────────────────────────────────
+
+let _VEC_DIM = 64
+
+fn _hash_vector(word: string) -> List[any] {
+    let vec: List[float] = []
+    for i in range(_VEC_DIM) {
+        vec.append(0.0)
+    }
+    let wb = word.encode("utf-8")
+    for d in range(_VEC_DIM) {
+        let h = hashlib.md5(wb + d.to_bytes(2, "little")).digest()
+        let val = bytes_to_int(h[:4], "little") / pow(2, 32)
+        let sign = 1.0
+        if (h[4] & 1) == 0 {
+            sign = -1.0
+        }
+        vec[d] = sign * val
+    }
+    let norm_sq = 0.0
+    for v in vec {
+        norm_sq += v * v
+    }
+    let norm = math.sqrt(norm_sq)
+    if norm == 0.0 {
+        norm = 1.0
+    }
+    let result: List[float] = []
+    for v in vec {
+        result.append(v / norm)
+    }
+    return result
+}
+
+fn _phrase_vector(tokens: List[string]) -> List[any] {
+    if len(tokens) == 0 {
+        let zero: List[float] = []
+        for i in range(_VEC_DIM) {
+            zero.append(0.0)
+        }
+        return zero
+    }
+    let acc: List[float] = []
+    for i in range(_VEC_DIM) {
+        acc.append(0.0)
+    }
+    for tok in tokens {
+        let vec = _hash_vector(tok)
+        for d in range(_VEC_DIM) {
+            acc[d] += vec[d]
+        }
+    }
+    let norm_sq = 0.0
+    for v in acc {
+        norm_sq += v * v
+    }
+    let norm = math.sqrt(norm_sq)
+    if norm == 0.0 {
+        norm = 1.0
+    }
+    let result: List[float] = []
+    for v in acc {
+        result.append(v / norm)
+    }
+    return result
+}
+
+fn _cosine(a: List[float], b: List[float]) -> float {
+    let dot = 0.0
+    for i in range(len(a)) {
+        dot += a[i] * b[i]
+    }
+    return max(min(dot, 1.0), -1.0)
+}
+
+/// ── Concept Normalizer ─────────────────────────────────────────────
+
+let _SYNONYMS: Dict[string, string] = {
+    "co2": "carbon dioxide",
+    "temp": "temperature",
+    "temps": "temperature",
+    "h2o": "water",
+    "o2": "oxygen",
+    "n2": "nitrogen",
+    "ai": "artificial intelligence",
+    "ml": "machine learning",
+    "gdp": "gross domestic product",
+    "dna": "deoxyribonucleic acid",
+    "rna": "ribonucleic acid",
+    "uv": "ultraviolet",
+    "ir": "infrared",
+    "ghg": "greenhouse gas",
+    "ev": "electric vehicle",
+    "iot": "internet of things"
+}
+
+fn normalize_concept(text: string) -> string {
+    text = text.lower().strip()
+    if text in _SYNONYMS {
+        return _SYNONYMS[text]
+    }
+    let tokens = _tokenize(text)
+    for i in range(len(tokens)) {
+        if tokens[i] in _SYNONYMS {
+            tokens[i] = _SYNONYMS[tokens[i]]
+        }
+    }
+    if len(tokens) > 0 {
+        return " ".join(tokens)
+    }
+    return text
+}
+
+/// ── Semantic Index ─────────────────────────────────────────────────
+
+class SemanticIndex {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._vectors: Dict[string, List[float]] = {}
+        self._built = false
+    }
+
+    fn build(self) {
+        self._vectors = {}
+        for node in self._graph.all_nodes() {
+            let tokens = _tokenize(node.concept)
+            if len(tokens) > 0 {
+                self._vectors[node.node_id()] = _phrase_vector(tokens)
+            }
+        }
+        self._built = true
+    }
+
+    fn query(self, text: string, top_k: int,
+             min_similarity: float) -> List[any] {
+        if top_k == None {
+            top_k = 10
+        }
+        if min_similarity == None {
+            min_similarity = 0.15
+        }
+        if not self._built {
+            self.build()
+        }
+
+        let tokens = _tokenize(normalize_concept(text))
+        if len(tokens) == 0 {
+            return []
+        }
+        let qvec = _phrase_vector(tokens)
+
+        let scored: List[Tuple[float, string]] = []
+        for nid in self._vectors {
+            let nvec = self._vectors[nid]
+            let sim = _cosine(qvec, nvec)
+            if sim >= min_similarity {
+                scored.append((sim, nid))
+            }
+        }
+
+        let sorted_scored: List[Tuple[float, string]] = []
+        let remaining = list(scored)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i][0] > remaining[best_idx][0] {
+                    best_idx = i
+                }
+            }
+            sorted_scored.append(remaining.pop(best_idx))
+        }
+
+        let result: List[Tuple[string, float]] = []
+        for i in range(min(top_k, len(sorted_scored))) {
+            let entry = sorted_scored[i]
+            result.append((entry[1], entry[0]))
+        }
+        return result
+    }
+
+    fn most_similar_node(self, text: string) -> Optional[Tuple[string, float]] {
+        let results = self.query(text, 1, 0.1)
+        if len(results) > 0 {
+            return results[0]
+        }
+        return None
+    }
+}
+
+/// ── Spreading Activation ───────────────────────────────────────────
+
+type ActivationState {
+    concept: string,
+    activation: float,
+    depth: int,
+    source: string
+}
+
+class SpreadingActivation {
+    fn __init__(self, graph: CausalGraph,
+                decay_factor: float, max_depth: int,
+                min_activation: float) {
+        self._graph = graph
+        self._decay = decay_factor
+        if self._decay == None {
+            self._decay = 0.6
+        }
+        self._max_depth = max_depth
+        if self._max_depth == None {
+            self._max_depth = 3
+        }
+        self._min_activation = min_activation
+        if self._min_activation == None {
+            self._min_activation = 0.05
+        }
+    }
+
+    fn activate(self, seeds: List[Tuple[string, float]]) -> Dict[string, float] {
+        let activations: Dict[string, float] = {}
+        let queue: List[ActivationState] = []
+
+        for seed in seeds {
+            let concept = seed[0]
+            let strength = seed[1]
+            let nid = concept.lower().strip()
+            if self._graph.has_node(nid) {
+                activations[nid] = strength
+                queue.append(ActivationState {
+                    concept: nid, activation: strength,
+                    depth: 0, source: "seed"
+                })
+            }
+        }
+
+        let idx = 0
+        while idx < len(queue) {
+            let state = queue[idx]
+            idx += 1
+
+            if state.depth >= self._max_depth {
+                continue
+            }
+
+            let new_activation = state.activation * self._decay
+            if new_activation < self._min_activation {
+                continue
+            }
+
+            let neighbor_set: Set[string] = set()
+            for edge in self._graph.outgoing(state.concept, None) {
+                neighbor_set.add(edge.target)
+            }
+            for edge in self._graph.incoming(state.concept, None) {
+                neighbor_set.add(edge.source)
+            }
+
+            for neighbor in neighbor_set {
+                let current = activations.get(neighbor, 0.0)
+                let boosted = current + new_activation
+                if boosted > current {
+                    activations[neighbor] = min(boosted, 1.0)
+                    if boosted > current + 0.01 {
+                        queue.append(ActivationState {
+                            concept: neighbor, activation: new_activation,
+                            depth: state.depth + 1, source: state.concept
+                        })
+                    }
+                }
+            }
+        }
+
+        return activations
+    }
+
+    fn focused_subgraph(self, seeds: List[Tuple[string, float]],
+                         top_k: int) -> List[any] {
+        if top_k == None {
+            top_k = 30
+        }
+        let activations = self.activate(seeds)
+
+        let items: List[Tuple[float, string]] = []
+        for k in activations {
+            items.append((activations[k], k))
+        }
+        let sorted_items: List[Tuple[float, string]] = []
+        let remaining = list(items)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i][0] > remaining[best_idx][0] {
+                    best_idx = i
+                }
+            }
+            sorted_items.append(remaining.pop(best_idx))
+        }
+
+        let result: List[Tuple[string, float]] = []
+        for i in range(min(top_k, len(sorted_items))) {
+            let entry = sorted_items[i]
+            result.append((entry[1], entry[0]))
+        }
+        return result
+    }
+}
+
+/// ── Semantic Query Understanding ───────────────────────────────────
+
+type QueryUnderstanding {
+    original: string,
+    normalized: string,
+    key_concepts: List[Tuple[string, float]],
+    intent_concepts: List[string],
+    activated_subgraph: List[Tuple[string, float]],
+    best_graph_matches: List[Tuple[string, float]]
+}
+
+class SemanticQueryParser {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._index = SemanticIndex(graph)
+        self._activation = SpreadingActivation(graph, 0.6, 3, 0.05)
+        self._index.build()
+    }
+
+    fn parse(self, query: string) -> QueryUnderstanding {
+        let normalized = normalize_concept(query)
+        let tokens = _tokenize(normalized)
+
+        let noun_phrases = self._extract_noun_phrases(query)
+        let key_concepts: List[Tuple[string, float]] = []
+
+        for np in noun_phrases {
+            let matches = self._index.query(np, 3, 0.15)
+            for entry in matches {
+                key_concepts.append(entry)
+            }
+        }
+
+        if len(key_concepts) == 0 {
+            for token in tokens {
+                let matches = self._index.query(token, 2, 0.2)
+                for entry in matches {
+                    key_concepts.append(entry)
+                }
+            }
+        }
+
+        let sorted_kc: List[Tuple[string, float]] = []
+        let remaining_kc = list(key_concepts)
+        while len(remaining_kc) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining_kc)) {
+                if remaining_kc[i][1] > remaining_kc[best_idx][1] {
+                    best_idx = i
+                }
+            }
+            sorted_kc.append(remaining_kc.pop(best_idx))
+        }
+
+        let seen: Set[string] = set()
+        let deduped: List[Tuple[string, float]] = []
+        for entry in sorted_kc {
+            let nid = entry[0]
+            let sim = entry[1]
+            if nid not in seen {
+                seen.add(nid)
+                deduped.append((nid, sim))
+            }
+        }
+        let limited: List[Tuple[string, float]] = []
+        for i in range(min(15, len(deduped))) {
+            limited.append(deduped[i])
+        }
+        key_concepts = limited
+
+        let seeds: List[Tuple[string, float]] = []
+        for i in range(min(5, len(key_concepts))) {
+            seeds.append(key_concepts[i])
+        }
+        let activated = self._activation.focused_subgraph(seeds, 20)
+
+        let intent: List[string] = []
+        for i in range(min(5, len(key_concepts))) {
+            intent.append(key_concepts[i][0])
+        }
+        let best_matches: List[Tuple[string, float]] = []
+        for i in range(min(10, len(key_concepts))) {
+            best_matches.append(key_concepts[i])
+        }
+
+        return QueryUnderstanding {
+            original: query,
+            normalized: normalized,
+            key_concepts: key_concepts,
+            intent_concepts: intent,
+            activated_subgraph: activated,
+            best_graph_matches: best_matches
+        }
+    }
+
+    fn _extract_noun_phrases(self, text: string) -> List[any] {
+        text = re.sub("[?!.,;:]", " ", text)
+        let chunks: List[string] = []
+
+        let pattern = "(?:[A-Z][a-z]+(?:\\s+[A-Z][a-z]+)*)|(?:(?:the|a|an)\\s+)?(?:[a-z]+\\s+){0,2}[a-z]+"
+        let matches = re.finditer(pattern, text)
+        for m in matches {
+            let phrase = m.group().strip()
+            let cleaned = normalize_concept(phrase)
+            if cleaned != "" and len(cleaned) > 2 {
+                chunks.append(cleaned)
+            }
+        }
+
+        let single_tokens = _tokenize(text)
+        for t in single_tokens {
+            let first_words: List[string] = []
+            for c in chunks {
+                let parts = c.split()
+                if len(parts) > 0 {
+                    first_words.append(parts[0])
+                } else {
+                    first_words.append("")
+                }
+            }
+            let found = false
+            for fw in first_words {
+                if t == fw {
+                    found = true
+                    break
+                }
+            }
+            if not found {
+                chunks.append(t)
+            }
+        }
+
+        return chunks
+    }
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export normalize_concept
+export SemanticIndex, SpreadingActivation, ActivationState
+export QueryUnderstanding, SemanticQueryParser

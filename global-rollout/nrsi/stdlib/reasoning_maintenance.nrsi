@@ -1,0 +1,433 @@
+/// NRSI — Graph Maintenance.
+///
+/// TTL/decay on edges, contradiction resolution, pruning of low-value
+/// nodes, and coherence auditing. Keeps the knowledge graph healthy.
+/// All transformer-free.
+
+module reasoning_maintenance
+
+
+import time from "std/time"
+from "reasoning_graph" import CausalGraph, GraphEdge, GraphNode, RelationType
+from "reasoning_governance" import ContradictionDetector
+
+/// ---------- Types ----------
+
+type ContradictionReport {
+    edge_a: string,
+    edge_b: string,
+    description: string,
+    resolution: string,
+    resolved: bool
+}
+
+type CoherenceReport {
+    total_nodes: int,
+    total_edges: int,
+    isolated_nodes: int,
+    contradictions: int,
+    weak_edges: int,
+    noise_nodes: int,
+    domain_coverage: Dict[string, int],
+    health_score: float,
+    recommendations: List[string]
+}
+
+/// ---------- Confidence Decay ----------
+
+let _DECAY_RATES: Dict[string, float] = {
+    "derived": 0.01,
+    "curiosity": 0.005,
+    "analogy": 0.008,
+    "knowledge_pack": 0.0,
+    "user_correction": 0.0
+}
+
+let _REINFORCEMENT_BONUS = 0.02
+
+class ConfidenceDecay {
+    fn __init__(self, graph: CausalGraph, min_confidence: float,
+                decay_interval_hours: float) {
+        self._graph = graph
+        if min_confidence == None {
+            min_confidence = 0.05
+        }
+        if decay_interval_hours == None {
+            decay_interval_hours = 24.0
+        }
+        self._min_confidence = min_confidence
+        self._interval = decay_interval_hours * 3600.0
+    }
+
+    fn apply_decay(self) -> Dict[string, int] {
+        let now = time.time()
+        let stats: Dict[string, int] = {"decayed": 0, "reinforced": 0, "pruned": 0}
+
+        let edges_to_remove: List[string] = []
+        for edge in self._graph.all_edges() {
+            if not edge.derived and not edge.fact_id.startswith("curiosity") {
+                continue
+            }
+
+            let elapsed = now - edge.last_accessed
+            let periods = elapsed / self._interval
+
+            let source_type = "derived"
+            if not edge.derived {
+                source_type = "curiosity"
+            }
+            if edge.fact_id.startswith("analogy") {
+                source_type = "analogy"
+            }
+            let rate = 0.005
+            if source_type in _DECAY_RATES {
+                rate = _DECAY_RATES[source_type]
+            }
+
+            if edge.access_count > 0 {
+                let reinforcement = edge.access_count * _REINFORCEMENT_BONUS
+                if reinforcement > 0.1 {
+                    reinforcement = 0.1
+                }
+                edge.confidence = edge.confidence + reinforcement
+                if edge.confidence > 1.0 {
+                    edge.confidence = 1.0
+                }
+                edge.access_count = 0
+                stats["reinforced"] += 1
+            }
+
+            let decay = rate * periods
+            if decay > 0.0 {
+                edge.confidence = edge.confidence - decay
+                if edge.confidence < 0.0 {
+                    edge.confidence = 0.0
+                }
+                stats["decayed"] += 1
+            }
+
+            if edge.confidence < self._min_confidence {
+                edges_to_remove.append(edge.edge_id)
+                stats["pruned"] += 1
+            }
+        }
+
+        for eid in edges_to_remove {
+            self._remove_edge(eid)
+        }
+
+        return stats
+    }
+
+    fn _remove_edge(self, edge_id: string) {
+        let edge = self._graph._edges.get(edge_id)
+        if edge == None {
+            return
+        }
+        if edge_id in self._graph._outgoing.get(edge.source, []) {
+            self._graph._outgoing[edge.source].remove(edge_id)
+        }
+        if edge_id in self._graph._incoming.get(edge.target, []) {
+            self._graph._incoming[edge.target].remove(edge_id)
+        }
+        del self._graph._edges[edge_id]
+    }
+}
+
+/// ---------- Contradiction Resolver ----------
+
+class ContradictionResolver {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._detector = ContradictionDetector(graph)
+    }
+
+    fn scan(self) -> List[any] {
+        let reports: List[ContradictionReport] = []
+        let checked: Set[string] = set()
+
+        for edge in self._graph.all_edges() {
+            let key = edge.source + "|" + edge.target
+            if key in checked {
+                continue
+            }
+            checked.add(key)
+
+            let contradictions = self._detector.check(
+                edge.source, edge.relation, edge.target, edge.confidence)
+            if len(contradictions) == 0 {
+                continue
+            }
+
+            for desc in contradictions {
+                reports.append(ContradictionReport {
+                    edge_a: edge.edge_id,
+                    edge_b: "",
+                    description: desc,
+                    resolution: "pending",
+                    resolved: false
+                })
+            }
+        }
+
+        return reports
+    }
+
+    fn resolve_all(self) -> List[any] {
+        let reports = self.scan()
+        for report in reports {
+            self._resolve_one(report)
+        }
+        return reports
+    }
+
+    fn _resolve_one(self, report: ContradictionReport) {
+        let parts = report.edge_a.split("|")
+        if len(parts) != 3 {
+            return
+        }
+
+        let source = parts[0]
+        let target = parts[2]
+        let edge_a = self._graph._edges.get(report.edge_a)
+        if edge_a == None {
+            return
+        }
+
+        let competing: List[GraphEdge] = []
+        for e in self._graph.outgoing(source) {
+            if e.target == target and e.edge_id != report.edge_a {
+                competing.append(e)
+            }
+        }
+
+        if len(competing) == 0 {
+            report.resolution = "no competing edge found"
+            return
+        }
+
+        for comp in competing {
+            if edge_a.derived and not comp.derived {
+                edge_a.confidence = edge_a.confidence * 0.3
+                report.resolution = "Downgraded derived edge '" + edge_a.edge_id + "' (sourced edge '" + comp.edge_id + "' takes precedence)"
+                report.resolved = true
+            } else if comp.derived and not edge_a.derived {
+                comp.confidence = comp.confidence * 0.3
+                report.resolution = "Downgraded derived edge '" + comp.edge_id + "' (sourced edge '" + edge_a.edge_id + "' takes precedence)"
+                report.resolved = true
+            } else if edge_a.confidence >= comp.confidence {
+                comp.confidence = comp.confidence * 0.5
+                report.resolution = "Downgraded lower-confidence '" + comp.edge_id + "' (" + str(round(comp.confidence, 2)) + " vs " + str(round(edge_a.confidence, 2)) + ")"
+                report.resolved = true
+            } else {
+                edge_a.confidence = edge_a.confidence * 0.5
+                report.resolution = "Downgraded lower-confidence '" + edge_a.edge_id + "' (" + str(round(edge_a.confidence, 2)) + " vs " + str(round(comp.confidence, 2)) + ")"
+                report.resolved = true
+            }
+        }
+    }
+}
+
+/// ---------- Node Pruner ----------
+
+let _NOISE_PATTERNS = ["^[a-z]{1,2}$", "^\\d+$", "^(however|therefore|thus|hence|moreover)$"]
+
+class NodePruner {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn prune(self) -> int {
+        let to_remove: List[string] = []
+
+        for node in self._graph.all_nodes() {
+            let nid = node.node_id
+
+            if self._is_noise(nid) {
+                to_remove.append(nid)
+                continue
+            }
+
+            let outgoing = self._graph.outgoing(nid)
+            let incoming = self._graph.incoming(nid)
+            if len(outgoing) == 0 and len(incoming) == 0 {
+                to_remove.append(nid)
+            }
+        }
+
+        for nid in to_remove {
+            if nid in self._graph._nodes {
+                del self._graph._nodes[nid]
+            }
+        }
+
+        return len(to_remove)
+    }
+
+    fn _is_noise(self, concept: string) -> bool {
+        if len(concept) <= 2 and concept.isalpha() {
+            return true
+        }
+        if concept.isdigit() {
+            return true
+        }
+        let fillers = ["however", "therefore", "thus", "hence", "moreover"]
+        if concept.lower() in fillers {
+            return true
+        }
+        return false
+    }
+}
+
+/// ---------- Coherence Auditor ----------
+
+class CoherenceAuditor {
+    fn __init__(self, graph: CausalGraph, weak_edge_threshold: float) {
+        self._graph = graph
+        if weak_edge_threshold == None {
+            weak_edge_threshold = 0.2
+        }
+        self._weak_threshold = weak_edge_threshold
+    }
+
+    fn audit(self) -> CoherenceReport {
+        let nodes = self._graph.all_nodes()
+        let edges = self._graph.all_edges()
+        let isolated = self._graph.isolated_nodes()
+        let weak: List[GraphEdge] = []
+        for e in edges {
+            if e.confidence < self._weak_threshold {
+                weak.append(e)
+            }
+        }
+
+        let domain_counts: Dict[string, int] = {}
+        for e in edges {
+            if e.domain != "" {
+                if e.domain not in domain_counts {
+                    domain_counts[e.domain] = 0
+                }
+                domain_counts[e.domain] += 1
+            }
+        }
+
+        let contradiction_detector = ContradictionDetector(self._graph)
+        let contradiction_count = 0
+        let checked: Set[string] = set()
+        for e in edges {
+            let key = e.source + "|" + e.target
+            if key in checked {
+                continue
+            }
+            checked.add(key)
+            let hits = contradiction_detector.check(e.source, e.relation, e.target, e.confidence)
+            contradiction_count += len(hits)
+        }
+
+        let pruner = NodePruner(self._graph)
+        let noise_count = 0
+        for n in nodes {
+            if pruner._is_noise(n.node_id) {
+                noise_count += 1
+            }
+        }
+
+        let total = len(nodes) + len(edges)
+        let health = 0.0
+        if total > 0 {
+            let node_max = len(nodes)
+            if node_max < 1 {
+                node_max = 1
+            }
+            let edge_max = len(edges)
+            if edge_max < 1 {
+                edge_max = 1
+            }
+            let penalty = (len(isolated) / node_max) * 0.3 + (len(weak) / edge_max) * 0.3 + (contradiction_count / edge_max) * 0.3 + (noise_count / node_max) * 0.1
+            health = 1.0 - penalty
+            if health < 0.0 {
+                health = 0.0
+            }
+        }
+
+        let recommendations: List[string] = []
+        if len(isolated) > len(nodes) * 0.3 {
+            recommendations.append("High isolation: " + str(len(isolated)) + " of " + str(len(nodes)) + " nodes have no edges. Run curiosity cycle to fill gaps.")
+        }
+        if contradiction_count > 0 {
+            recommendations.append(str(contradiction_count) + " contradiction(s) found. Run ContradictionResolver.resolve_all().")
+        }
+        if len(weak) > len(edges) * 0.2 {
+            recommendations.append(str(len(weak)) + " weak edges (conf < " + str(self._weak_threshold) + "). Consider evidence reinforcement or pruning.")
+        }
+        if noise_count > 0 {
+            recommendations.append(str(noise_count) + " noise node(s) detected. Run NodePruner.prune().")
+        }
+
+        return CoherenceReport {
+            total_nodes: len(nodes), total_edges: len(edges),
+            isolated_nodes: len(isolated), contradictions: contradiction_count,
+            weak_edges: len(weak), noise_nodes: noise_count,
+            domain_coverage: domain_counts,
+            health_score: health,
+            recommendations: recommendations
+        }
+    }
+}
+
+/// ---------- Graph Maintenance (Unified) ----------
+
+class GraphMaintenance {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._decay = ConfidenceDecay(graph, None, None)
+        self._resolver = ContradictionResolver(graph)
+        self._pruner = NodePruner(graph)
+        self._auditor = CoherenceAuditor(graph, None)
+    }
+
+    fn run_full_maintenance(self) -> Dict[string, Any] {
+        let decay_stats = self._decay.apply_decay()
+        let contradictions = self._resolver.resolve_all()
+        let resolved_count = 0
+        for c in contradictions {
+            if c.resolved {
+                resolved_count += 1
+            }
+        }
+        let pruned_nodes = self._pruner.prune()
+        let audit = self._auditor.audit()
+
+        return {
+            "decay": decay_stats,
+            "contradictions_found": len(contradictions),
+            "contradictions_resolved": resolved_count,
+            "nodes_pruned": pruned_nodes,
+            "health_score": audit.health_score,
+            "recommendations": audit.recommendations,
+            "graph_size": {
+                "nodes": self._graph.node_count(),
+                "edges": self._graph.edge_count()
+            }
+        }
+    }
+
+    fn audit(self) -> CoherenceReport {
+        return self._auditor.audit()
+    }
+}
+
+/// ---------- Gate ----------
+
+gate maintenance_gate(data: raw[CoherenceReport]) -> validated[CoherenceReport] {
+    require confidence >= 0.3
+    validate health_check
+    validate contradiction_check
+}
+
+/// ---------- Exports ----------
+
+export ContradictionReport, CoherenceReport
+export ConfidenceDecay, ContradictionResolver, NodePruner
+export CoherenceAuditor, GraphMaintenance
+export maintenance_gate

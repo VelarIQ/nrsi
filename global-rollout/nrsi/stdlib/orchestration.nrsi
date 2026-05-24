@@ -1,0 +1,400 @@
+/// NRSIP Multi-Agent Orchestration — Task Decomposition & Coordination.
+///
+/// Decomposes complex queries into sub-tasks routed to specialist NRS
+/// instances, with coordinated context sharing and result aggregation.
+///
+/// Features: task decomposition, context management, result aggregation,
+/// streaming coordination.
+///
+/// Patent-covered: Multi-agent orchestration, task decomposition, context management.
+/// Ported from nrsip/orchestration.py.
+
+module orchestration
+
+
+import time from "std/time"
+import hashlib from "std/hashlib"
+/// ── Enumerations ──
+
+enum TaskStatus {
+    PENDING = "PENDING",
+    DISPATCHED = "DISPATCHED",
+    PROCESSING = "PROCESSING",
+    COMPLETED = "COMPLETED",
+    FAILED = "FAILED",
+    TIMEOUT = "TIMEOUT"
+}
+
+enum MergeStrategy {
+    SEQUENTIAL = "SEQUENTIAL",
+    CONFIDENCE_WEIGHTED = "CONFIDENCE_WEIGHTED",
+    SECTION_LABELED = "SECTION_LABELED",
+    BEST_OF = "BEST_OF"
+}
+
+/// ── Types ──
+
+type SubTask {
+    task_id: string,
+    query: string,
+    domain: string,
+    required_lobe: string,
+    required_tier: string,
+    required_mode: string,
+    priority: int,
+    timeout_ms: int,
+    status: TaskStatus,
+    assigned_instance: string
+}
+
+type SubTaskResult {
+    task_id: string,
+    instance_id: string,
+    result: any,
+    confidence: float,
+    h_score: float,
+    h_verdict: string,
+    processing_mode: string,
+    processing_time_ms: float,
+    provenance: Map[string, any]
+}
+
+type ContextPacket {
+    source_instance: string,
+    target_instance: string,
+    vlt_entries: List[Map[string, any]],
+    session_id: string,
+    sequence: int,
+    timestamp_ms: int
+}
+
+fn context_packet_entry_count(cp: ContextPacket) -> int {
+    return cp.vlt_entries.len()
+}
+
+type CompositeResponse {
+    query_hash: string,
+    sections: List[Map[string, any]],
+    overall_confidence: float,
+    overall_h_score: float,
+    merge_strategy: string,
+    total_sub_tasks: int,
+    successful_sub_tasks: int,
+    failed_sub_tasks: int,
+    total_processing_time_ms: float,
+    per_section_provenance: List[Map[string, any]],
+    coordinator_id: string
+}
+
+/// ── Domain Keywords ──
+
+let DOMAIN_KEYWORDS = {
+    "medical": [ "medical", "health", "clinical", "patient", "diagnosis", "treatment", "drug", "pharmacology" ],
+    "legal": [ "legal", "law", "regulation", "court", "statute", "compliance", "rights", "contract" ],
+    "financial": [ "financial", "market", "stock", "investment", "bank", "currency", "revenue", "profit" ],
+    "mathematical": [ "calculate", "compute", "equation", "formula", "prove", "theorem", "integral" ],
+    "temporal": [ "when", "timeline", "history", "sequence", "before", "after", "during", "era" ],
+    "spatial": [ "where", "location", "map", "geometry", "distance", "area", "volume", "shape" ],
+    "creative": [ "write", "compose", "imagine", "create", "design", "brainstorm", "story", "poem" ]
+}
+
+let DOMAIN_TO_LOBE = {
+    "medical": "linguistic",
+    "legal": "logical",
+    "financial": "mathematical",
+    "mathematical": "mathematical",
+    "temporal": "temporal",
+    "spatial": "spatial",
+    "creative": "creative"
+}
+
+/// ── Task Decomposer ──
+
+class TaskDecomposer {
+    fn init(self) {}
+
+    fn decompose(self, query: string) -> List[any] {
+        let query_lower = query.lower()
+        let detected_domains = {}
+
+        for domain in DOMAIN_KEYWORDS.keys() {
+            let keywords = DOMAIN_KEYWORDS[domain]
+            let hits = 0
+            for kw in keywords {
+                if query_lower.contains(kw) { hits += 1 }
+            }
+            if hits > 0 {
+                detected_domains[domain] = hits
+            }
+        }
+
+        if detected_domains.len() == 0 {
+            return [
+                SubTask {
+                    task_id: hashlib.sha256("0:" + query).hexdigest().slice(0, 12),
+                    query: query,
+                    domain: "general",
+                    required_lobe: "linguistic",
+                    required_tier: "T2",
+                    required_mode: "",
+                    priority: 0,
+                    timeout_ms: 10000,
+                    status: TaskStatus.PENDING,
+                    assigned_instance: ""
+                }
+            ]
+        }
+
+        if detected_domains.len() == 1 {
+            let domain = detected_domains.keys()[0]
+            let lobe = DOMAIN_TO_LOBE.get(domain, "linguistic")
+            return [
+                SubTask {
+                    task_id: hashlib.sha256("0:" + query).hexdigest().slice(0, 12),
+                    query: query,
+                    domain: domain,
+                    required_lobe: lobe,
+                    required_tier: "T2",
+                    required_mode: "",
+                    priority: 0,
+                    timeout_ms: 10000,
+                    status: TaskStatus.PENDING,
+                    assigned_instance: ""
+                }
+            ]
+        }
+
+        let sorted_domains = []
+        for d in detected_domains.keys() {
+            sorted_domains.append({
+                "domain": d, "hits": detected_domains[d]
+            })
+        }
+        sorted_domains.sort_by(fn(a: Map[string, any]) -> float {
+            return -to_float(a["hits"])
+        })
+
+        let tasks = []
+        let i = 0
+        for entry in sorted_domains {
+            let domain = to_string(entry["domain"])
+            let lobe = DOMAIN_TO_LOBE.get(domain, "linguistic")
+            tasks.append(SubTask {
+                task_id: hashlib.sha256(to_string(i) + ":" + domain + ":" + query).hexdigest().slice(0, 12),
+                query: query,
+                domain: domain,
+                required_lobe: lobe,
+                required_tier: "T2",
+                required_mode: "",
+                priority: i,
+                timeout_ms: 10000,
+                status: TaskStatus.PENDING,
+                assigned_instance: ""
+            })
+            i += 1
+        }
+        return tasks
+    }
+}
+
+/// ── Result Aggregator ──
+
+class ResultAggregator {
+    fn init(self) {}
+
+    fn aggregate(self, query: string, results: List[SubTaskResult],
+                 strategy: MergeStrategy,
+                 coordinator_id: string) -> CompositeResponse {
+        let query_hash = hashlib.sha256(query).hexdigest()
+        let start_ms = time.monotonic() * 1000.0
+
+        let successful = []
+        let failed = []
+        for r in results {
+            if r.h_score > 0.0 {
+                successful.append(r)
+            } else {
+                failed.append(r)
+            }
+        }
+
+        let sections = []
+        let provenance_entries = []
+
+        if strategy == MergeStrategy.SECTION_LABELED {
+            for r in successful {
+                let label = "CREATIVE"
+                if r.processing_mode == "DETERMINISTIC" {
+                    label = "VALIDATED"
+                }
+                sections.append({
+                    "task_id": r.task_id,
+                    "content": r.result,
+                    "label": label,
+                    "confidence": r.confidence,
+                    "h_score": r.h_score,
+                    "h_verdict": r.h_verdict,
+                    "instance_id": r.instance_id
+                })
+                provenance_entries.append(r.provenance)
+            }
+        } else if strategy == MergeStrategy.CONFIDENCE_WEIGHTED {
+            let total_conf = 0.0
+            for r in successful { total_conf += r.confidence }
+            if total_conf == 0.0 { total_conf = 1.0 }
+            for r in successful {
+                sections.append({
+                    "task_id": r.task_id,
+                    "content": r.result,
+                    "weight": r.confidence / total_conf,
+                    "confidence": r.confidence,
+                    "h_score": r.h_score
+                })
+                provenance_entries.append(r.provenance)
+            }
+        } else if strategy == MergeStrategy.BEST_OF {
+            if successful.len() > 0 {
+                let best = successful[0]
+                for r in successful {
+                    if r.h_score > best.h_score { best = r }
+                }
+                sections.append({
+                    "task_id": best.task_id,
+                    "content": best.result,
+                    "confidence": best.confidence,
+                    "h_score": best.h_score
+                })
+                provenance_entries.append(best.provenance)
+            }
+        } else {
+            for r in successful {
+                sections.append({
+                    "task_id": r.task_id,
+                    "content": r.result,
+                    "confidence": r.confidence,
+                    "h_score": r.h_score
+                })
+                provenance_entries.append(r.provenance)
+            }
+        }
+
+        let overall_conf = 0.0
+        let overall_h = 0.0
+        if successful.len() > 0 {
+            let total_c = 0.0
+            let total_h = 0.0
+            for r in successful {
+                total_c += r.confidence
+                total_h += r.h_score
+            }
+            overall_conf = total_c / to_float(successful.len())
+            overall_h = total_h / to_float(successful.len())
+        }
+
+        return CompositeResponse {
+            query_hash: query_hash,
+            sections: sections,
+            overall_confidence: round(overall_conf, 4),
+            overall_h_score: round(overall_h, 4),
+            merge_strategy: strategy.value,
+            total_sub_tasks: results.len(),
+            successful_sub_tasks: successful.len(),
+            failed_sub_tasks: failed.len(),
+            total_processing_time_ms: round(time.monotonic() * 1000.0 - start_ms, 2),
+            per_section_provenance: provenance_entries,
+            coordinator_id: coordinator_id
+        }
+    }
+}
+
+/// ── Orchestration Coordinator ──
+
+class OrchestrationCoordinator {
+    fn init(self, coordinator_id: string, lobe_registry: Optional[any]) {
+        self.coordinator_id = coordinator_id
+        if self.coordinator_id == "" {
+            self.coordinator_id = hashlib.sha256(to_string(time.time())).hexdigest().slice(0, 12)
+        }
+        self.decomposer = TaskDecomposer()
+        self.decomposer.init()
+        self.aggregator = ResultAggregator()
+        self.aggregator.init()
+        self._lobe_registry = lobe_registry
+    }
+
+    fn plan(self, query: string) -> List[any] {
+        return self.decomposer.decompose(query)
+    }
+
+    fn execute(self, query: string, strategy: MergeStrategy) -> CompositeResponse {
+        let tasks = self.plan(query)
+        let results: List[SubTaskResult] = []
+        for task in tasks {
+            let t0 = time.time()
+            task.status = TaskStatus.DISPATCHED
+            let result_data = nil
+            let result_conf = 0.0
+            if self._lobe_registry != nil {
+                try {
+                    let lobe = self._lobe_registry.get_lobe(task.required_lobe)
+                    if lobe != nil and hasattr(lobe, "process") {
+                        task.status = TaskStatus.PROCESSING
+                        let lobe_out = lobe.process(task.query, task.domain)
+                        if lobe_out != nil {
+                            result_data = getattr(lobe_out, "value", lobe_out)
+                            result_conf = getattr(lobe_out, "confidence", 0.5)
+                        }
+                    }
+                } catch(e) {
+                    task.status = TaskStatus.FAILED
+                }
+            }
+            if result_data == nil {
+                result_data = "No lobe available for " + task.required_lobe
+                result_conf = 0.1
+                if task.status != TaskStatus.FAILED {
+                    task.status = TaskStatus.COMPLETED
+                }
+            } else {
+                task.status = TaskStatus.COMPLETED
+            }
+            let elapsed = (time.time() - t0) * 1000.0
+            results.append(SubTaskResult {
+                task_id: task.task_id,
+                instance_id: self.coordinator_id,
+                result: result_data,
+                confidence: result_conf,
+                h_score: 0.0,
+                h_verdict: "",
+                processing_mode: task.required_mode,
+                processing_time_ms: elapsed,
+                provenance: {}
+            })
+        }
+        return self.merge(query, results, strategy)
+    }
+
+    fn build_context_packet(self, source: string, target: string,
+                            vlt_entries: List[Map[string, any]],
+                            session_id: string,
+                            sequence: int) -> ContextPacket {
+        return ContextPacket {
+            source_instance: source,
+            target_instance: target,
+            vlt_entries: vlt_entries,
+            session_id: session_id,
+            sequence: sequence,
+            timestamp_ms: to_int(time.time() * 1000.0)
+        }
+    }
+
+    fn merge(self, query: string, results: List[SubTaskResult],
+             strategy: MergeStrategy) -> CompositeResponse {
+        return self.aggregator.aggregate(query, results, strategy, self.coordinator_id)
+    }
+}
+
+export TaskStatus, MergeStrategy
+export SubTask, SubTaskResult, ContextPacket, context_packet_entry_count
+export CompositeResponse
+export TaskDecomposer, ResultAggregator, OrchestrationCoordinator

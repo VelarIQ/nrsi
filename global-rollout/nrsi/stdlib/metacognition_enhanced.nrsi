@@ -1,0 +1,1115 @@
+/// NRSI Metacognition — Enhanced Capabilities.
+///
+/// Extends the base metacognition subsystem with six upgrades:
+///
+/// 1. Multi-step reasoning decomposition (actually executes sub-questions)
+/// 2. Confidence calibration (tracks prediction accuracy over time)
+/// 3. Cross-user lesson aggregation (global knowledge from many users)
+/// 4. Full reasoning chain trace (step-by-step audit per answer)
+/// 5. Proactive behavior (flags weak prior answers, warns about gaps)
+/// 6. Deep self-model (domain performance, knowledge boundaries, strategy history)
+
+module metacognition_enhanced
+
+from "metacognition_types" import ClaimConfidence, ConversationEpisode, CritiqueFinding, CritiqueVerdict, EpisodeOutcome, GoalState, LessonRecord, PlanAction, PolicyDelta, ProcessingMode, ReasoningPlan, ReasoningStep, SafetyClass, SelfAssessment, StrategyPolicySnapshot, SubGoal, UserModel, _now_ms, _uid
+from "metacognition_memory" import MetacognitionMemory
+from "metacognition_engine" import MetacognitionOrchestrator, MetacognitiveResult
+
+/// ═══════════════════════════════════════════════════════════════════
+/// 1. Multi-Step Reasoning Decomposition
+/// ═══════════════════════════════════════════════════════════════════
+
+type SubQuestion {
+    text: string,
+    answer: string,
+    confidence: float,
+    domain: string,
+    mode: ProcessingMode
+}
+
+type DecompositionResult {
+    original_query: string,
+    sub_questions: List[SubQuestion],
+    merged_answer: string,
+    overall_confidence: float
+}
+
+class QueryDecomposer {
+    fn __init__(self) {
+        self._SPLIT_SIGNALS: Set[string] = {
+            "and", "also", "additionally", "furthermore", "plus",
+            "as well as", "along with", "besides"
+        }
+        self._CONDITIONAL_SIGNALS: List[string] = ["if", "assuming", "given that", "when"]
+        self._COMPARISON_SIGNALS: List[string] = [
+            "compare", "versus", "vs", "difference between",
+            "similarities between", "contrast"
+        ]
+    }
+
+    fn should_decompose(self, query: string) -> bool {
+        let q = query.lower()
+        let question_marks = query.count("?")
+        if question_marks >= 2 {
+            return true
+        }
+        let tokens: Set[string] = set()
+        for w in q.split() {
+            tokens.add(w)
+        }
+        let conjunction_count = 0
+        for w in tokens {
+            if w in self._SPLIT_SIGNALS {
+                conjunction_count += 1
+            }
+        }
+        if conjunction_count >= 2 {
+            return true
+        }
+        for c in self._COMPARISON_SIGNALS {
+            if c in q {
+                return true
+            }
+        }
+        if len(query.split()) > 50 {
+            return true
+        }
+        return false
+    }
+
+    fn decompose(self, query: string) -> List[any] {
+        let q = query.strip()
+        let sub_qs: List[SubQuestion] = []
+
+        if query.count("?") >= 2 {
+            let parts = query.split("?")
+            for part in parts {
+                let trimmed = part.strip()
+                if trimmed != "" {
+                    sub_qs.append(SubQuestion {
+                        text: trimmed + "?", answer: "", confidence: 0.0,
+                        domain: "", mode: ProcessingMode.DETERMINISTIC
+                    })
+                }
+            }
+            if len(sub_qs) >= 2 {
+                return sub_qs
+            }
+            return [SubQuestion { text: q, answer: "", confidence: 0.0, domain: "", mode: ProcessingMode.DETERMINISTIC }]
+        }
+
+        let q_lower = q.lower()
+        for c in self._COMPARISON_SIGNALS {
+            if c in q_lower {
+                sub_qs.append(SubQuestion { text: "Describe the first item: " + q, answer: "", confidence: 0.0, domain: "", mode: ProcessingMode.DETERMINISTIC })
+                sub_qs.append(SubQuestion { text: "Describe the second item: " + q, answer: "", confidence: 0.0, domain: "", mode: ProcessingMode.DETERMINISTIC })
+                sub_qs.append(SubQuestion { text: "What are the key differences and similarities?", answer: "", confidence: 0.0, domain: "", mode: ProcessingMode.DETERMINISTIC })
+                return sub_qs
+            }
+        }
+
+        let signals_sorted: List[string] = []
+        let remaining_sigs = list(self._SPLIT_SIGNALS)
+        while len(remaining_sigs) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining_sigs)) {
+                if len(remaining_sigs[i]) > len(remaining_sigs[best_idx]) {
+                    best_idx = i
+                }
+            }
+            signals_sorted.append(remaining_sigs.pop(best_idx))
+        }
+
+        for signal in signals_sorted {
+            let search = " " + signal + " "
+            if search in q_lower {
+                let idx = q_lower.index(search)
+                let left = q[:idx].strip()
+                let right = q[idx + len(signal) + 2:].strip()
+                if len(left) > 10 and len(right) > 10 {
+                    sub_qs.append(SubQuestion { text: left, answer: "", confidence: 0.0, domain: "", mode: ProcessingMode.DETERMINISTIC })
+                    sub_qs.append(SubQuestion { text: right, answer: "", confidence: 0.0, domain: "", mode: ProcessingMode.DETERMINISTIC })
+                    return sub_qs
+                }
+            }
+        }
+
+        return [SubQuestion { text: q, answer: "", confidence: 0.0, domain: "", mode: ProcessingMode.DETERMINISTIC }]
+    }
+
+    fn merge_answers(self, original: string,
+                     sub_questions: List[SubQuestion]) -> DecompositionResult {
+        let answered: List[SubQuestion] = []
+        for sq in sub_questions {
+            if sq.answer != "" {
+                answered.append(sq)
+            }
+        }
+        if len(answered) == 0 {
+            return DecompositionResult { original_query: original, sub_questions: [], merged_answer: "", overall_confidence: 0.0 }
+        }
+
+        if len(answered) == 1 {
+            return DecompositionResult {
+                original_query: original, sub_questions: sub_questions,
+                merged_answer: answered[0].answer,
+                overall_confidence: answered[0].confidence
+            }
+        }
+
+        let parts: List[string] = []
+        for i in range(len(answered)) {
+            if len(answered) > 2 {
+                parts.append("**Part " + str(i + 1) + ":** " + answered[i].answer)
+            } else {
+                parts.append(answered[i].answer)
+            }
+        }
+
+        let merged = "\n\n".join(parts)
+        let total_conf = 0.0
+        for sq in answered {
+            total_conf += sq.confidence
+        }
+        let avg_conf = total_conf / len(answered)
+
+        return DecompositionResult {
+            original_query: original, sub_questions: sub_questions,
+            merged_answer: merged, overall_confidence: avg_conf
+        }
+    }
+}
+
+/// ═══════════════════════════════════════════════════════════════════
+/// 2. Confidence Calibration
+/// ═══════════════════════════════════════════════════════════════════
+
+type CalibrationBucket {
+    range_low: float,
+    range_high: float,
+    total_predictions: int,
+    correct_predictions: int
+}
+
+fn bucket_actual_accuracy(b: CalibrationBucket) -> float {
+    if b.total_predictions == 0 {
+        return 0.0
+    }
+    return b.correct_predictions / b.total_predictions
+}
+
+fn bucket_calibration_error(b: CalibrationBucket) -> float {
+    let midpoint = (b.range_low + b.range_high) / 2
+    return abs(midpoint - bucket_actual_accuracy(b))
+}
+
+class ConfidenceCalibrator {
+    let BUCKET_COUNT = 10
+    let MIN_SAMPLES_FOR_CALIBRATION = 20
+
+    fn __init__(self) {
+        self._domain_buckets: Dict[string, List[CalibrationBucket]] = {}
+        self._global_buckets = self._make_buckets()
+    }
+
+    fn _make_buckets(self) -> List[any] {
+        let step = 1.0 / self.BUCKET_COUNT
+        let buckets: List[CalibrationBucket] = []
+        for i in range(self.BUCKET_COUNT) {
+            buckets.append(CalibrationBucket {
+                range_low: i * step, range_high: (i + 1) * step,
+                total_predictions: 0, correct_predictions: 0
+            })
+        }
+        return buckets
+    }
+
+    fn record_outcome(self, predicted_confidence: float,
+                      was_correct: bool, domain: string) {
+        let conf = max(0.0, min(1.0, predicted_confidence))
+        let bucket_idx = min(int(conf * self.BUCKET_COUNT), self.BUCKET_COUNT - 1)
+
+        self._global_buckets[bucket_idx].total_predictions += 1
+        if was_correct {
+            self._global_buckets[bucket_idx].correct_predictions += 1
+        }
+
+        if domain != "" {
+            if domain not in self._domain_buckets {
+                self._domain_buckets[domain] = self._make_buckets()
+            }
+            self._domain_buckets[domain][bucket_idx].total_predictions += 1
+            if was_correct {
+                self._domain_buckets[domain][bucket_idx].correct_predictions += 1
+            }
+        }
+    }
+
+    fn calibrate(self, raw_confidence: float, domain: string) -> float {
+        let buckets = self._global_buckets
+        if domain != "" and domain in self._domain_buckets {
+            buckets = self._domain_buckets[domain]
+        }
+        let total_samples = 0
+        for b in buckets {
+            total_samples += b.total_predictions
+        }
+        if total_samples < self.MIN_SAMPLES_FOR_CALIBRATION {
+            return raw_confidence
+        }
+
+        let bucket_idx = min(int(raw_confidence * self.BUCKET_COUNT), self.BUCKET_COUNT - 1)
+        let bucket = buckets[bucket_idx]
+        if bucket.total_predictions < 5 {
+            return raw_confidence
+        }
+
+        return bucket_actual_accuracy(bucket)
+    }
+
+    fn expected_calibration_error(self) -> float {
+        let total = 0
+        for b in self._global_buckets {
+            total += b.total_predictions
+        }
+        if total == 0 {
+            return 0.0
+        }
+        let ece = 0.0
+        for b in self._global_buckets {
+            let weight = b.total_predictions / total
+            ece += weight * bucket_calibration_error(b)
+        }
+        return ece
+    }
+
+    fn report(self, domain: string) -> Dict[string, Any] {
+        let buckets = self._global_buckets
+        if domain != "" and domain in self._domain_buckets {
+            buckets = self._domain_buckets[domain]
+        }
+        let total = 0
+        for b in buckets {
+            total += b.total_predictions
+        }
+        let dom_label = "global"
+        if domain != "" {
+            dom_label = domain
+        }
+        let bucket_reports: List[Dict[string, Any]] = []
+        for b in buckets {
+            if b.total_predictions > 0 {
+                bucket_reports.append({
+                    "range": str(round(b.range_low, 1)) + "-" + str(round(b.range_high, 1)),
+                    "predictions": b.total_predictions,
+                    "accuracy": round(bucket_actual_accuracy(b), 3),
+                    "error": round(bucket_calibration_error(b), 3)
+                })
+            }
+        }
+        return {
+            "domain": dom_label,
+            "total_predictions": total,
+            "expected_calibration_error": self.expected_calibration_error(),
+            "buckets": bucket_reports
+        }
+    }
+}
+
+/// ═══════════════════════════════════════════════════════════════════
+/// 3. Cross-User Lesson Aggregation
+/// ═══════════════════════════════════════════════════════════════════
+
+type GlobalLesson {
+    lesson_id: string,
+    description: string,
+    domain: string,
+    contributing_users: int,
+    contributing_episodes: List[string],
+    confidence: float,
+    first_seen_ms: int,
+    last_seen_ms: int,
+    invalidated: bool
+}
+
+fn global_lesson_to_dict(gl: GlobalLesson) -> Dict[string, Any] {
+    let limited: List[string] = []
+    let start = max(0, len(gl.contributing_episodes) - 20)
+    for i in range(start, len(gl.contributing_episodes)) {
+        limited.append(gl.contributing_episodes[i])
+    }
+    return {
+        "lesson_id": gl.lesson_id,
+        "description": gl.description,
+        "domain": gl.domain,
+        "contributing_users": gl.contributing_users,
+        "contributing_episodes": limited,
+        "confidence": gl.confidence,
+        "first_seen_ms": gl.first_seen_ms,
+        "last_seen_ms": gl.last_seen_ms,
+        "invalidated": gl.invalidated
+    }
+}
+
+class CrossUserAggregator {
+    let PROMOTION_THRESHOLD = 3
+    let MAX_GLOBAL_LESSONS = 500
+
+    fn __init__(self) {
+        self._global_lessons: Dict[string, GlobalLesson] = {}
+        self._correction_clusters: Dict[string, List[LessonRecord]] = {}
+    }
+
+    fn ingest(self, lesson: LessonRecord) -> Optional[GlobalLesson] {
+        if lesson.lesson_type != "factual_correction" {
+            return None
+        }
+        if lesson.safety_class == SafetyClass.REVIEW_REQUIRED {
+            return None
+        }
+
+        let cluster_key = self._cluster_key(lesson)
+        if cluster_key not in self._correction_clusters {
+            self._correction_clusters[cluster_key] = []
+        }
+        self._correction_clusters[cluster_key].append(lesson)
+
+        let cluster = self._correction_clusters[cluster_key]
+        let user_ids: Set[string] = set()
+        for l in cluster {
+            user_ids.add(l.user_id)
+        }
+        let unique_users = len(user_ids)
+
+        if unique_users >= self.PROMOTION_THRESHOLD {
+            let existing = self._global_lessons.get(cluster_key)
+            if existing != None {
+                existing.contributing_users = unique_users
+                existing.contributing_episodes.append(lesson.episode_id)
+                existing.confidence = min(0.95, 0.5 + unique_users * 0.1)
+                existing.last_seen_ms = _now_ms()
+                return existing
+            }
+
+            let ep_ids: List[string] = []
+            for l in cluster {
+                ep_ids.append(l.episode_id)
+            }
+            let gl = GlobalLesson {
+                lesson_id: _uid("gl-"),
+                description: lesson.description,
+                domain: lesson.domain,
+                contributing_users: unique_users,
+                contributing_episodes: ep_ids,
+                confidence: min(0.95, 0.5 + unique_users * 0.1),
+                first_seen_ms: _now_ms(),
+                last_seen_ms: _now_ms(),
+                invalidated: false
+            }
+            self._global_lessons[cluster_key] = gl
+            self._enforce_limit()
+            return gl
+        }
+
+        return None
+    }
+
+    fn get_global_lessons(self, domain: string,
+                          limit: int) -> List[any] {
+        let lessons: List[GlobalLesson] = []
+        for gl in self._global_lessons.values() {
+            if not gl.invalidated {
+                if domain == "" or gl.domain == domain {
+                    lessons.append(gl)
+                }
+            }
+        }
+        let sorted_lessons: List[GlobalLesson] = []
+        let remaining = list(lessons)
+        while len(remaining) > 0 and len(sorted_lessons) < limit {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i].confidence > remaining[best_idx].confidence {
+                    best_idx = i
+                }
+            }
+            sorted_lessons.append(remaining.pop(best_idx))
+        }
+        return sorted_lessons
+    }
+
+    fn _cluster_key(self, lesson: LessonRecord) -> string {
+        let words: List[string] = []
+        for w in lesson.description.lower().split() {
+            words.append(w)
+        }
+        words.sort()
+        let limited: List[string] = []
+        for i in range(min(10, len(words))) {
+            limited.append(words[i])
+        }
+        let sig = " ".join(limited)
+        return lesson.domain + ":" + sig
+    }
+
+    fn _enforce_limit(self) {
+        while len(self._global_lessons) > self.MAX_GLOBAL_LESSONS {
+            let oldest_key = ""
+            let oldest_ms = _now_ms() + 1
+            for k in self._global_lessons {
+                if self._global_lessons[k].last_seen_ms < oldest_ms {
+                    oldest_ms = self._global_lessons[k].last_seen_ms
+                    oldest_key = k
+                }
+            }
+            if oldest_key != "" {
+                self._global_lessons.pop(oldest_key, None)
+            } else {
+                break
+            }
+        }
+    }
+}
+
+/// ═══════════════════════════════════════════════════════════════════
+/// 4. Reasoning Chain Trace
+/// ═══════════════════════════════════════════════════════════════════
+
+type ReasoningStepTrace {
+    step_number: int,
+    stage: string,
+    description: string,
+    input_summary: string,
+    output_summary: string,
+    confidence: float,
+    duration_ms: float,
+    metadata: Dict[string, Any]
+}
+
+fn step_trace_to_dict(s: ReasoningStepTrace) -> Dict[string, Any] {
+    return {
+        "step": s.step_number,
+        "stage": s.stage,
+        "description": s.description,
+        "input": s.input_summary,
+        "output": s.output_summary,
+        "confidence": s.confidence,
+        "duration_ms": round(s.duration_ms, 1),
+        "metadata": s.metadata
+    }
+}
+
+class ReasoningChain {
+    fn __init__(self) {
+        self.chain_id = _uid("chain-")
+        self.query = ""
+        self.steps: List[ReasoningStepTrace] = []
+        self.final_verdict = ""
+        self.total_duration_ms = 0.0
+        self.revision_count = 0
+        self.created_at_ms = _now_ms()
+    }
+
+    fn add_step(self, stage: string, description: string,
+                input_summary: string, output_summary: string,
+                confidence: float, duration_ms: float,
+                metadata: Optional[Dict[string, Any]]) {
+        let md = metadata
+        if md == None {
+            md = {}
+        }
+        self.steps.append(ReasoningStepTrace {
+            step_number: len(self.steps) + 1,
+            stage: stage, description: description,
+            input_summary: input_summary, output_summary: output_summary,
+            confidence: confidence, duration_ms: duration_ms,
+            metadata: md
+        })
+    }
+
+    fn to_dict(self) -> Dict[string, Any] {
+        let step_dicts: List[Dict[string, Any]] = []
+        for s in self.steps {
+            step_dicts.append(step_trace_to_dict(s))
+        }
+        return {
+            "chain_id": self.chain_id,
+            "query": self.query,
+            "steps": step_dicts,
+            "final_verdict": self.final_verdict,
+            "total_duration_ms": round(self.total_duration_ms, 1),
+            "revision_count": self.revision_count
+        }
+    }
+}
+
+class ReasoningTracer {
+    fn __init__(self) {
+        self._chains: Dict[string, ReasoningChain] = {}
+        self._max_chains = 1000
+    }
+
+    fn start_chain(self, query: string) -> ReasoningChain {
+        let chain = ReasoningChain()
+        chain.query = query
+        self._chains[chain.chain_id] = chain
+        if len(self._chains) > self._max_chains {
+            let oldest_key = ""
+            let oldest_ms = _now_ms() + 1
+            for k in self._chains {
+                if self._chains[k].created_at_ms < oldest_ms {
+                    oldest_ms = self._chains[k].created_at_ms
+                    oldest_key = k
+                }
+            }
+            if oldest_key != "" {
+                self._chains.pop(oldest_key, None)
+            }
+        }
+        return chain
+    }
+
+    fn trace_from_result(self, result: MetacognitiveResult) -> ReasoningChain {
+        let chain = self.start_chain(result.plan.query)
+
+        chain.add_step(
+            "plan",
+            "Created plan with " + str(len(result.plan.steps)) + " steps, mode=" + result.plan.chosen_mode.value,
+            result.plan.query[:100],
+            "confidence=" + str(round(result.plan.planner_confidence, 2)) + ", evidence_needed=" + str(result.plan.evidence_needed),
+            result.plan.planner_confidence, 0.0, None)
+
+        for i in range(len(result.assessments)) {
+            let assessment = result.assessments[i]
+            let stage = "pre_assessment"
+            if i > 0 {
+                stage = "critique_round_" + str(assessment.revision_round)
+            }
+            let finding_cats: List[string] = []
+            for f in assessment.critique_findings {
+                finding_cats.append(f.category)
+            }
+            let findings_str = "none"
+            if len(finding_cats) > 0 {
+                findings_str = ", ".join(finding_cats)
+            }
+            chain.add_step(
+                stage,
+                "Verdict: " + assessment.verdict.value + ", findings: " + findings_str,
+                "", "", assessment.overall_confidence, 0.0,
+                {"findings_count": len(assessment.critique_findings), "critical": assessment.has_critical_findings()})
+        }
+
+        let final_stage = "finalize"
+        if result.is_clarification {
+            final_stage = "clarification"
+        }
+        let desc = "Finalized answer"
+        if result.is_clarification {
+            desc = "Asked clarifying question"
+        }
+        let out = result.final_answer[:200]
+        if result.is_clarification {
+            out = result.clarification_question
+        }
+        chain.add_step(final_stage, desc, "", out, 0.0, 0.0, None)
+
+        chain.final_verdict = final_stage
+        chain.revision_count = result.revision_rounds
+        chain.total_duration_ms = result.processing_time_ms
+        return chain
+    }
+
+    fn get_chain(self, chain_id: string) -> Optional[ReasoningChain] {
+        return self._chains.get(chain_id)
+    }
+}
+
+/// ═══════════════════════════════════════════════════════════════════
+/// 5. Proactive Behavior
+/// ═══════════════════════════════════════════════════════════════════
+
+type ProactiveNotice {
+    notice_type: string,
+    priority: string,
+    message: string,
+    related_episode_id: string,
+    evidence: string,
+    created_at_ms: int
+}
+
+fn proactive_notice_to_dict(n: ProactiveNotice) -> Dict[string, Any] {
+    return {
+        "notice_type": n.notice_type,
+        "priority": n.priority,
+        "message": n.message,
+        "related_episode_id": n.related_episode_id,
+        "evidence": n.evidence
+    }
+}
+
+class ProactiveEngine {
+    let LOW_CONFIDENCE_THRESHOLD = 0.50
+    let GAP_CHECK_WINDOW_MS = 7 * 24 * 3600 * 1000
+
+    fn check(self, user: UserModel,
+             recent_episodes: List[ConversationEpisode],
+             global_lessons: List[GlobalLesson],
+             goal: Optional[GoalState]) -> List[any] {
+        let notices: List[ProactiveNotice] = []
+
+        for ep in recent_episodes {
+            for sig_key in ep.outcome_signals {
+                let sig_val = ep.outcome_signals[sig_key]
+                if sig_key == "confidence" and is_number(sig_val) {
+                    if sig_val < self.LOW_CONFIDENCE_THRESHOLD {
+                        notices.append(ProactiveNotice {
+                            notice_type: "weak_prior_answer",
+                            priority: "medium",
+                            message: "My earlier answer about '" + ep.summary[:60] + "' had low confidence (" + str(int(sig_val * 100)) + "%). I may be able to do better now if you'd like to revisit it.",
+                            related_episode_id: ep.episode_id,
+                            evidence: "",
+                            created_at_ms: _now_ms()
+                        })
+                    }
+                }
+            }
+        }
+
+        let user_claims: Set[string] = set()
+        for ep in recent_episodes {
+            for claim in ep.claims {
+                user_claims.add(claim)
+            }
+        }
+        for gl in global_lessons {
+            let gl_words: Set[string] = set()
+            for w in gl.description.lower().split() {
+                gl_words.add(w)
+            }
+            for claim in user_claims {
+                let claim_words: Set[string] = set()
+                for w in claim.lower().split() {
+                    claim_words.add(w)
+                }
+                let overlap = 0
+                for w in gl_words {
+                    if w in claim_words {
+                        overlap += 1
+                    }
+                }
+                if overlap >= 3 and gl.contributing_users >= 3 {
+                    notices.append(ProactiveNotice {
+                        notice_type: "correction_update",
+                        priority: "high",
+                        message: "Multiple users have reported a correction related to: " + gl.description[:100] + ". This may affect something we discussed previously.",
+                        related_episode_id: "",
+                        evidence: str(gl.contributing_users) + " users, confidence " + str(int(gl.confidence * 100)) + "%",
+                        created_at_ms: _now_ms()
+                    })
+                    break
+                }
+            }
+        }
+
+        for ep in recent_episodes {
+            for item in ep.unresolved_items {
+                notices.append(ProactiveNotice {
+                    notice_type: "follow_up",
+                    priority: "low",
+                    message: "We left this unresolved last time: " + item[:100] + ". Would you like to pick it up?",
+                    related_episode_id: ep.episode_id,
+                    evidence: "",
+                    created_at_ms: _now_ms()
+                })
+            }
+        }
+
+        if goal != None and goal.status == "active" {
+            let open_sgs = goal.open_subgoals()
+            if len(open_sgs) > 0 {
+                let remaining: List[string] = []
+                for i in range(min(3, len(open_sgs))) {
+                    remaining.append(open_sgs[i].description)
+                }
+                notices.append(ProactiveNotice {
+                    notice_type: "follow_up",
+                    priority: "medium",
+                    message: "You still have open items: " + "; ".join(remaining) + ". Want to continue?",
+                    related_episode_id: "",
+                    evidence: "",
+                    created_at_ms: _now_ms()
+                })
+            }
+        }
+
+        return notices
+    }
+}
+
+/// ═══════════════════════════════════════════════════════════════════
+/// 6. Deep Self-Model
+/// ═══════════════════════════════════════════════════════════════════
+
+type DomainPerformance {
+    domain: string,
+    total_queries: int,
+    successful_queries: int,
+    corrections_received: int,
+    avg_confidence: float,
+    avg_satisfaction: float,
+    preferred_mode: string,
+    last_failure_description: string,
+    last_updated_ms: int
+}
+
+fn domain_perf_success_rate(dp: DomainPerformance) -> float {
+    if dp.total_queries == 0 {
+        return 0.0
+    }
+    return dp.successful_queries / dp.total_queries
+}
+
+fn domain_perf_is_weak(dp: DomainPerformance) -> bool {
+    return dp.total_queries >= 5 and (domain_perf_success_rate(dp) < 0.6 or dp.corrections_received >= 3)
+}
+
+fn domain_perf_to_dict(dp: DomainPerformance) -> Dict[string, Any] {
+    return {
+        "domain": dp.domain,
+        "total_queries": dp.total_queries,
+        "success_rate": round(domain_perf_success_rate(dp), 3),
+        "corrections": dp.corrections_received,
+        "avg_confidence": round(dp.avg_confidence, 3),
+        "is_weak": domain_perf_is_weak(dp),
+        "preferred_mode": dp.preferred_mode
+    }
+}
+
+type StrategyEffectivenessRecord {
+    strategy_description: string,
+    times_used: int,
+    times_succeeded: int,
+    avg_revision_rounds: float,
+    avg_latency_ms: float
+}
+
+fn strategy_effectiveness(se: StrategyEffectivenessRecord) -> float {
+    if se.times_used == 0 {
+        return 0.0
+    }
+    return se.times_succeeded / se.times_used
+}
+
+fn strategy_eff_to_dict(se: StrategyEffectivenessRecord) -> Dict[string, Any] {
+    return {
+        "strategy": se.strategy_description,
+        "used": se.times_used,
+        "effectiveness": round(strategy_effectiveness(se), 3),
+        "avg_revisions": round(se.avg_revision_rounds, 1),
+        "avg_latency_ms": round(se.avg_latency_ms, 0)
+    }
+}
+
+class DeepSelfModel {
+    fn __init__(self) {
+        self._domain_performance: Dict[string, DomainPerformance] = {}
+        self._strategy_history: Dict[string, StrategyEffectivenessRecord] = {}
+        self._known_weak_areas: Set[string] = set()
+        self._knowledge_boundaries: Dict[string, float] = {}
+    }
+
+    fn record_interaction(self, domain: string, was_successful: bool,
+                          was_corrected: bool, confidence: float,
+                          satisfaction: float, mode: string,
+                          strategy_description: string,
+                          revision_rounds: int, latency_ms: float) {
+        if domain not in self._domain_performance {
+            self._domain_performance[domain] = DomainPerformance {
+                domain: domain, total_queries: 0, successful_queries: 0,
+                corrections_received: 0, avg_confidence: 0.5,
+                avg_satisfaction: 0.5, preferred_mode: "deterministic",
+                last_failure_description: "", last_updated_ms: _now_ms()
+            }
+        }
+        let dp = self._domain_performance[domain]
+        dp.total_queries += 1
+        if was_successful {
+            dp.successful_queries += 1
+        }
+        if was_corrected {
+            dp.corrections_received += 1
+        }
+        let n = dp.total_queries
+        dp.avg_confidence = dp.avg_confidence * (n - 1) / n + confidence / n
+        dp.avg_satisfaction = dp.avg_satisfaction * (n - 1) / n + satisfaction / n
+        dp.preferred_mode = mode
+        dp.last_updated_ms = _now_ms()
+
+        if domain_perf_is_weak(dp) {
+            self._known_weak_areas.add(domain)
+        }
+
+        if strategy_description not in self._strategy_history {
+            self._strategy_history[strategy_description] = StrategyEffectivenessRecord {
+                strategy_description: strategy_description,
+                times_used: 0, times_succeeded: 0,
+                avg_revision_rounds: 0.0, avg_latency_ms: 0.0
+            }
+        }
+        let se = self._strategy_history[strategy_description]
+        se.times_used += 1
+        if was_successful {
+            se.times_succeeded += 1
+        }
+        let n2 = se.times_used
+        se.avg_revision_rounds = se.avg_revision_rounds * (n2 - 1) / n2 + revision_rounds / n2
+        se.avg_latency_ms = se.avg_latency_ms * (n2 - 1) / n2 + latency_ms / n2
+
+        self._knowledge_boundaries[domain] = domain_perf_success_rate(dp)
+    }
+
+    fn get_domain_assessment(self, domain: string) -> Dict[string, Any] {
+        let dp = self._domain_performance.get(domain)
+        if dp == None {
+            return {"domain": domain, "known": false, "recommendation": "proceed_with_caution"}
+        }
+
+        let recommendation = "confident"
+        if domain_perf_is_weak(dp) {
+            recommendation = "seek_evidence"
+        } else if dp.total_queries < 5 {
+            recommendation = "proceed_with_caution"
+        }
+
+        return {
+            "domain": domain,
+            "known": true,
+            "performance": domain_perf_to_dict(dp),
+            "recommendation": recommendation
+        }
+    }
+
+    fn get_best_strategy(self, domain: string) -> Optional[string] {
+        if len(self._strategy_history) == 0 {
+            return None
+        }
+        let candidates: List[StrategyEffectivenessRecord] = []
+        for s in self._strategy_history.values() {
+            if s.times_used >= 3 {
+                candidates.append(s)
+            }
+        }
+        if len(candidates) == 0 {
+            return None
+        }
+        let best = candidates[0]
+        for s in candidates {
+            if strategy_effectiveness(s) > strategy_effectiveness(best) {
+                best = s
+            }
+        }
+        if strategy_effectiveness(best) > 0.5 {
+            return best.strategy_description
+        }
+        return None
+    }
+
+    fn weak_domains(self) -> any {
+        let result: Set[string] = set()
+        for d in self._known_weak_areas {
+            result.add(d)
+        }
+        return result
+    }
+
+    fn knowledge_map(self) -> Dict[string, float] {
+        let result: Dict[string, float] = {}
+        for d in self._knowledge_boundaries {
+            result[d] = self._knowledge_boundaries[d]
+        }
+        return result
+    }
+
+    fn full_report(self) -> Dict[string, Any] {
+        let dp_report: Dict[string, Any] = {}
+        for d in self._domain_performance {
+            dp_report[d] = domain_perf_to_dict(self._domain_performance[d])
+        }
+        let kb_report: Dict[string, float] = {}
+        for d in self._knowledge_boundaries {
+            kb_report[d] = round(self._knowledge_boundaries[d], 3)
+        }
+        let se_report: Dict[string, Any] = {}
+        for s in self._strategy_history {
+            if self._strategy_history[s].times_used >= 2 {
+                se_report[s] = strategy_eff_to_dict(self._strategy_history[s])
+            }
+        }
+        return {
+            "domain_performance": dp_report,
+            "weak_domains": sorted(self._known_weak_areas),
+            "knowledge_boundaries": kb_report,
+            "strategy_effectiveness": se_report,
+            "best_strategy": self.get_best_strategy("")
+        }
+    }
+}
+
+/// ═══════════════════════════════════════════════════════════════════
+/// Enhanced Orchestrator
+/// ═══════════════════════════════════════════════════════════════════
+
+class EnhancedMetacognition {
+    fn __init__(self, bridge: Any) {
+        self.bridge = bridge
+        self.decomposer = QueryDecomposer()
+        self.calibrator = ConfidenceCalibrator()
+        self.aggregator = CrossUserAggregator()
+        self.tracer = ReasoningTracer()
+        self.proactive = ProactiveEngine()
+        self.deep_model = DeepSelfModel()
+    }
+
+    fn process(self, query: string, session_id: string, user_id: string,
+               domain: string,
+               generate_fn: Optional[Callable]) -> Dict[string, Any] {
+        let decomposition: Optional[DecompositionResult] = None
+        let final_answer = ""
+
+        if self.decomposer.should_decompose(query) {
+            let sub_qs = self.decomposer.decompose(query)
+            if len(sub_qs) > 1 {
+                for sq in sub_qs {
+                    let answer = self.bridge.metacognitive_wrap(
+                        "", sq.text, session_id, user_id, domain, generate_fn)
+                    sq.answer = answer
+                    sq.confidence = 0.7
+                }
+                decomposition = self.decomposer.merge_answers(query, sub_qs)
+                final_answer = decomposition.merged_answer
+            } else {
+                final_answer = self.bridge.metacognitive_wrap(
+                    "", query, session_id, user_id, domain, generate_fn)
+            }
+        } else {
+            final_answer = self.bridge.metacognitive_wrap(
+                "", query, session_id, user_id, domain, generate_fn)
+        }
+
+        let chain: Optional[ReasoningChain] = None
+        if self.bridge._last_result != None {
+            chain = self.tracer.trace_from_result(self.bridge._last_result)
+        }
+
+        let raw_confidence = 0.5
+        if self.bridge._last_result != None and len(self.bridge._last_result.assessments) > 0 {
+            let last_idx = len(self.bridge._last_result.assessments) - 1
+            raw_confidence = self.bridge._last_result.assessments[last_idx].overall_confidence
+        }
+        let calibrated_confidence = self.calibrator.calibrate(raw_confidence, domain)
+
+        let domain_assessment = self.deep_model.get_domain_assessment(domain)
+
+        let user = self.bridge.memory.get_or_create_user(user_id)
+        let recent = self.bridge.memory.store.list_episodes(user_id, 5)
+        let global_lessons = self.aggregator.get_global_lessons(domain, 20)
+        let goal = self.bridge.memory.store.load_active_goal(session_id)
+        let notices = self.proactive.check(user, recent, global_lessons, goal)
+
+        let notice_dicts: List[Dict[string, Any]] = []
+        for n in notices {
+            notice_dicts.append(proactive_notice_to_dict(n))
+        }
+
+        let chain_dict: Optional[Dict[string, Any]] = None
+        if chain != None {
+            chain_dict = chain.to_dict()
+        }
+
+        let decomp_info: Dict[string, Any] = {"was_decomposed": false, "sub_questions": []}
+        if decomposition != None {
+            let sq_list: List[Dict[string, Any]] = []
+            for sq in decomposition.sub_questions {
+                sq_list.append({"q": sq.text, "a": sq.answer[:100]})
+            }
+            decomp_info = {"was_decomposed": true, "sub_questions": sq_list}
+        }
+
+        return {
+            "answer": final_answer,
+            "raw_confidence": raw_confidence,
+            "calibrated_confidence": calibrated_confidence,
+            "domain_assessment": domain_assessment,
+            "reasoning_chain": chain_dict,
+            "decomposition": decomp_info,
+            "proactive_notices": notice_dicts
+        }
+    }
+
+    fn post_response_learn(self, session_id: string, user_id: string,
+                           domain: string, was_correct: bool,
+                           satisfaction: float,
+                           next_user_message: Optional[string]) -> Dict[string, Any] {
+        let lessons = self.bridge.post_response_learn(
+            session_id, user_id, next_user_message)
+
+        let result = self.bridge._last_result
+        let raw_conf = 0.5
+        if result != None and len(result.assessments) > 0 {
+            let last_idx = len(result.assessments) - 1
+            raw_conf = result.assessments[last_idx].overall_confidence
+        }
+
+        self.calibrator.record_outcome(raw_conf, was_correct, domain)
+
+        let promoted: List[Dict[string, Any]] = []
+        for lesson in lessons {
+            let gl = self.aggregator.ingest(lesson)
+            if gl != None {
+                promoted.append(global_lesson_to_dict(gl))
+            }
+        }
+
+        let strategy_desc = "unknown"
+        if result != None {
+            strategy_desc = "mode=" + result.plan.chosen_mode.value
+        }
+        let was_corrected = false
+        for l in lessons {
+            if l.lesson_type == "factual_correction" {
+                was_corrected = true
+                break
+            }
+        }
+        let mode_val = "deterministic"
+        let rev_rounds = 0
+        let lat_ms = 0.0
+        if result != None {
+            mode_val = result.plan.chosen_mode.value
+            rev_rounds = result.revision_rounds
+            lat_ms = result.processing_time_ms
+        }
+        self.deep_model.record_interaction(
+            domain, was_correct, was_corrected, raw_conf, satisfaction,
+            mode_val, strategy_desc, rev_rounds, lat_ms)
+
+        return {
+            "lessons_extracted": len(lessons),
+            "global_lessons_promoted": promoted,
+            "calibration": self.calibrator.report(domain),
+            "domain_performance": self.deep_model.get_domain_assessment(domain),
+            "self_model_report": self.deep_model.full_report()
+        }
+    }
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export SubQuestion, DecompositionResult, QueryDecomposer
+export CalibrationBucket, ConfidenceCalibrator
+export GlobalLesson, CrossUserAggregator
+export ReasoningStepTrace, ReasoningChain, ReasoningTracer
+export ProactiveNotice, ProactiveEngine
+export DomainPerformance, StrategyEffectivenessRecord, DeepSelfModel
+export EnhancedMetacognition

@@ -1,0 +1,56 @@
+{
+  "domain": "finance",
+  "version": "2026.1",
+  "source": "CFA Institute / SEC / Basel Committee / industry standards",
+  "source_tier": "t2_verified",
+  "facts": [
+    {
+      "id": "fc-asset-classes",
+      "text": "Primary asset classes: equities (stocks, ownership shares in companies), fixed income (bonds, debt instruments with coupon payments), cash equivalents (money market, T-bills), real estate (REITs, direct property), commodities (gold, oil, agricultural), derivatives (options, futures, swaps derived from underlying assets). Each has distinct risk-return profiles and correlation characteristics.",
+      "confidence": 0.97,
+      "tags": ["asset-classes", "investment", "logical"]
+    },
+    {
+      "id": "fc-valuation-methods",
+      "text": "Core valuation methods: DCF (Discounted Cash Flow) projects future cash flows and discounts to present value using WACC. Comparable analysis uses multiples (P/E, EV/EBITDA, P/B) from similar companies. Precedent transactions use M&A deal multiples. DDM (Dividend Discount Model) values stocks based on expected dividend stream. NAV (Net Asset Value) for asset-heavy companies.",
+      "confidence": 0.96,
+      "tags": ["valuation", "dcf", "multiples", "mathematical"]
+    },
+    {
+      "id": "fc-risk-measures",
+      "text": "Risk measurement: VaR (Value at Risk) estimates maximum loss at a confidence level over a time horizon. CVaR (Conditional VaR / Expected Shortfall) measures expected loss beyond VaR. Beta measures systematic risk relative to market. Standard deviation measures total volatility. Sharpe ratio = (return - risk-free rate) / standard deviation. Maximum drawdown measures largest peak-to-trough decline.",
+      "confidence": 0.96,
+      "tags": ["risk", "var", "beta", "sharpe", "mathematical"]
+    },
+    {
+      "id": "fc-market-structure",
+      "text": "Market structure: exchanges (NYSE, NASDAQ, LSE) provide centralized order matching with transparency. OTC (over-the-counter) markets handle bilateral trades for bonds, derivatives, forex. Dark pools allow large block trades without market impact. Market makers provide liquidity by quoting bid/ask spreads. Clearinghouses (DTCC, LCH) guarantee settlement and manage counterparty risk.",
+      "confidence": 0.95,
+      "tags": ["market-structure", "exchange", "otc", "logical"]
+    },
+    {
+      "id": "fc-portfolio-theory",
+      "text": "Modern Portfolio Theory (Markowitz): optimal portfolios lie on the efficient frontier maximizing return for given risk. CAPM: expected return = risk-free rate + beta * (market return - risk-free rate). Diversification reduces unsystematic risk but not systematic (market) risk. Correlation between assets determines diversification benefit; negative correlation provides strongest hedge.",
+      "confidence": 0.96,
+      "tags": ["portfolio", "capm", "diversification", "mathematical", "causal"]
+    },
+    {
+      "id": "fc-derivatives-basics",
+      "text": "Derivative instruments: call option (right to buy at strike price), put option (right to sell at strike price), futures (obligation to buy/sell at future date), forwards (customized futures, OTC), swaps (exchange of cash flows, e.g. interest rate swap exchanges fixed for floating). Black-Scholes model prices European options using underlying price, strike, time, volatility, risk-free rate.",
+      "confidence": 0.96,
+      "tags": ["derivatives", "options", "futures", "black-scholes", "mathematical"]
+    },
+    {
+      "id": "fc-financial-statements",
+      "text": "Three core financial statements: Income Statement (revenue, expenses, net income over period), Balance Sheet (assets = liabilities + equity at point in time), Cash Flow Statement (operating, investing, financing cash flows). Key ratios: ROE (net income/equity), ROA (net income/assets), debt-to-equity, current ratio (current assets/current liabilities), free cash flow (operating CF - capex).",
+      "confidence": 0.97,
+      "tags": ["financial-statements", "ratios", "accounting", "mathematical"]
+    },
+    {
+      "id": "fc-credit-analysis",
+      "text": "Credit analysis evaluates borrower ability to repay: 5 Cs of credit (Character, Capacity, Capital, Collateral, Conditions). Credit ratings: AAA/Aaa (highest quality) through D (default). Investment grade: BBB-/Baa3 and above. High yield/junk: below investment grade. Credit spreads widen during economic stress, reflecting increased default probability. Recovery rates vary by seniority: senior secured ~65%, senior unsecured ~45%, subordinated ~25%.",
+      "confidence": 0.95,
+      "tags": ["credit", "ratings", "analysis", "causal"]
+    }
+  ]
+}

@@ -1,0 +1,84 @@
+/// NRSI Mode Policy — Risk Domain Classification and Mode Thresholds
+///
+/// Declares which domains are high-risk, default mode thresholds,
+/// and the norms constraining mode transitions.
+
+module mode_policy
+
+import NRSIData, TrustLevel from "types"
+
+/// ---------- Risk Domain Classification ----------
+
+enum RiskLevel {
+    CRITICAL,
+    HIGH,
+    MODERATE,
+    LOW
+}
+
+type DomainRisk {
+    domain: String,
+    risk: RiskLevel,
+    requires_deterministic: Bool
+}
+
+/// ---------- High-Risk Domain Norms ----------
+
+norm force_deterministic_medical {
+    type: obligation,
+    scope: domain("medical"),
+    action: "force_deterministic_mode",
+    priority: 100,
+    condition: risk == RiskLevel.CRITICAL
+}
+
+norm force_deterministic_legal {
+    type: obligation,
+    scope: domain("legal"),
+    action: "force_deterministic_mode",
+    priority: 100,
+    condition: risk == RiskLevel.CRITICAL
+}
+
+norm force_deterministic_financial {
+    type: obligation,
+    scope: domain("financial"),
+    action: "force_deterministic_mode",
+    priority: 95,
+    condition: risk == RiskLevel.HIGH
+}
+
+norm allow_probabilistic_creative {
+    type: permission,
+    scope: domain("creative"),
+    action: "allow_probabilistic_mode",
+    priority: 50,
+    condition: risk == RiskLevel.LOW
+}
+
+norm allow_hybrid_philosophy {
+    type: permission,
+    scope: domain("philosophy"),
+    action: "allow_hybrid_mode",
+    priority: 60,
+    condition: risk == RiskLevel.MODERATE
+}
+
+/// ---------- Mode Transition Gates ----------
+
+gate deterministic_entry(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.85
+    require data.domain != "unknown"
+    validate axiom_backed
+    validate no_ambiguity
+}
+
+gate probabilistic_entry(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.40
+    validate creative_or_exploratory
+}
+
+gate hybrid_entry(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.60
+    validate mixed_evidence
+}

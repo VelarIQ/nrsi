@@ -1,0 +1,3384 @@
+/// NRS Telecom Fault Isolation Engine — Ericsson SMS Signaling Analysis.
+///
+/// Ingests control-plane data from Ericsson routers (~2000+ data points),
+/// runs five parallel analysis dimensions, fuses evidence through NRS
+/// reasoning, and identifies the faulty tower with full provenance.
+///
+/// Every conclusion traced to exact data point indices.
+/// Deterministic: same input → same output, always.
+/// Faster than any cloud API: pure vectorized local computation.
+///
+/// ═══════════════════════════════════════════════════════════════════
+///   ANALYSIS PIPELINE
+/// ═══════════════════════════════════════════════════════════════════
+///
+///   Raw Data (CSV/TSV/JSON/XML)
+///        │
+///        ▼
+///   ┌─ ADAPTIVE PARSER ───────────────────────────────────────────┐
+///   │  Auto-detect format, schema mapping, normalization          │
+///   │  Output: List[SignalingRecord] with row_index provenance    │
+///   └────────────┬────────────────────────────────────────────────┘
+///                │
+///                ▼
+///   ┌─ STATISTICAL PROFILER ──────────────────────────────────────┐
+///   │  Per-tower aggregation, z-score, Wilson CI, entropy         │
+///   └────────────┬────────────────────────────────────────────────┘
+///                │
+///        ┌───────┼───────┬───────────┬──────────────┐
+///        ▼       ▼       ▼           ▼              ▼
+///   TEMPORAL  SPATIAL  SIGNALING  GRAPH       STATISTICAL
+///   CUSUM     LAC vs   MAP error  Path        Anomaly
+///   change    tower    taxonomy   isolation   detection
+///   points    mobility signatures SPOF
+///        │       │       │           │              │
+///        └───────┴───────┴───────────┴──────────────┘
+///                │
+///                ▼
+///   ┌─ EVIDENCE FUSION ───────────────────────────────────────────┐
+///   │  Weighted scoring, cross-dimension agreement, ranking       │
+///   └────────────┬────────────────────────────────────────────────┘
+///                │
+///                ▼
+///   ┌─ VERIFICATION GATE ─────────────────────────────────────────┐
+///   │  Cross-check, sanity, calibration, trust level, provenance  │
+///   └────────────┬────────────────────────────────────────────────┘
+///                │
+///                ▼
+///   ┌─ ANALYSIS REPORT ───────────────────────────────────────────┐
+///   │  Primary fault, alternatives, reasoning chain, hash         │
+///   └─────────────────────────────────────────────────────────────┘
+
+module telecom_analyzer
+
+import time from "std/time"
+import math from "std/math"
+import hashlib from "std/hashlib"
+import json from "std/json"
+import re from "std/regex"
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 1 — ENUMS
+// ═══════════════════════════════════════════════════════════════════
+
+enum SignalingEventType {
+    MO_SMS = "MO_SMS",
+    MT_SMS = "MT_SMS",
+    SRI_SM = "SRI_SM",
+    DELIVERY_REPORT = "DELIVERY_REPORT",
+    LOCATION_UPDATE = "LOCATION_UPDATE",
+    PAGING = "PAGING",
+    HANDOVER = "HANDOVER",
+    AUTH_REQUEST = "AUTH_REQUEST",
+    MAP_ERROR = "MAP_ERROR",
+    SCCP_ERROR = "SCCP_ERROR",
+    SIGTRAN_ERROR = "SIGTRAN_ERROR",
+    UNKNOWN = "UNKNOWN"
+}
+
+enum ResultCode {
+    SUCCESS = "SUCCESS",
+    ABSENT_SUBSCRIBER = "ABSENT_SUBSCRIBER",
+    SYSTEM_FAILURE = "SYSTEM_FAILURE",
+    UNIDENTIFIED_SUBSCRIBER = "UNIDENTIFIED_SUBSCRIBER",
+    SM_DELIVERY_FAILURE = "SM_DELIVERY_FAILURE",
+    CALL_BARRED = "CALL_BARRED",
+    FACILITY_NOT_SUPPORTED = "FACILITY_NOT_SUPPORTED",
+    CONGESTION = "CONGESTION",
+    NETWORK_OUT_OF_ORDER = "NETWORK_OUT_OF_ORDER",
+    TEMPORARY_FAILURE = "TEMPORARY_FAILURE",
+    PROTOCOL_ERROR = "PROTOCOL_ERROR",
+    EQUIPMENT_FAILURE = "EQUIPMENT_FAILURE",
+    UNKNOWN_ERROR = "UNKNOWN_ERROR"
+}
+
+enum FaultDomain {
+    RADIO = "RADIO",
+    CORE = "CORE",
+    TRANSPORT = "TRANSPORT",
+    SMSC = "SMSC",
+    SUBSCRIBER = "SUBSCRIBER",
+    CONFIG = "CONFIG",
+    UNKNOWN = "UNKNOWN"
+}
+
+enum FaultSeverity {
+    CRITICAL = "CRITICAL",
+    MAJOR = "MAJOR",
+    MINOR = "MINOR",
+    WARNING = "WARNING",
+    INFO = "INFO"
+}
+
+enum AnalysisDimension {
+    STATISTICAL = "STATISTICAL",
+    TEMPORAL = "TEMPORAL",
+    SPATIAL = "SPATIAL",
+    SIGNALING = "SIGNALING",
+    GRAPH = "GRAPH"
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 2 — TYPE DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════
+
+type SignalingRecord {
+    row_index: int,
+    timestamp: float,
+    event_type: string,
+    result_code: string,
+    cell_id: string,
+    lac: string,
+    rnc_bsc: string,
+    msc: string,
+    smsc: string,
+    imsi_hash: string,
+    duration_ms: float,
+    retry_count: int,
+    signal_strength: float,
+    timing_advance: float,
+    frequency_band: string,
+    technology: string,
+    raw_fields: Dict[string, string]
+}
+
+type TowerProfile {
+    cell_id: string,
+    lac: string,
+    rnc_bsc: string,
+    total_events: int,
+    success_count: int,
+    failure_count: int,
+    failure_rate: float,
+    error_distribution: Dict[string, int],
+    unique_subscribers: int,
+    avg_duration_ms: float,
+    avg_retry_count: float,
+    first_event: float,
+    last_event: float,
+    anomaly_scores: Dict[string, float],
+    evidence_items: List[EvidenceItem],
+    band_distribution: Dict[string, int],
+    band_failure_rates: Dict[string, float],
+    technology_distribution: Dict[string, int],
+    primary_band: string,
+    primary_technology: string
+}
+
+type EvidenceItem {
+    dimension: string,
+    metric: string,
+    anomaly_score: float,
+    confidence: float,
+    row_indices: List[int],
+    reasoning: string,
+    tower_id: string,
+    comparison_value: string
+}
+
+type ChangePoint {
+    timestamp: float,
+    metric: string,
+    before_value: float,
+    after_value: float,
+    significance: float,
+    row_index: int
+}
+
+type FaultHypothesis {
+    tower_id: string,
+    fault_domain: string,
+    fault_severity: string,
+    confidence: float,
+    evidence: List[EvidenceItem],
+    root_cause: string,
+    explanation: string,
+    recommendations: List[string],
+    change_point: Optional[ChangePoint],
+    provenance_hash: string
+}
+
+type AnalysisReport {
+    report_id: string,
+    timestamp: float,
+    elapsed_ms: float,
+    total_records: int,
+    total_towers: int,
+    primary_fault: FaultHypothesis,
+    alternative_hypotheses: List[FaultHypothesis],
+    network_health: Dict[string, float],
+    data_quality: Dict[string, float],
+    reasoning_chain: List[string],
+    trust_level: string,
+    provenance_hash: string
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 3 — CONSTANTS AND HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+let DIMENSION_WEIGHTS = {
+    "STATISTICAL": 0.30,
+    "TEMPORAL": 0.20,
+    "SPATIAL": 0.15,
+    "SIGNALING": 0.25,
+    "GRAPH": 0.10
+}
+
+let CROSS_DIMENSION_BONUS = 0.15
+
+let MIN_EVENTS_FOR_ANALYSIS = 5
+let MIN_EVENTS_HIGH_CONFIDENCE = 10
+let Z_SCORE_THRESHOLD = 2.0
+let CUSUM_THRESHOLD = 4.0
+let BURST_WINDOW_SEC = 300.0
+let BURST_MIN_FAILURES = 5
+
+let RESULT_CODE_ALIASES = {
+    "success": "SUCCESS",
+    "ok": "SUCCESS",
+    "0": "SUCCESS",
+    "absent": "ABSENT_SUBSCRIBER",
+    "absent_subscriber": "ABSENT_SUBSCRIBER",
+    "absent subscriber": "ABSENT_SUBSCRIBER",
+    "system_failure": "SYSTEM_FAILURE",
+    "system failure": "SYSTEM_FAILURE",
+    "sys_fail": "SYSTEM_FAILURE",
+    "unidentified": "UNIDENTIFIED_SUBSCRIBER",
+    "unidentified_subscriber": "UNIDENTIFIED_SUBSCRIBER",
+    "sm_delivery_failure": "SM_DELIVERY_FAILURE",
+    "delivery_failure": "SM_DELIVERY_FAILURE",
+    "call_barred": "CALL_BARRED",
+    "barred": "CALL_BARRED",
+    "facility_not_supported": "FACILITY_NOT_SUPPORTED",
+    "congestion": "CONGESTION",
+    "network_out_of_order": "NETWORK_OUT_OF_ORDER",
+    "temporary_failure": "TEMPORARY_FAILURE",
+    "temp_fail": "TEMPORARY_FAILURE",
+    "protocol_error": "PROTOCOL_ERROR",
+    "equipment_failure": "EQUIPMENT_FAILURE",
+    "equip_fail": "EQUIPMENT_FAILURE"
+}
+
+let ERROR_DOMAIN_MAP = {
+    "ABSENT_SUBSCRIBER": "RADIO",
+    "SYSTEM_FAILURE": "CORE",
+    "UNIDENTIFIED_SUBSCRIBER": "CORE",
+    "SM_DELIVERY_FAILURE": "SMSC",
+    "CALL_BARRED": "CONFIG",
+    "FACILITY_NOT_SUPPORTED": "CONFIG",
+    "CONGESTION": "RADIO",
+    "NETWORK_OUT_OF_ORDER": "TRANSPORT",
+    "TEMPORARY_FAILURE": "CORE",
+    "PROTOCOL_ERROR": "TRANSPORT",
+    "EQUIPMENT_FAILURE": "RADIO"
+}
+
+/// Clamp a float to [lo, hi].
+fn _clamp(val: float, lo: float, hi: float) -> float {
+    if val < lo { return lo }
+    if val > hi { return hi }
+    return val
+}
+
+/// Safe division — returns 0.0 if denominator is zero.
+fn _safe_div(num: float, den: float) -> float {
+    if den == 0.0 { return 0.0 }
+    return num / den
+}
+
+/// Square root via Newton's method (no external dependency).
+fn _sqrt(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    let i = 0
+    while i < 50 {
+        let next = (guess + x / guess) / 2.0
+        if abs(next - guess) < 1e-12 { return next }
+        guess = next
+        i += 1
+    }
+    return guess
+}
+
+/// Natural log approximation for entropy calculations.
+fn _ln(x: float) -> float {
+    if x <= 0.0 { return -999.0 }
+    return math.log(x)
+}
+
+/// Log base 2.
+fn _log2(x: float) -> float {
+    if x <= 0.0 { return -999.0 }
+    return _ln(x) / _ln(2.0)
+}
+
+/// Compute SHA-256 hex digest of a string.
+fn _hash_string(s: string) -> string {
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+}
+
+/// Sort a list of EvidenceItem by anomaly_score descending.
+fn _sort_evidence_desc(items: List[EvidenceItem]) -> List[EvidenceItem] {
+    items.sort_by(fn(e) { return -e.anomaly_score })
+    return items
+}
+
+/// Build a default empty SignalingRecord.
+fn _default_record(row_idx: int) -> SignalingRecord {
+    return SignalingRecord {
+        row_index: row_idx,
+        timestamp: 0.0,
+        event_type: "UNKNOWN",
+        result_code: "UNKNOWN_ERROR",
+        cell_id: "unknown",
+        lac: "unknown",
+        rnc_bsc: "unknown",
+        msc: "unknown",
+        smsc: "unknown",
+        imsi_hash: "unknown",
+        duration_ms: 0.0,
+        retry_count: 0,
+        signal_strength: 0.0,
+        timing_advance: 0.0,
+        frequency_band: "unknown",
+        technology: "unknown",
+        raw_fields: {}
+    }
+}
+
+/// Ericsson band/ARFCN lookup tables.
+let _EARFCN_TO_BAND = {
+    "B1": [0, 599], "B2": [600, 1199], "B3": [1200, 1949],
+    "B4": [1950, 2399], "B5": [2400, 2649], "B7": [2750, 3449],
+    "B8": [3450, 3799], "B12": [5010, 5179], "B13": [5180, 5279],
+    "B14": [5280, 5379], "B17": [5730, 5849], "B20": [6150, 6449],
+    "B25": [8040, 8689], "B26": [8690, 9039], "B28": [9210, 9659],
+    "B29": [9660, 9769], "B30": [9770, 9869], "B38": [37750, 38249],
+    "B40": [38650, 39649], "B41": [39650, 41589], "B42": [41590, 43589],
+    "B43": [43590, 45589], "B66": [66436, 67335], "B71": [68586, 68935]
+}
+
+let _BAND_TO_TECH = {
+    "GSM900": "2G", "GSM1800": "2G", "GSM850": "2G", "GSM1900": "2G",
+    "B1": "4G", "B2": "4G", "B3": "4G", "B4": "4G", "B5": "4G",
+    "B7": "4G", "B8": "4G", "B12": "4G", "B13": "4G", "B14": "4G",
+    "B17": "4G", "B20": "4G", "B25": "4G", "B26": "4G", "B28": "4G",
+    "B29": "4G", "B30": "4G", "B38": "4G", "B40": "4G", "B41": "4G",
+    "B42": "4G", "B43": "4G", "B66": "4G", "B71": "4G",
+    "UMTS850": "3G", "UMTS900": "3G", "UMTS1700": "3G",
+    "UMTS1900": "3G", "UMTS2100": "3G",
+    "N1": "5G", "N3": "5G", "N5": "5G", "N7": "5G", "N8": "5G",
+    "N20": "5G", "N25": "5G", "N28": "5G", "N38": "5G", "N40": "5G",
+    "N41": "5G", "N66": "5G", "N71": "5G", "N77": "5G", "N78": "5G",
+    "N79": "5G", "N257": "5G", "N258": "5G", "N260": "5G", "N261": "5G"
+}
+
+/// Resolve a frequency band from ARFCN/EARFCN number.
+fn _earfcn_to_band(earfcn: int) -> string {
+    for band_name in _EARFCN_TO_BAND {
+        let range_pair = _EARFCN_TO_BAND[band_name]
+        if earfcn >= range_pair[0] and earfcn <= range_pair[1] {
+            return band_name
+        }
+    }
+    return "unknown"
+}
+
+/// Normalize a raw band string to canonical form.
+fn _normalize_band(raw: string) -> string {
+    let s = raw.strip().upper()
+    if len(s) == 0 { return "unknown" }
+
+    // Direct band names: B1, B3, B7, B20, N78, etc.
+    if s.startswith("B") or s.startswith("N") {
+        return s
+    }
+    // GSM bands
+    if "GSM" in s and "900" in s { return "GSM900" }
+    if "GSM" in s and "1800" in s { return "GSM1800" }
+    if "GSM" in s and "850" in s { return "GSM850" }
+    if "GSM" in s and "1900" in s { return "GSM1900" }
+    // UMTS bands
+    if "UMTS" in s or "WCDMA" in s {
+        if "2100" in s { return "UMTS2100" }
+        if "900" in s { return "UMTS900" }
+        if "850" in s { return "UMTS850" }
+        if "1900" in s { return "UMTS1900" }
+        if "1700" in s { return "UMTS1700" }
+    }
+    // LTE band numbers: "LTE2100" -> B1, "LTE800" -> B20
+    if "LTE" in s {
+        if "2100" in s { return "B1" }
+        if "1800" in s { return "B3" }
+        if "2600" in s { return "B7" }
+        if "900" in s { return "B8" }
+        if "800" in s { return "B20" }
+        if "700" in s { return "B28" }
+    }
+    // NR bands
+    if "NR" in s {
+        if "3500" in s { return "N78" }
+        if "2600" in s { return "N38" }
+        if "700" in s { return "N28" }
+        if "2100" in s { return "N1" }
+    }
+    // Numeric EARFCN
+    let is_numeric = true
+    for ch in s {
+        if ch < "0" or ch > "9" { is_numeric = false }
+    }
+    if is_numeric and len(s) > 0 {
+        return _earfcn_to_band(int(s))
+    }
+    // Frequency in MHz: "900", "1800", "2100"
+    if s == "900" { return "GSM900" }
+    if s == "1800" { return "GSM1800" }
+    if s == "2100" { return "UMTS2100" }
+    if s == "2600" { return "B7" }
+    if s == "800" { return "B20" }
+    return s
+}
+
+/// Infer technology from band name.
+fn _band_to_technology(band: string) -> string {
+    if band in _BAND_TO_TECH {
+        return _BAND_TO_TECH[band]
+    }
+    if band.startswith("N") { return "5G" }
+    if band.startswith("B") { return "4G" }
+    if band.startswith("UMTS") or band.startswith("WCDMA") { return "3G" }
+    if band.startswith("GSM") { return "2G" }
+    return "unknown"
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 4 — ADAPTIVE PARSER
+// ═══════════════════════════════════════════════════════════════════
+
+/// Auto-detect format, map schema, normalize, produce SignalingRecords.
+class AdaptiveParser {
+    fn init(self) {
+        self._column_map = {}
+        self._format = "unknown"
+
+        self._cell_keywords = ["cell", "cgi", "ci", "cell_id", "cellid", "bts"]
+        self._lac_keywords = ["lac", "location_area", "la"]
+        self._rnc_keywords = ["rnc", "bsc", "rnc_bsc", "controller"]
+        self._msc_keywords = ["msc", "switch", "vlr"]
+        self._smsc_keywords = ["smsc", "sc", "service_center", "message_center"]
+        self._result_keywords = ["result", "cause", "error", "status", "result_code", "cause_code"]
+        self._event_keywords = ["event", "type", "event_type", "msg_type", "message_type"]
+        self._time_keywords = ["time", "timestamp", "date", "datetime", "ts", "epoch"]
+        self._imsi_keywords = ["imsi", "subscriber", "msisdn", "imsi_hash"]
+        self._duration_keywords = ["duration", "duration_ms", "latency", "response_time"]
+        self._retry_keywords = ["retry", "retries", "retry_count", "attempts"]
+        self._signal_keywords = ["signal", "rssi", "signal_strength", "rxlev"]
+        self._ta_keywords = ["ta", "timing_advance", "timing"]
+        self._band_keywords = ["band", "freq", "frequency", "frequency_band",
+                               "arfcn", "earfcn", "uarfcn", "nrarfcn",
+                               "carrier", "dl_freq", "dl_earfcn", "channel"]
+        self._tech_keywords = ["technology", "tech", "rat", "radio_access",
+                               "access_technology", "network_type", "rat_type"]
+    }
+
+    /// Main entry: parse raw data string into records.
+    fn parse(self, raw_data: string, format_hint: string) -> List[SignalingRecord] {
+        let trimmed = raw_data.strip()
+        if len(trimmed) == 0 { return [] }
+
+        let detected = self._detect_format(trimmed, format_hint)
+        self._format = detected
+
+        if detected == "json_array" {
+            return self._parse_json_array(trimmed)
+        }
+        if detected == "json_lines" {
+            return self._parse_json_lines(trimmed)
+        }
+        if detected == "xml" {
+            return self._parse_xml(trimmed)
+        }
+        if detected == "tsv" {
+            return self._parse_delimited(trimmed, "\t")
+        }
+        return self._parse_delimited(trimmed, ",")
+    }
+
+    /// Detect the data format from content inspection and hint.
+    fn _detect_format(self, data: string, hint: string) -> string {
+        let h = hint.strip().lower()
+        if h == "json" or h == "json_array" { return "json_array" }
+        if h == "jsonl" or h == "json_lines" or h == "ndjson" { return "json_lines" }
+        if h == "xml" { return "xml" }
+        if h == "tsv" { return "tsv" }
+        if h == "csv" { return "csv" }
+
+        if data.startswith("[") { return "json_array" }
+        if data.startswith("{") { return "json_lines" }
+        if data.startswith("<") or data.startswith("<?xml") { return "xml" }
+
+        let first_line = data.split("\n")[0]
+        let tab_count = 0
+        let comma_count = 0
+        for ch in first_line {
+            if ch == "\t" { tab_count += 1 }
+            if ch == "," { comma_count += 1 }
+        }
+        if tab_count > comma_count { return "tsv" }
+        return "csv"
+    }
+
+    /// Parse CSV or TSV data.
+    fn _parse_delimited(self, data: string, delimiter: string) -> List[SignalingRecord] {
+        let lines = data.split("\n")
+        if len(lines) < 2 { return [] }
+
+        let header_line = lines[0].strip()
+        let headers = header_line.split(delimiter)
+        let clean_headers: List[string] = []
+        for h in headers {
+            append(clean_headers, h.strip().lower().replace("\"", ""))
+        }
+
+        let col_map = self._build_column_map(clean_headers)
+        self._column_map = col_map
+
+        let records: List[SignalingRecord] = []
+        let row_idx = 0
+        let i = 1
+        while i < len(lines) {
+            let line = lines[i].strip()
+            if len(line) == 0 {
+                i += 1
+                continue
+            }
+            let fields = line.split(delimiter)
+            let raw_dict: Dict[string, string] = {}
+            let j = 0
+            while j < len(fields) and j < len(clean_headers) {
+                raw_dict[clean_headers[j]] = fields[j].strip().replace("\"", "")
+                j += 1
+            }
+            let rec = self._map_to_record(raw_dict, col_map, row_idx)
+            append(records, rec)
+            row_idx += 1
+            i += 1
+        }
+        return records
+    }
+
+    /// Parse JSON array format.
+    fn _parse_json_array(self, data: string) -> List[SignalingRecord] {
+        let arr = json.loads(data)
+        if arr == None { return [] }
+
+        let records: List[SignalingRecord] = []
+        let row_idx = 0
+
+        if len(arr) > 0 {
+            let first = arr[0]
+            let keys: List[string] = []
+            for k in first.keys() {
+                append(keys, k.lower())
+            }
+            self._column_map = self._build_column_map(keys)
+        }
+
+        for item in arr {
+            let raw_dict: Dict[string, string] = {}
+            for k, v in item.items() {
+                raw_dict[k.lower()] = str(v)
+            }
+            let rec = self._map_to_record(raw_dict, self._column_map, row_idx)
+            append(records, rec)
+            row_idx += 1
+        }
+        return records
+    }
+
+    /// Parse newline-delimited JSON.
+    fn _parse_json_lines(self, data: string) -> List[SignalingRecord] {
+        let lines = data.split("\n")
+        let records: List[SignalingRecord] = []
+        let row_idx = 0
+        let col_map_built = false
+
+        for line in lines {
+            let trimmed = line.strip()
+            if len(trimmed) == 0 { continue }
+            let obj = json.loads(trimmed)
+            if obj == None { continue }
+
+            if !col_map_built {
+                let keys: List[string] = []
+                for k in obj.keys() {
+                    append(keys, k.lower())
+                }
+                self._column_map = self._build_column_map(keys)
+                col_map_built = true
+            }
+
+            let raw_dict: Dict[string, string] = {}
+            for k, v in obj.items() {
+                raw_dict[k.lower()] = str(v)
+            }
+            let rec = self._map_to_record(raw_dict, self._column_map, row_idx)
+            append(records, rec)
+            row_idx += 1
+        }
+        return records
+    }
+
+    /// Parse XML format — expects <record> or <event> elements.
+    fn _parse_xml(self, data: string) -> List[SignalingRecord] {
+        let records: List[SignalingRecord] = []
+        let row_idx = 0
+
+        let tag_pattern = "<(record|event|row|entry)[^>]*>(.*?)</(record|event|row|entry)>"
+        let matches = re.findall(tag_pattern, data, re.DOTALL)
+
+        for match in matches {
+            let content = match[1]
+            let raw_dict: Dict[string, string] = {}
+            let field_matches = re.findall("<(\\w+)>([^<]*)</(\\w+)>", content)
+            for fm in field_matches {
+                raw_dict[fm[0].lower()] = fm[1].strip()
+            }
+
+            if len(raw_dict) > 0 {
+                if len(self._column_map) == 0 {
+                    let keys: List[string] = []
+                    for k in raw_dict.keys() {
+                        append(keys, k)
+                    }
+                    self._column_map = self._build_column_map(keys)
+                }
+                let rec = self._map_to_record(raw_dict, self._column_map, row_idx)
+                append(records, rec)
+                row_idx += 1
+            }
+        }
+        return records
+    }
+
+    /// Build a mapping from semantic role to column name.
+    fn _build_column_map(self, headers: List[string]) -> Dict[string, string] {
+        let mapping: Dict[string, string] = {}
+
+        for h in headers {
+            if self._matches_any(h, self._cell_keywords) {
+                mapping["cell_id"] = h
+            }
+            if self._matches_any(h, self._lac_keywords) {
+                mapping["lac"] = h
+            }
+            if self._matches_any(h, self._rnc_keywords) {
+                mapping["rnc_bsc"] = h
+            }
+            if self._matches_any(h, self._msc_keywords) {
+                mapping["msc"] = h
+            }
+            if self._matches_any(h, self._smsc_keywords) {
+                mapping["smsc"] = h
+            }
+            if self._matches_any(h, self._result_keywords) {
+                mapping["result_code"] = h
+            }
+            if self._matches_any(h, self._event_keywords) {
+                mapping["event_type"] = h
+            }
+            if self._matches_any(h, self._time_keywords) {
+                mapping["timestamp"] = h
+            }
+            if self._matches_any(h, self._imsi_keywords) {
+                mapping["imsi_hash"] = h
+            }
+            if self._matches_any(h, self._duration_keywords) {
+                mapping["duration_ms"] = h
+            }
+            if self._matches_any(h, self._retry_keywords) {
+                mapping["retry_count"] = h
+            }
+            if self._matches_any(h, self._signal_keywords) {
+                mapping["signal_strength"] = h
+            }
+            if self._matches_any(h, self._ta_keywords) {
+                mapping["timing_advance"] = h
+            }
+            if self._matches_any(h, self._band_keywords) {
+                mapping["frequency_band"] = h
+            }
+            if self._matches_any(h, self._tech_keywords) {
+                mapping["technology"] = h
+            }
+        }
+        return mapping
+    }
+
+    /// Check if a header matches any keyword in a list.
+    fn _matches_any(self, header: string, keywords: List[string]) -> bool {
+        let h = header.lower().strip()
+        for kw in keywords {
+            if h == kw { return true }
+            if h.startswith(kw) { return true }
+            if h.endswith(kw) { return true }
+        }
+        return false
+    }
+
+    /// Map a raw dict row to a SignalingRecord using the column map.
+    fn _map_to_record(self, raw: Dict[string, string], col_map: Dict[string, string], row_idx: int) -> SignalingRecord {
+        let rec = _default_record(row_idx)
+        rec.raw_fields = raw
+
+        let ts_col = col_map.get("timestamp", "")
+        if ts_col != "" and ts_col in raw {
+            let ts_str = raw[ts_col]
+            rec.timestamp = self._parse_timestamp(ts_str)
+        }
+
+        let ev_col = col_map.get("event_type", "")
+        if ev_col != "" and ev_col in raw {
+            rec.event_type = self._normalize_event_type(raw[ev_col])
+        }
+
+        let rc_col = col_map.get("result_code", "")
+        if rc_col != "" and rc_col in raw {
+            rec.result_code = self._normalize_result_code(raw[rc_col])
+        }
+
+        let cell_col = col_map.get("cell_id", "")
+        if cell_col != "" and cell_col in raw {
+            rec.cell_id = raw[cell_col].strip()
+            if len(rec.cell_id) == 0 { rec.cell_id = "unknown" }
+        }
+
+        let lac_col = col_map.get("lac", "")
+        if lac_col != "" and lac_col in raw {
+            rec.lac = raw[lac_col].strip()
+            if len(rec.lac) == 0 { rec.lac = "unknown" }
+        }
+
+        let rnc_col = col_map.get("rnc_bsc", "")
+        if rnc_col != "" and rnc_col in raw {
+            rec.rnc_bsc = raw[rnc_col].strip()
+            if len(rec.rnc_bsc) == 0 { rec.rnc_bsc = "unknown" }
+        }
+
+        let msc_col = col_map.get("msc", "")
+        if msc_col != "" and msc_col in raw {
+            rec.msc = raw[msc_col].strip()
+            if len(rec.msc) == 0 { rec.msc = "unknown" }
+        }
+
+        let smsc_col = col_map.get("smsc", "")
+        if smsc_col != "" and smsc_col in raw {
+            rec.smsc = raw[smsc_col].strip()
+            if len(rec.smsc) == 0 { rec.smsc = "unknown" }
+        }
+
+        let imsi_col = col_map.get("imsi_hash", "")
+        if imsi_col != "" and imsi_col in raw {
+            rec.imsi_hash = raw[imsi_col].strip()
+            if len(rec.imsi_hash) == 0 { rec.imsi_hash = "unknown" }
+        }
+
+        let dur_col = col_map.get("duration_ms", "")
+        if dur_col != "" and dur_col in raw {
+            rec.duration_ms = self._safe_float(raw[dur_col], 0.0)
+        }
+
+        let retry_col = col_map.get("retry_count", "")
+        if retry_col != "" and retry_col in raw {
+            rec.retry_count = int(self._safe_float(raw[retry_col], 0.0))
+        }
+
+        let sig_col = col_map.get("signal_strength", "")
+        if sig_col != "" and sig_col in raw {
+            rec.signal_strength = self._safe_float(raw[sig_col], 0.0)
+        }
+
+        let ta_col = col_map.get("timing_advance", "")
+        if ta_col != "" and ta_col in raw {
+            rec.timing_advance = self._safe_float(raw[ta_col], 0.0)
+        }
+
+        let band_col = col_map.get("frequency_band", "")
+        if band_col != "" and band_col in raw {
+            rec.frequency_band = _normalize_band(raw[band_col])
+            if rec.technology == "unknown" and rec.frequency_band != "unknown" {
+                rec.technology = _band_to_technology(rec.frequency_band)
+            }
+        }
+
+        let tech_col = col_map.get("technology", "")
+        if tech_col != "" and tech_col in raw {
+            let raw_tech = raw[tech_col].strip().upper()
+            if raw_tech == "LTE" or raw_tech == "4G" { rec.technology = "4G" }
+            if raw_tech == "UMTS" or raw_tech == "WCDMA" or raw_tech == "3G" { rec.technology = "3G" }
+            if raw_tech == "GSM" or raw_tech == "2G" { rec.technology = "2G" }
+            if raw_tech == "NR" or raw_tech == "5G" { rec.technology = "5G" }
+        }
+
+        return rec
+    }
+
+    /// Parse a timestamp string to epoch float.
+    fn _parse_timestamp(self, ts_str: string) -> float {
+        let stripped = ts_str.strip()
+        let as_float = self._safe_float(stripped, -1.0)
+        if as_float > 0.0 {
+            if as_float > 1e12 { return as_float / 1000.0 }
+            return as_float
+        }
+        return 0.0
+    }
+
+    /// Normalize event type strings to enum values.
+    fn _normalize_event_type(self, raw: string) -> string {
+        let upper = raw.strip().upper().replace(" ", "_").replace("-", "_")
+        let valid = ["MO_SMS", "MT_SMS", "SRI_SM", "DELIVERY_REPORT",
+                     "LOCATION_UPDATE", "PAGING", "HANDOVER", "AUTH_REQUEST",
+                     "MAP_ERROR", "SCCP_ERROR", "SIGTRAN_ERROR"]
+        if upper in valid { return upper }
+        if upper.startswith("MO") { return "MO_SMS" }
+        if upper.startswith("MT") { return "MT_SMS" }
+        if upper.startswith("SRI") { return "SRI_SM" }
+        if upper.startswith("DELIV") { return "DELIVERY_REPORT" }
+        if upper.startswith("LOC") { return "LOCATION_UPDATE" }
+        if upper.startswith("PAG") { return "PAGING" }
+        if upper.startswith("HAND") { return "HANDOVER" }
+        if upper.startswith("AUTH") { return "AUTH_REQUEST" }
+        return "UNKNOWN"
+    }
+
+    /// Normalize result code strings using alias table.
+    fn _normalize_result_code(self, raw: string) -> string {
+        let cleaned = raw.strip().lower().replace(" ", "_").replace("-", "_")
+        let alias = RESULT_CODE_ALIASES.get(cleaned, "")
+        if alias != "" { return alias }
+
+        let upper = raw.strip().upper().replace(" ", "_").replace("-", "_")
+        let valid = ["SUCCESS", "ABSENT_SUBSCRIBER", "SYSTEM_FAILURE",
+                     "UNIDENTIFIED_SUBSCRIBER", "SM_DELIVERY_FAILURE",
+                     "CALL_BARRED", "FACILITY_NOT_SUPPORTED", "CONGESTION",
+                     "NETWORK_OUT_OF_ORDER", "TEMPORARY_FAILURE",
+                     "PROTOCOL_ERROR", "EQUIPMENT_FAILURE"]
+        if upper in valid { return upper }
+        return "UNKNOWN_ERROR"
+    }
+
+    /// Safe float parse with fallback.
+    fn _safe_float(self, s: string, fallback: float) -> float {
+        let stripped = s.strip()
+        if len(stripped) == 0 { return fallback }
+        try {
+            return float(stripped)
+        } catch(e) {
+            return fallback
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 5 — STATISTICAL PROFILER
+// ═══════════════════════════════════════════════════════════════════
+
+/// Builds per-tower profiles and detects statistical anomalies.
+class StatisticalProfiler {
+    fn init(self) {
+        self._network_mean_failure_rate = 0.0
+        self._network_std_failure_rate = 0.0
+        self._network_median_failure_rate = 0.0
+        self._network_mad = 0.0
+    }
+
+    /// Build per-tower aggregate profiles from raw records.
+    fn profile(self, records: List[SignalingRecord]) -> List[TowerProfile] {
+        let tower_data: Dict[string, List[SignalingRecord]] = {}
+        for rec in records {
+            let cid = rec.cell_id
+            if cid not in tower_data {
+                tower_data[cid] = []
+            }
+            tower_data[cid].append(rec)
+        }
+
+        let profiles: List[TowerProfile] = []
+        for cell_id in tower_data.keys() {
+            let recs = tower_data[cell_id]
+            let prof = self._build_profile(cell_id, recs)
+            append(profiles, prof)
+        }
+
+        self._compute_network_stats(profiles)
+        return profiles
+    }
+
+    /// Build a single tower profile from its records.
+    fn _build_profile(self, cell_id: string, recs: List[SignalingRecord]) -> TowerProfile {
+        let total = len(recs)
+        let success = 0
+        let failure = 0
+        let error_dist: Dict[string, int] = {}
+        let subscribers: Dict[string, bool] = {}
+        let total_duration = 0.0
+        let total_retries = 0
+        let first_ts = 9999999999.0
+        let last_ts = 0.0
+        let lac = "unknown"
+        let rnc = "unknown"
+
+        let band_dist: Dict[string, int] = {}
+        let band_fail_counts: Dict[string, int] = {}
+        let band_total_counts: Dict[string, int] = {}
+        let tech_dist: Dict[string, int] = {}
+
+        for rec in recs {
+            if rec.result_code == "SUCCESS" {
+                success += 1
+            } else {
+                failure += 1
+                let rc = rec.result_code
+                if rc in error_dist {
+                    error_dist[rc] = error_dist[rc] + 1
+                } else {
+                    error_dist[rc] = 1
+                }
+            }
+
+            if rec.imsi_hash != "unknown" {
+                subscribers[rec.imsi_hash] = true
+            }
+
+            total_duration += rec.duration_ms
+            total_retries += rec.retry_count
+
+            if rec.timestamp < first_ts and rec.timestamp > 0.0 {
+                first_ts = rec.timestamp
+            }
+            if rec.timestamp > last_ts {
+                last_ts = rec.timestamp
+            }
+
+            if rec.lac != "unknown" { lac = rec.lac }
+            if rec.rnc_bsc != "unknown" { rnc = rec.rnc_bsc }
+
+            // Band tracking
+            let b = rec.frequency_band
+            if b != "unknown" {
+                if b in band_dist { band_dist[b] = band_dist[b] + 1 }
+                else { band_dist[b] = 1 }
+                if b in band_total_counts { band_total_counts[b] = band_total_counts[b] + 1 }
+                else { band_total_counts[b] = 1 }
+                if rec.result_code != "SUCCESS" {
+                    if b in band_fail_counts { band_fail_counts[b] = band_fail_counts[b] + 1 }
+                    else { band_fail_counts[b] = 1 }
+                }
+            }
+
+            // Technology tracking
+            let tech = rec.technology
+            if tech != "unknown" {
+                if tech in tech_dist { tech_dist[tech] = tech_dist[tech] + 1 }
+                else { tech_dist[tech] = 1 }
+            }
+        }
+
+        let fail_rate = _safe_div(float(failure), float(total))
+        let avg_dur = _safe_div(total_duration, float(total))
+        let avg_retry = _safe_div(float(total_retries), float(total))
+        let unique_subs = len(subscribers)
+
+        // Per-band failure rates
+        let band_fail_rates: Dict[string, float] = {}
+        for bk in band_total_counts {
+            let bf = 0
+            if bk in band_fail_counts { bf = band_fail_counts[bk] }
+            band_fail_rates[bk] = _safe_div(float(bf), float(band_total_counts[bk]))
+        }
+
+        // Primary band and technology (most events)
+        let primary_band = "unknown"
+        let primary_band_count = 0
+        for bk in band_dist {
+            if band_dist[bk] > primary_band_count {
+                primary_band = bk
+                primary_band_count = band_dist[bk]
+            }
+        }
+        let primary_tech = "unknown"
+        let primary_tech_count = 0
+        for tk in tech_dist {
+            if tech_dist[tk] > primary_tech_count {
+                primary_tech = tk
+                primary_tech_count = tech_dist[tk]
+            }
+        }
+
+        return TowerProfile {
+            cell_id: cell_id,
+            lac: lac,
+            rnc_bsc: rnc,
+            total_events: total,
+            success_count: success,
+            failure_count: failure,
+            failure_rate: fail_rate,
+            error_distribution: error_dist,
+            unique_subscribers: unique_subs,
+            avg_duration_ms: avg_dur,
+            avg_retry_count: avg_retry,
+            first_event: first_ts,
+            last_event: last_ts,
+            anomaly_scores: {},
+            evidence_items: [],
+            band_distribution: band_dist,
+            band_failure_rates: band_fail_rates,
+            technology_distribution: tech_dist,
+            primary_band: primary_band,
+            primary_technology: primary_tech
+        }
+    }
+
+    /// Compute network-wide statistics for baseline comparison.
+    fn _compute_network_stats(self, profiles: List[TowerProfile]) {
+        let rates: List[float] = []
+        for p in profiles {
+            if p.total_events >= MIN_EVENTS_FOR_ANALYSIS {
+                append(rates, p.failure_rate)
+            }
+        }
+        if len(rates) == 0 { return }
+
+        let sum = 0.0
+        for r in rates { sum += r }
+        self._network_mean_failure_rate = sum / float(len(rates))
+
+        let variance = 0.0
+        for r in rates {
+            let diff = r - self._network_mean_failure_rate
+            variance += diff * diff
+        }
+        variance = variance / float(len(rates))
+        self._network_std_failure_rate = _sqrt(variance)
+
+        let sorted_rates = List.copy(rates)
+        sorted_rates.sort()
+        let n = len(sorted_rates)
+        if n % 2 == 0 {
+            self._network_median_failure_rate = (sorted_rates[int(n / 2) - 1] + sorted_rates[int(n / 2)]) / 2.0
+        } else {
+            self._network_median_failure_rate = sorted_rates[int(n / 2)]
+        }
+
+        let deviations: List[float] = []
+        for r in rates {
+            append(deviations, abs(r - self._network_median_failure_rate))
+        }
+        deviations.sort()
+        let nd = len(deviations)
+        if nd % 2 == 0 {
+            self._network_mad = (deviations[int(nd / 2) - 1] + deviations[int(nd / 2)]) / 2.0
+        } else {
+            self._network_mad = deviations[int(nd / 2)]
+        }
+    }
+
+    /// Detect anomalies across all tower profiles.
+    fn detect_anomalies(self, profiles: List[TowerProfile]) -> List[EvidenceItem] {
+        let all_evidence: List[EvidenceItem] = []
+
+        for prof in profiles {
+            if prof.total_events < MIN_EVENTS_FOR_ANALYSIS { continue }
+
+            let z_ev = self._zscore_anomaly(prof)
+            if z_ev != None { append(all_evidence, z_ev) }
+
+            let mz_ev = self._modified_zscore_anomaly(prof)
+            if mz_ev != None { append(all_evidence, mz_ev) }
+
+            let wilson_ev = self._wilson_score_anomaly(prof)
+            if wilson_ev != None { append(all_evidence, wilson_ev) }
+
+            let entropy_ev = self._entropy_anomaly(prof)
+            if entropy_ev != None { append(all_evidence, entropy_ev) }
+
+            let vol_ev = self._volume_anomaly(prof, profiles)
+            if vol_ev != None { append(all_evidence, vol_ev) }
+
+            let peer_evs = self._peer_comparison(prof, profiles)
+            for pe in peer_evs {
+                append(all_evidence, pe)
+            }
+        }
+
+        return _sort_evidence_desc(all_evidence)
+    }
+
+    /// Standard z-score on failure rate vs network mean.
+    fn _zscore_anomaly(self, prof: TowerProfile) -> Optional[EvidenceItem] {
+        if self._network_std_failure_rate < 0.001 { return None }
+
+        let z = (prof.failure_rate - self._network_mean_failure_rate) / self._network_std_failure_rate
+        if z < Z_SCORE_THRESHOLD { return None }
+
+        let score = _clamp(z / 5.0, 0.0, 1.0)
+        let conf = _clamp(float(prof.total_events) / 50.0, 0.3, 0.95)
+
+        return EvidenceItem {
+            dimension: "STATISTICAL",
+            metric: "zscore_failure_rate",
+            anomaly_score: score,
+            confidence: conf,
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + " failure rate " + format_float(prof.failure_rate, 3) + " is " + format_float(z, 2) + " std devs above network mean " + format_float(self._network_mean_failure_rate, 3),
+            tower_id: prof.cell_id,
+            comparison_value: "z=" + format_float(z, 2) + " threshold=" + format_float(Z_SCORE_THRESHOLD, 1)
+        }
+    }
+
+    /// Modified z-score using MAD for robustness against outliers.
+    fn _modified_zscore_anomaly(self, prof: TowerProfile) -> Optional[EvidenceItem] {
+        if self._network_mad < 0.001 { return None }
+
+        let modified_z = 0.6745 * (prof.failure_rate - self._network_median_failure_rate) / self._network_mad
+        if modified_z < 3.5 { return None }
+
+        let score = _clamp(modified_z / 7.0, 0.0, 1.0)
+        let conf = _clamp(float(prof.total_events) / 50.0, 0.3, 0.95)
+
+        return EvidenceItem {
+            dimension: "STATISTICAL",
+            metric: "modified_zscore_failure_rate",
+            anomaly_score: score,
+            confidence: conf,
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + " modified z-score " + format_float(modified_z, 2) + " (MAD-based, robust to outliers) exceeds threshold 3.5",
+            tower_id: prof.cell_id,
+            comparison_value: "mz=" + format_float(modified_z, 2)
+        }
+    }
+
+    /// Wilson score confidence interval on success rate.
+    /// If the lower bound of the CI is below network average, flag it.
+    fn _wilson_score_anomaly(self, prof: TowerProfile) -> Optional[EvidenceItem] {
+        let n = float(prof.total_events)
+        if n < 10.0 { return None }
+
+        let p_hat = 1.0 - prof.failure_rate
+        let z = 1.96
+
+        let denominator = 1.0 + (z * z) / n
+        let center = p_hat + (z * z) / (2.0 * n)
+        let spread = z * _sqrt((p_hat * (1.0 - p_hat) + (z * z) / (4.0 * n)) / n)
+
+        let lower = (center - spread) / denominator
+        let upper = (center + spread) / denominator
+
+        let network_success = 1.0 - self._network_mean_failure_rate
+        if lower >= network_success { return None }
+
+        let gap = network_success - lower
+        let score = _clamp(gap * 3.0, 0.0, 1.0)
+        let conf = _clamp(n / 100.0, 0.4, 0.95)
+
+        return EvidenceItem {
+            dimension: "STATISTICAL",
+            metric: "wilson_score_ci",
+            anomaly_score: score,
+            confidence: conf,
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + " Wilson 95% CI lower bound " + format_float(lower, 3) + " is below network success rate " + format_float(network_success, 3),
+            tower_id: prof.cell_id,
+            comparison_value: "CI=[" + format_float(lower, 3) + "," + format_float(upper, 3) + "]"
+        }
+    }
+
+    /// Error code entropy — low entropy means one dominant error type (likely fault).
+    fn _entropy_anomaly(self, prof: TowerProfile) -> Optional[EvidenceItem] {
+        if prof.failure_count < 3 { return None }
+
+        let total_errors = float(prof.failure_count)
+        let entropy = 0.0
+        let dominant_error = ""
+        let dominant_count = 0
+
+        for code, count in prof.error_distribution.items() {
+            let p = float(count) / total_errors
+            if p > 0.0 {
+                entropy -= p * _log2(p)
+            }
+            if count > dominant_count {
+                dominant_count = count
+                dominant_error = code
+            }
+        }
+
+        let num_codes = len(prof.error_distribution)
+        if num_codes <= 1 {
+            let score = _clamp(float(prof.failure_count) / 20.0, 0.3, 0.95)
+            return EvidenceItem {
+                dimension: "STATISTICAL",
+                metric: "error_entropy",
+                anomaly_score: score,
+                confidence: 0.8,
+                row_indices: [],
+                reasoning: "Tower " + prof.cell_id + " has single error type '" + dominant_error + "' (" + str(dominant_count) + " occurrences) — zero entropy indicates systematic fault",
+                tower_id: prof.cell_id,
+                comparison_value: "entropy=0.0 dominant=" + dominant_error
+            }
+        }
+
+        let max_entropy = _log2(float(num_codes))
+        if max_entropy <= 0.0 { return None }
+        let normalized_entropy = entropy / max_entropy
+
+        if normalized_entropy > 0.5 { return None }
+
+        let score = _clamp((1.0 - normalized_entropy) * 0.8, 0.0, 1.0)
+        let conf = _clamp(float(prof.failure_count) / 30.0, 0.3, 0.9)
+
+        return EvidenceItem {
+            dimension: "STATISTICAL",
+            metric: "error_entropy",
+            anomaly_score: score,
+            confidence: conf,
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + " has low error entropy " + format_float(normalized_entropy, 3) + " — dominant error '" + dominant_error + "' accounts for " + str(dominant_count) + "/" + str(int(total_errors)) + " failures",
+            tower_id: prof.cell_id,
+            comparison_value: "entropy=" + format_float(normalized_entropy, 3) + " dominant=" + dominant_error
+        }
+    }
+
+    /// Volume anomaly — too few or too many events relative to peers.
+    fn _volume_anomaly(self, prof: TowerProfile, all_profiles: List[TowerProfile]) -> Optional[EvidenceItem] {
+        let volumes: List[float] = []
+        for p in all_profiles {
+            append(volumes, float(p.total_events))
+        }
+        if len(volumes) < 3 { return None }
+
+        let sum = 0.0
+        for v in volumes { sum += v }
+        let mean_vol = sum / float(len(volumes))
+
+        let var_sum = 0.0
+        for v in volumes {
+            let d = v - mean_vol
+            var_sum += d * d
+        }
+        let std_vol = _sqrt(var_sum / float(len(volumes)))
+        if std_vol < 1.0 { return None }
+
+        let z = (float(prof.total_events) - mean_vol) / std_vol
+        if abs(z) < 2.0 { return None }
+
+        let direction = "high"
+        if z < 0.0 { direction = "low" }
+
+        let score = _clamp(abs(z) / 5.0, 0.0, 0.7)
+
+        return EvidenceItem {
+            dimension: "STATISTICAL",
+            metric: "volume_anomaly",
+            anomaly_score: score,
+            confidence: 0.5,
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + " event volume " + str(prof.total_events) + " is anomalously " + direction + " (z=" + format_float(z, 2) + ", mean=" + format_float(mean_vol, 1) + ")",
+            tower_id: prof.cell_id,
+            comparison_value: "volume_z=" + format_float(z, 2) + " direction=" + direction
+        }
+    }
+
+    /// Peer comparison within same LAC.
+    fn _peer_comparison(self, prof: TowerProfile, all_profiles: List[TowerProfile]) -> List[EvidenceItem] {
+        let evidence: List[EvidenceItem] = []
+        let lac_peers: List[TowerProfile] = []
+
+        for p in all_profiles {
+            if p.lac == prof.lac and p.cell_id != prof.cell_id and p.total_events >= MIN_EVENTS_FOR_ANALYSIS {
+                append(lac_peers, p)
+            }
+        }
+        if len(lac_peers) < 2 { return evidence }
+
+        let peer_sum = 0.0
+        for p in lac_peers { peer_sum += p.failure_rate }
+        let peer_mean = peer_sum / float(len(lac_peers))
+
+        let peer_var = 0.0
+        for p in lac_peers {
+            let d = p.failure_rate - peer_mean
+            peer_var += d * d
+        }
+        let peer_std = _sqrt(peer_var / float(len(lac_peers)))
+        if peer_std < 0.001 { peer_std = 0.01 }
+
+        let z = (prof.failure_rate - peer_mean) / peer_std
+        if z > 2.0 {
+            let score = _clamp(z / 5.0, 0.0, 1.0)
+            append(evidence, EvidenceItem {
+                dimension: "STATISTICAL",
+                metric: "lac_peer_comparison",
+                anomaly_score: score,
+                confidence: _clamp(float(len(lac_peers)) / 5.0, 0.4, 0.9),
+                row_indices: [],
+                reasoning: "Tower " + prof.cell_id + " failure rate " + format_float(prof.failure_rate, 3) + " is " + format_float(z, 2) + " std devs above LAC " + prof.lac + " peer mean " + format_float(peer_mean, 3) + " (" + str(len(lac_peers)) + " peers)",
+                tower_id: prof.cell_id,
+                comparison_value: "peer_z=" + format_float(z, 2) + " lac=" + prof.lac
+            })
+        }
+
+        return evidence
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 6 — TEMPORAL ANALYZER
+// ═══════════════════════════════════════════════════════════════════
+
+/// Detects change points, trends, bursts, and periodicity in failure time series.
+class TemporalAnalyzer {
+    fn init(self) {
+        self._cusum_threshold = CUSUM_THRESHOLD
+        self._burst_window = BURST_WINDOW_SEC
+        self._burst_min = BURST_MIN_FAILURES
+    }
+
+    /// Run all temporal analyses on records grouped by tower.
+    fn analyze(self, records: List[SignalingRecord], profiles: List[TowerProfile]) -> List[EvidenceItem] {
+        let all_evidence: List[EvidenceItem] = []
+
+        let tower_records: Dict[string, List[SignalingRecord]] = {}
+        for rec in records {
+            if rec.cell_id not in tower_records {
+                tower_records[rec.cell_id] = []
+            }
+            tower_records[rec.cell_id].append(rec)
+        }
+
+        for prof in profiles {
+            if prof.total_events < MIN_EVENTS_FOR_ANALYSIS { continue }
+            let recs = tower_records.get(prof.cell_id, [])
+            if len(recs) == 0 { continue }
+
+            recs.sort_by(fn(r) { return r.timestamp })
+
+            let cusum_ev = self._cusum_change_point(prof, recs)
+            if cusum_ev != None { append(all_evidence, cusum_ev) }
+
+            let trend_ev = self._trend_detection(prof, recs)
+            if trend_ev != None { append(all_evidence, trend_ev) }
+
+            let burst_evs = self._burst_detection(prof, recs)
+            for be in burst_evs {
+                append(all_evidence, be)
+            }
+
+            let period_ev = self._periodicity_detection(prof, recs)
+            if period_ev != None { append(all_evidence, period_ev) }
+
+            let ttf_ev = self._time_to_failure_analysis(prof, recs)
+            if ttf_ev != None { append(all_evidence, ttf_ev) }
+        }
+
+        return _sort_evidence_desc(all_evidence)
+    }
+
+    /// CUSUM change-point detection on per-tower failure rate time series.
+    /// Divides timeline into windows and tracks cumulative sum of deviations.
+    fn _cusum_change_point(self, prof: TowerProfile, recs: List[SignalingRecord]) -> Optional[EvidenceItem] {
+        if len(recs) < 20 { return None }
+
+        let window_size = max(int(len(recs) / 10), 5)
+        let windows: List[float] = []
+        let window_indices: List[int] = []
+        let window_timestamps: List[float] = []
+
+        let i = 0
+        while i < len(recs) {
+            let end = min(i + window_size, len(recs))
+            let fail_count = 0
+            let win_total = 0
+            let j = i
+            while j < end {
+                win_total += 1
+                if recs[j].result_code != "SUCCESS" {
+                    fail_count += 1
+                }
+                j += 1
+            }
+            append(windows, _safe_div(float(fail_count), float(win_total)))
+            append(window_indices, i)
+            append(window_timestamps, recs[i].timestamp)
+            i = end
+        }
+
+        if len(windows) < 3 { return None }
+
+        let mean_rate = 0.0
+        for w in windows { mean_rate += w }
+        mean_rate = mean_rate / float(len(windows))
+
+        let cusum_pos = 0.0
+        let cusum_neg = 0.0
+        let max_cusum = 0.0
+        let change_idx = 0
+
+        let k = 0
+        while k < len(windows) {
+            let deviation = windows[k] - mean_rate
+            cusum_pos = max(0.0, cusum_pos + deviation)
+            cusum_neg = min(0.0, cusum_neg + deviation)
+
+            if cusum_pos > max_cusum {
+                max_cusum = cusum_pos
+                change_idx = k
+            }
+            k += 1
+        }
+
+        if max_cusum < self._cusum_threshold * _sqrt(float(len(windows))) * 0.1 { return None }
+
+        let before_mean = 0.0
+        let before_count = 0
+        let bi = 0
+        while bi < change_idx {
+            before_mean += windows[bi]
+            before_count += 1
+            bi += 1
+        }
+        if before_count > 0 { before_mean = before_mean / float(before_count) }
+
+        let after_mean = 0.0
+        let after_count = 0
+        let ai = change_idx
+        while ai < len(windows) {
+            after_mean += windows[ai]
+            after_count += 1
+            ai += 1
+        }
+        if after_count > 0 { after_mean = after_mean / float(after_count) }
+
+        let shift = after_mean - before_mean
+        if shift < 0.05 { return None }
+
+        let score = _clamp(shift * 2.0, 0.0, 1.0)
+        let row_idx = window_indices[change_idx]
+        let fail_rows: List[int] = []
+        let fi = row_idx
+        while fi < min(row_idx + window_size, len(recs)) {
+            if recs[fi].result_code != "SUCCESS" {
+                append(fail_rows, recs[fi].row_index)
+            }
+            fi += 1
+        }
+
+        return EvidenceItem {
+            dimension: "TEMPORAL",
+            metric: "cusum_change_point",
+            anomaly_score: score,
+            confidence: _clamp(float(len(recs)) / 100.0, 0.4, 0.9),
+            row_indices: fail_rows,
+            reasoning: "Tower " + prof.cell_id + " CUSUM detected change point at window " + str(change_idx) + " — failure rate shifted from " + format_float(before_mean, 3) + " to " + format_float(after_mean, 3) + " (delta=" + format_float(shift, 3) + ")",
+            tower_id: prof.cell_id,
+            comparison_value: "before=" + format_float(before_mean, 3) + " after=" + format_float(after_mean, 3)
+        }
+    }
+
+    /// Detect increasing failure rate trend (linear regression on windowed rates).
+    fn _trend_detection(self, prof: TowerProfile, recs: List[SignalingRecord]) -> Optional[EvidenceItem] {
+        if len(recs) < 20 { return None }
+
+        let window_size = max(int(len(recs) / 8), 5)
+        let rates: List[float] = []
+
+        let i = 0
+        while i < len(recs) {
+            let end = min(i + window_size, len(recs))
+            let fail_count = 0
+            let total = 0
+            let j = i
+            while j < end {
+                total += 1
+                if recs[j].result_code != "SUCCESS" { fail_count += 1 }
+                j += 1
+            }
+            append(rates, _safe_div(float(fail_count), float(total)))
+            i = end
+        }
+
+        if len(rates) < 3 { return None }
+
+        let n = float(len(rates))
+        let sum_x = 0.0
+        let sum_y = 0.0
+        let sum_xy = 0.0
+        let sum_xx = 0.0
+        let idx = 0
+        while idx < len(rates) {
+            let x = float(idx)
+            let y = rates[idx]
+            sum_x += x
+            sum_y += y
+            sum_xy += x * y
+            sum_xx += x * x
+            idx += 1
+        }
+
+        let denom = n * sum_xx - sum_x * sum_x
+        if abs(denom) < 1e-10 { return None }
+        let slope = (n * sum_xy - sum_x * sum_y) / denom
+
+        if slope < 0.01 { return None }
+
+        let score = _clamp(slope * 5.0, 0.0, 1.0)
+
+        return EvidenceItem {
+            dimension: "TEMPORAL",
+            metric: "trend_increasing",
+            anomaly_score: score,
+            confidence: _clamp(n / 10.0, 0.3, 0.85),
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + " shows increasing failure trend with slope " + format_float(slope, 4) + " per window — degrading performance",
+            tower_id: prof.cell_id,
+            comparison_value: "slope=" + format_float(slope, 4)
+        }
+    }
+
+    /// Detect bursts of clustered failures within short time windows.
+    fn _burst_detection(self, prof: TowerProfile, recs: List[SignalingRecord]) -> List[EvidenceItem] {
+        let evidence: List[EvidenceItem] = []
+        let failures: List[SignalingRecord] = []
+        for r in recs {
+            if r.result_code != "SUCCESS" {
+                append(failures, r)
+            }
+        }
+        if len(failures) < self._burst_min { return evidence }
+
+        let burst_start = 0
+        let i = 0
+        while i < len(failures) {
+            while burst_start < i and (failures[i].timestamp - failures[burst_start].timestamp) > self._burst_window {
+                burst_start += 1
+            }
+            let burst_size = i - burst_start + 1
+
+            if burst_size >= self._burst_min {
+                let row_ids: List[int] = []
+                let bi = burst_start
+                while bi <= i {
+                    append(row_ids, failures[bi].row_index)
+                    bi += 1
+                }
+
+                let score = _clamp(float(burst_size) / 20.0, 0.3, 1.0)
+                append(evidence, EvidenceItem {
+                    dimension: "TEMPORAL",
+                    metric: "failure_burst",
+                    anomaly_score: score,
+                    confidence: 0.7,
+                    row_indices: row_ids,
+                    reasoning: "Tower " + prof.cell_id + " burst of " + str(burst_size) + " failures within " + format_float(self._burst_window, 0) + "s window",
+                    tower_id: prof.cell_id,
+                    comparison_value: "burst_size=" + str(burst_size)
+                })
+                i = i + burst_size
+                burst_start = i
+                continue
+            }
+            i += 1
+        }
+        return evidence
+    }
+
+    /// Detect periodic failure patterns (regular intervals suggest interference or capacity).
+    fn _periodicity_detection(self, prof: TowerProfile, recs: List[SignalingRecord]) -> Optional[EvidenceItem] {
+        let failures: List[float] = []
+        for r in recs {
+            if r.result_code != "SUCCESS" and r.timestamp > 0.0 {
+                append(failures, r.timestamp)
+            }
+        }
+        if len(failures) < 10 { return None }
+
+        let intervals: List[float] = []
+        let i = 1
+        while i < len(failures) {
+            let gap = failures[i] - failures[i - 1]
+            if gap > 0.0 {
+                append(intervals, gap)
+            }
+            i += 1
+        }
+        if len(intervals) < 5 { return None }
+
+        let sum = 0.0
+        for iv in intervals { sum += iv }
+        let mean_interval = sum / float(len(intervals))
+        if mean_interval < 1.0 { return None }
+
+        let var_sum = 0.0
+        for iv in intervals {
+            let d = iv - mean_interval
+            var_sum += d * d
+        }
+        let std_interval = _sqrt(var_sum / float(len(intervals)))
+
+        let cv = _safe_div(std_interval, mean_interval)
+
+        if cv > 0.5 { return None }
+
+        let regularity = 1.0 - cv
+        let score = _clamp(regularity * 0.7, 0.0, 0.8)
+
+        return EvidenceItem {
+            dimension: "TEMPORAL",
+            metric: "periodicity",
+            anomaly_score: score,
+            confidence: _clamp(float(len(intervals)) / 20.0, 0.3, 0.8),
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + " failures show periodic pattern with mean interval " + format_float(mean_interval, 1) + "s (CV=" + format_float(cv, 3) + ") — suggests interference or capacity cycle",
+            tower_id: prof.cell_id,
+            comparison_value: "interval=" + format_float(mean_interval, 1) + "s cv=" + format_float(cv, 3)
+        }
+    }
+
+    /// Analyze time-to-failure distribution — short TTF suggests cascading failures.
+    fn _time_to_failure_analysis(self, prof: TowerProfile, recs: List[SignalingRecord]) -> Optional[EvidenceItem] {
+        let ttf_values: List[float] = []
+        let last_failure_ts = -1.0
+
+        for r in recs {
+            if r.result_code != "SUCCESS" {
+                if last_failure_ts > 0.0 and r.timestamp > last_failure_ts {
+                    append(ttf_values, r.timestamp - last_failure_ts)
+                }
+                last_failure_ts = r.timestamp
+            }
+        }
+        if len(ttf_values) < 5 { return None }
+
+        let sum = 0.0
+        for t in ttf_values { sum += t }
+        let mean_ttf = sum / float(len(ttf_values))
+
+        let short_count = 0
+        for t in ttf_values {
+            if t < mean_ttf * 0.25 {
+                short_count += 1
+            }
+        }
+
+        let short_ratio = float(short_count) / float(len(ttf_values))
+        if short_ratio < 0.3 { return None }
+
+        let score = _clamp(short_ratio, 0.0, 0.8)
+
+        return EvidenceItem {
+            dimension: "TEMPORAL",
+            metric: "time_to_failure",
+            anomaly_score: score,
+            confidence: 0.6,
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + " has " + format_float(short_ratio * 100.0, 1) + "% of inter-failure intervals below 25% of mean (" + format_float(mean_ttf, 1) + "s) — suggests cascading or correlated failures",
+            tower_id: prof.cell_id,
+            comparison_value: "short_ratio=" + format_float(short_ratio, 3) + " mean_ttf=" + format_float(mean_ttf, 1) + "s"
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 7 — SPATIAL CORRELATOR
+// ═══════════════════════════════════════════════════════════════════
+
+/// Isolates whether faults are tower-specific or LAC/region-wide,
+/// tracks subscriber mobility, and compares adjacent towers.
+class SpatialCorrelator {
+    fn init(self) {
+        self._lac_profiles: Dict[string, Dict[string, float]] = {}
+    }
+
+    /// Run all spatial analyses.
+    fn analyze(self, records: List[SignalingRecord], profiles: List[TowerProfile]) -> List[EvidenceItem] {
+        let all_evidence: List[EvidenceItem] = []
+
+        self._build_lac_profiles(profiles)
+
+        for prof in profiles {
+            if prof.total_events < MIN_EVENTS_FOR_ANALYSIS { continue }
+
+            let lac_ev = self._lac_vs_tower_isolation(prof, profiles)
+            if lac_ev != None { append(all_evidence, lac_ev) }
+
+            let mob_ev = self._subscriber_mobility(prof, records)
+            if mob_ev != None { append(all_evidence, mob_ev) }
+
+            let adj_ev = self._adjacent_tower_comparison(prof, profiles)
+            if adj_ev != None { append(all_evidence, adj_ev) }
+
+            let ho_ev = self._handover_failure_concentration(prof, records)
+            if ho_ev != None { append(all_evidence, ho_ev) }
+        }
+
+        return _sort_evidence_desc(all_evidence)
+    }
+
+    /// Build LAC-level aggregate statistics.
+    fn _build_lac_profiles(self, profiles: List[TowerProfile]) {
+        let lac_data: Dict[string, List[TowerProfile]] = {}
+        for p in profiles {
+            if p.lac not in lac_data {
+                lac_data[p.lac] = []
+            }
+            lac_data[p.lac].append(p)
+        }
+
+        for lac, profs in lac_data.items() {
+            let total_events = 0
+            let total_failures = 0
+            for p in profs {
+                total_events += p.total_events
+                total_failures += p.failure_count
+            }
+            self._lac_profiles[lac] = {
+                "total_events": float(total_events),
+                "total_failures": float(total_failures),
+                "failure_rate": _safe_div(float(total_failures), float(total_events)),
+                "tower_count": float(len(profs))
+            }
+        }
+    }
+
+    /// Determine if the fault is tower-specific or LAC-wide.
+    fn _lac_vs_tower_isolation(self, prof: TowerProfile, all_profiles: List[TowerProfile]) -> Optional[EvidenceItem] {
+        let lac_stats = self._lac_profiles.get(prof.lac, None)
+        if lac_stats == None { return None }
+
+        let lac_rate = lac_stats["failure_rate"]
+        let tower_count = lac_stats["tower_count"]
+        if tower_count < 2.0 { return None }
+
+        let rate_ratio = _safe_div(prof.failure_rate, lac_rate)
+
+        if rate_ratio < 1.5 {
+            return None
+        }
+
+        if rate_ratio > 3.0 {
+            let score = _clamp((rate_ratio - 1.0) / 5.0, 0.3, 1.0)
+            return EvidenceItem {
+                dimension: "SPATIAL",
+                metric: "tower_isolated_fault",
+                anomaly_score: score,
+                confidence: _clamp(tower_count / 5.0, 0.4, 0.9),
+                row_indices: [],
+                reasoning: "Tower " + prof.cell_id + " failure rate " + format_float(prof.failure_rate, 3) + " is " + format_float(rate_ratio, 1) + "x the LAC " + prof.lac + " average " + format_float(lac_rate, 3) + " — fault is tower-specific, not LAC-wide",
+                tower_id: prof.cell_id,
+                comparison_value: "tower_rate=" + format_float(prof.failure_rate, 3) + " lac_rate=" + format_float(lac_rate, 3) + " ratio=" + format_float(rate_ratio, 1)
+            }
+        }
+
+        return None
+    }
+
+    /// Analyze subscriber mobility: do failures follow subscribers or stay at one tower?
+    fn _subscriber_mobility(self, prof: TowerProfile, records: List[SignalingRecord]) -> Optional[EvidenceItem] {
+        let tower_failures: Dict[string, int] = {}
+        let sub_other_towers: Dict[string, int] = {}
+
+        for rec in records {
+            if rec.cell_id == prof.cell_id and rec.result_code != "SUCCESS" {
+                let sub = rec.imsi_hash
+                if sub != "unknown" {
+                    if sub in tower_failures {
+                        tower_failures[sub] = tower_failures[sub] + 1
+                    } else {
+                        tower_failures[sub] = 1
+                    }
+                }
+            }
+        }
+
+        if len(tower_failures) < 3 { return None }
+
+        for rec in records {
+            if rec.cell_id != prof.cell_id {
+                let sub = rec.imsi_hash
+                if sub in tower_failures {
+                    if rec.result_code != "SUCCESS" {
+                        if sub in sub_other_towers {
+                            sub_other_towers[sub] = sub_other_towers[sub] + 1
+                        } else {
+                            sub_other_towers[sub] = 1
+                        }
+                    }
+                }
+            }
+        }
+
+        let subs_failing_elsewhere = len(sub_other_towers)
+        let total_failing_subs = len(tower_failures)
+        let mobility_ratio = _safe_div(float(subs_failing_elsewhere), float(total_failing_subs))
+
+        if mobility_ratio > 0.5 {
+            return None
+        }
+
+        let score = _clamp((1.0 - mobility_ratio) * 0.6, 0.0, 0.8)
+
+        return EvidenceItem {
+            dimension: "SPATIAL",
+            metric: "subscriber_mobility",
+            anomaly_score: score,
+            confidence: _clamp(float(total_failing_subs) / 10.0, 0.3, 0.85),
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + ": only " + format_float(mobility_ratio * 100.0, 1) + "% of failing subscribers also fail at other towers — failures are tower-bound, not subscriber-bound",
+            tower_id: prof.cell_id,
+            comparison_value: "mobility=" + format_float(mobility_ratio, 3) + " failing_subs=" + str(total_failing_subs)
+        }
+    }
+
+    /// Compare tower to adjacent towers in the same LAC.
+    fn _adjacent_tower_comparison(self, prof: TowerProfile, all_profiles: List[TowerProfile]) -> Optional[EvidenceItem] {
+        let peers: List[TowerProfile] = []
+        for p in all_profiles {
+            if p.lac == prof.lac and p.cell_id != prof.cell_id and p.total_events >= MIN_EVENTS_FOR_ANALYSIS {
+                append(peers, p)
+            }
+        }
+        if len(peers) < 2 { return None }
+
+        let peer_rates: List[float] = []
+        for p in peers { append(peer_rates, p.failure_rate) }
+        peer_rates.sort()
+
+        let median_peer = peer_rates[int(len(peer_rates) / 2)]
+        let ratio = _safe_div(prof.failure_rate, max(median_peer, 0.001))
+
+        if ratio < 2.0 { return None }
+
+        let score = _clamp((ratio - 1.0) / 5.0, 0.0, 0.9)
+
+        return EvidenceItem {
+            dimension: "SPATIAL",
+            metric: "adjacent_tower_comparison",
+            anomaly_score: score,
+            confidence: _clamp(float(len(peers)) / 5.0, 0.4, 0.9),
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + " failure rate " + format_float(prof.failure_rate, 3) + " is " + format_float(ratio, 1) + "x the median of " + str(len(peers)) + " adjacent towers in LAC " + prof.lac + " (median=" + format_float(median_peer, 3) + ")",
+            tower_id: prof.cell_id,
+            comparison_value: "ratio=" + format_float(ratio, 1) + " peers=" + str(len(peers))
+        }
+    }
+
+    /// Detect concentration of handover failures at a specific tower.
+    fn _handover_failure_concentration(self, prof: TowerProfile, records: List[SignalingRecord]) -> Optional[EvidenceItem] {
+        let ho_total = 0
+        let ho_fail = 0
+        let fail_rows: List[int] = []
+
+        for rec in records {
+            if rec.cell_id == prof.cell_id and rec.event_type == "HANDOVER" {
+                ho_total += 1
+                if rec.result_code != "SUCCESS" {
+                    ho_fail += 1
+                    append(fail_rows, rec.row_index)
+                }
+            }
+        }
+        if ho_total < 5 { return None }
+
+        let ho_fail_rate = _safe_div(float(ho_fail), float(ho_total))
+        if ho_fail_rate < 0.2 { return None }
+
+        let score = _clamp(ho_fail_rate, 0.0, 0.9)
+
+        return EvidenceItem {
+            dimension: "SPATIAL",
+            metric: "handover_failure_concentration",
+            anomaly_score: score,
+            confidence: _clamp(float(ho_total) / 20.0, 0.3, 0.85),
+            row_indices: fail_rows,
+            reasoning: "Tower " + prof.cell_id + " handover failure rate " + format_float(ho_fail_rate, 3) + " (" + str(ho_fail) + "/" + str(ho_total) + ") — high handover failures indicate radio/coverage issue",
+            tower_id: prof.cell_id,
+            comparison_value: "ho_fail_rate=" + format_float(ho_fail_rate, 3)
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 8 — SIGNALING PATTERN DETECTOR
+// ═══════════════════════════════════════════════════════════════════
+
+/// Classifies MAP errors into fault domains, matches fault signatures,
+/// analyzes retry patterns, and detects error type correlations.
+class SignalingPatternDetector {
+    fn init(self) {
+        self._fault_signatures = {
+            "ABSENT_SUBSCRIBER": {"domain": "RADIO", "label": "paging/radio fault", "severity": "MAJOR"},
+            "SYSTEM_FAILURE": {"domain": "CORE", "label": "equipment/software fault", "severity": "CRITICAL"},
+            "UNIDENTIFIED_SUBSCRIBER": {"domain": "CORE", "label": "HLR/VLR sync issue", "severity": "MAJOR"},
+            "SM_DELIVERY_FAILURE": {"domain": "SMSC", "label": "SMSC routing or last-mile fault", "severity": "MAJOR"},
+            "EQUIPMENT_FAILURE": {"domain": "RADIO", "label": "hardware fault", "severity": "CRITICAL"},
+            "CONGESTION": {"domain": "RADIO", "label": "capacity exhaustion", "severity": "MAJOR"},
+            "NETWORK_OUT_OF_ORDER": {"domain": "TRANSPORT", "label": "transport link fault", "severity": "CRITICAL"},
+            "PROTOCOL_ERROR": {"domain": "TRANSPORT", "label": "signaling protocol fault", "severity": "MAJOR"},
+            "CALL_BARRED": {"domain": "CONFIG", "label": "provisioning/config fault", "severity": "MINOR"},
+            "FACILITY_NOT_SUPPORTED": {"domain": "CONFIG", "label": "feature provisioning fault", "severity": "MINOR"},
+            "TEMPORARY_FAILURE": {"domain": "CORE", "label": "transient core fault", "severity": "WARNING"}
+        }
+    }
+
+    /// Run all signaling pattern analyses.
+    fn analyze(self, records: List[SignalingRecord], profiles: List[TowerProfile]) -> List[EvidenceItem] {
+        let all_evidence: List[EvidenceItem] = []
+
+        for prof in profiles {
+            if prof.total_events < MIN_EVENTS_FOR_ANALYSIS { continue }
+
+            let sig_evs = self._fault_signature_matching(prof, records)
+            for se in sig_evs {
+                append(all_evidence, se)
+            }
+
+            let retry_ev = self._retry_pattern_analysis(prof, records)
+            if retry_ev != None { append(all_evidence, retry_ev) }
+
+            let corr_ev = self._error_correlation(prof)
+            if corr_ev != None { append(all_evidence, corr_ev) }
+
+            let domain_ev = self._domain_classification(prof)
+            if domain_ev != None { append(all_evidence, domain_ev) }
+
+            let band_evs = self._band_failure_analysis(prof, records)
+            for be in band_evs {
+                append(all_evidence, be)
+            }
+        }
+
+        return _sort_evidence_desc(all_evidence)
+    }
+
+    /// Match error patterns against known fault signatures.
+    fn _fault_signature_matching(self, prof: TowerProfile, records: List[SignalingRecord]) -> List[EvidenceItem] {
+        let evidence: List[EvidenceItem] = []
+
+        for error_code, count in prof.error_distribution.items() {
+            let sig = self._fault_signatures.get(error_code, None)
+            if sig == None { continue }
+
+            let error_ratio = _safe_div(float(count), float(prof.failure_count))
+            if error_ratio < 0.2 { continue }
+
+            let fail_rows: List[int] = []
+            for rec in records {
+                if rec.cell_id == prof.cell_id and rec.result_code == error_code {
+                    append(fail_rows, rec.row_index)
+                }
+            }
+
+            let score = _clamp(error_ratio * 0.9, 0.2, 0.95)
+            let severity_boost = 0.0
+            if sig["severity"] == "CRITICAL" { severity_boost = 0.15 }
+            if sig["severity"] == "MAJOR" { severity_boost = 0.08 }
+            score = _clamp(score + severity_boost, 0.0, 1.0)
+
+            append(evidence, EvidenceItem {
+                dimension: "SIGNALING",
+                metric: "fault_signature_" + error_code.lower(),
+                anomaly_score: score,
+                confidence: _clamp(float(count) / 10.0, 0.4, 0.95),
+                row_indices: fail_rows,
+                reasoning: "Tower " + prof.cell_id + " matches fault signature: " + sig["label"] + " — " + error_code + " accounts for " + format_float(error_ratio * 100.0, 1) + "% of failures (" + str(count) + " events), domain=" + sig["domain"],
+                tower_id: prof.cell_id,
+                comparison_value: "error=" + error_code + " ratio=" + format_float(error_ratio, 3) + " domain=" + sig["domain"]
+            })
+        }
+
+        return evidence
+    }
+
+    /// Analyze retry patterns — high retries indicate persistent failures.
+    fn _retry_pattern_analysis(self, prof: TowerProfile, records: List[SignalingRecord]) -> Optional[EvidenceItem] {
+        let retry_counts: List[int] = []
+        let high_retry_rows: List[int] = []
+
+        for rec in records {
+            if rec.cell_id == prof.cell_id {
+                append(retry_counts, rec.retry_count)
+                if rec.retry_count >= 3 {
+                    append(high_retry_rows, rec.row_index)
+                }
+            }
+        }
+        if len(retry_counts) == 0 { return None }
+
+        let sum = 0.0
+        for r in retry_counts { sum += float(r) }
+        let mean_retry = sum / float(len(retry_counts))
+
+        if mean_retry < 1.5 { return None }
+
+        let high_retry_ratio = _safe_div(float(len(high_retry_rows)), float(len(retry_counts)))
+        let score = _clamp(mean_retry / 5.0, 0.0, 0.8)
+
+        return EvidenceItem {
+            dimension: "SIGNALING",
+            metric: "retry_pattern",
+            anomaly_score: score,
+            confidence: _clamp(float(len(retry_counts)) / 50.0, 0.3, 0.8),
+            row_indices: high_retry_rows,
+            reasoning: "Tower " + prof.cell_id + " mean retry count " + format_float(mean_retry, 2) + " with " + format_float(high_retry_ratio * 100.0, 1) + "% of events having 3+ retries — persistent delivery failures",
+            tower_id: prof.cell_id,
+            comparison_value: "mean_retry=" + format_float(mean_retry, 2) + " high_retry_pct=" + format_float(high_retry_ratio * 100.0, 1)
+        }
+    }
+
+    /// Detect correlation between multiple error types at the same tower (systemic issue).
+    fn _error_correlation(self, prof: TowerProfile) -> Optional[EvidenceItem] {
+        let significant_errors: List[string] = []
+        for code, count in prof.error_distribution.items() {
+            if count >= 3 {
+                append(significant_errors, code)
+            }
+        }
+
+        if len(significant_errors) < 2 { return None }
+
+        let domains_seen: Dict[string, bool] = {}
+        for code in significant_errors {
+            let domain = ERROR_DOMAIN_MAP.get(code, "UNKNOWN")
+            domains_seen[domain] = true
+        }
+
+        let multi_domain = len(domains_seen) >= 2
+        let score = _clamp(float(len(significant_errors)) / 5.0, 0.3, 0.9)
+        if multi_domain { score = _clamp(score + 0.15, 0.0, 1.0) }
+
+        let error_list = join(significant_errors, ", ")
+
+        return EvidenceItem {
+            dimension: "SIGNALING",
+            metric: "error_correlation",
+            anomaly_score: score,
+            confidence: 0.7,
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + " exhibits " + str(len(significant_errors)) + " distinct error types (" + error_list + ") across " + str(len(domains_seen)) + " fault domains — systemic issue likely",
+            tower_id: prof.cell_id,
+            comparison_value: "error_types=" + str(len(significant_errors)) + " domains=" + str(len(domains_seen))
+        }
+    }
+
+    /// Classify the dominant fault domain for a tower.
+    fn _domain_classification(self, prof: TowerProfile) -> Optional[EvidenceItem] {
+        if prof.failure_count < 3 { return None }
+
+        let domain_counts: Dict[string, int] = {}
+        for code, count in prof.error_distribution.items() {
+            let domain = ERROR_DOMAIN_MAP.get(code, "UNKNOWN")
+            if domain in domain_counts {
+                domain_counts[domain] = domain_counts[domain] + count
+            } else {
+                domain_counts[domain] = count
+            }
+        }
+
+        let dominant_domain = "UNKNOWN"
+        let dominant_count = 0
+        for domain, count in domain_counts.items() {
+            if count > dominant_count {
+                dominant_count = count
+                dominant_domain = domain
+            }
+        }
+
+        let domain_ratio = _safe_div(float(dominant_count), float(prof.failure_count))
+        if domain_ratio < 0.5 { return None }
+
+        let score = _clamp(domain_ratio * 0.7, 0.0, 0.85)
+
+        return EvidenceItem {
+            dimension: "SIGNALING",
+            metric: "domain_classification",
+            anomaly_score: score,
+            confidence: _clamp(float(prof.failure_count) / 20.0, 0.4, 0.9),
+            row_indices: [],
+            reasoning: "Tower " + prof.cell_id + " dominant fault domain is " + dominant_domain + " (" + format_float(domain_ratio * 100.0, 1) + "% of failures) -- " + str(dominant_count) + "/" + str(prof.failure_count) + " errors map to " + dominant_domain,
+            tower_id: prof.cell_id,
+            comparison_value: "domain=" + dominant_domain + " ratio=" + format_float(domain_ratio, 3)
+        }
+    }
+
+    /// Band-specific failure analysis: detect if failures concentrate on one band.
+    fn _band_failure_analysis(self, prof: TowerProfile, records: List[SignalingRecord]) -> List[EvidenceItem] {
+        let evidence: List[EvidenceItem] = []
+        if len(prof.band_failure_rates) == 0 { return evidence }
+
+        // Overall tower failure rate as baseline
+        let tower_fr = prof.failure_rate
+
+        for band_name in prof.band_failure_rates {
+            let band_fr = prof.band_failure_rates[band_name]
+            let band_count = prof.band_distribution.get(band_name, 0)
+            if band_count < 5 { continue }
+
+            // Band failure rate significantly higher than tower average
+            let ratio = _safe_div(band_fr, max(tower_fr, 0.001))
+            if band_fr > tower_fr + 0.15 and ratio > 1.5 {
+                let fail_rows: List[int] = []
+                for rec in records {
+                    if rec.cell_id == prof.cell_id and rec.frequency_band == band_name and rec.result_code != "SUCCESS" {
+                        append(fail_rows, rec.row_index)
+                    }
+                }
+
+                let score = _clamp((band_fr - tower_fr) * 2.0, 0.2, 0.95)
+                let tech = _band_to_technology(band_name)
+                append(evidence, EvidenceItem {
+                    dimension: "SIGNALING",
+                    metric: "band_failure_concentration",
+                    anomaly_score: score,
+                    confidence: _clamp(float(band_count) / 30.0, 0.3, 0.9),
+                    row_indices: fail_rows,
+                    reasoning: "Tower " + prof.cell_id + " band " + band_name + " (" + tech + ") failure rate " + _pct_str(band_fr) + " is " + format_float(ratio, 1) + "x the tower average " + _pct_str(tower_fr) + " (" + str(band_count) + " events on this band) -- possible band-specific antenna, filter, or interference issue",
+                    tower_id: prof.cell_id,
+                    comparison_value: "band=" + band_name + " band_fr=" + format_float(band_fr, 3) + " tower_fr=" + format_float(tower_fr, 3)
+                })
+            }
+        }
+
+        // Cross-band comparison: if one band fails much more than others on same tower
+        if len(prof.band_failure_rates) >= 2 {
+            let best_band = ""
+            let best_fr = 1.0
+            let worst_band = ""
+            let worst_fr = 0.0
+            for bk in prof.band_failure_rates {
+                if prof.band_distribution.get(bk, 0) < 5 { continue }
+                let bfr = prof.band_failure_rates[bk]
+                if bfr < best_fr { best_fr = bfr; best_band = bk }
+                if bfr > worst_fr { worst_fr = bfr; worst_band = bk }
+            }
+
+            if worst_band != "" and best_band != "" and worst_band != best_band {
+                let gap = worst_fr - best_fr
+                if gap > 0.2 {
+                    let score = _clamp(gap * 1.5, 0.3, 0.95)
+                    append(evidence, EvidenceItem {
+                        dimension: "SIGNALING",
+                        metric: "band_disparity",
+                        anomaly_score: score,
+                        confidence: _clamp(float(prof.total_events) / 50.0, 0.4, 0.9),
+                        row_indices: [],
+                        reasoning: "Tower " + prof.cell_id + " band disparity: " + worst_band + " (" + _band_to_technology(worst_band) + ") fails at " + _pct_str(worst_fr) + " while " + best_band + " (" + _band_to_technology(best_band) + ") fails at " + _pct_str(best_fr) + " -- " + format_float(gap * 100.0, 1) + " percentage point gap suggests band-specific hardware or interference fault",
+                        tower_id: prof.cell_id,
+                        comparison_value: "worst=" + worst_band + "(" + format_float(worst_fr, 3) + ") best=" + best_band + "(" + format_float(best_fr, 3) + ")"
+                    })
+                }
+            }
+        }
+
+        return evidence
+    }
+}
+
+/// Helper: format a float as percentage string.
+fn _pct_str(v: float) -> string {
+    return format_float(v * 100.0, 1) + "%"
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 9 — NETWORK GRAPH ANALYZER
+// ═══════════════════════════════════════════════════════════════════
+
+/// Builds signaling path graph (SMSC→MSC→BSC/RNC→Tower) and detects
+/// common-cause failures, path isolation, and single points of failure.
+class NetworkGraphAnalyzer {
+    fn init(self) {
+        self._graph: Dict[string, List[string]] = {}
+        self._node_failures: Dict[string, int] = {}
+        self._node_totals: Dict[string, int] = {}
+    }
+
+    /// Run all graph-based analyses.
+    fn analyze(self, records: List[SignalingRecord], profiles: List[TowerProfile]) -> List[EvidenceItem] {
+        let all_evidence: List[EvidenceItem] = []
+
+        self._build_graph(records)
+
+        let cc_evs = self._common_cause_analysis(profiles)
+        for ev in cc_evs {
+            append(all_evidence, ev)
+        }
+
+        for prof in profiles {
+            if prof.total_events < MIN_EVENTS_FOR_ANALYSIS { continue }
+
+            let path_ev = self._path_isolation(prof)
+            if path_ev != None { append(all_evidence, path_ev) }
+        }
+
+        let spof_evs = self._single_point_of_failure(profiles)
+        for ev in spof_evs {
+            append(all_evidence, ev)
+        }
+
+        return _sort_evidence_desc(all_evidence)
+    }
+
+    /// Build the signaling path graph from records.
+    fn _build_graph(self, records: List[SignalingRecord]) {
+        self._graph = {}
+        self._node_failures = {}
+        self._node_totals = {}
+
+        for rec in records {
+            let tower = "tower:" + rec.cell_id
+            let bsc = "bsc:" + rec.rnc_bsc
+            let msc_node = "msc:" + rec.msc
+            let smsc_node = "smsc:" + rec.smsc
+
+            self._add_edge(smsc_node, msc_node)
+            self._add_edge(msc_node, bsc)
+            self._add_edge(bsc, tower)
+
+            let is_failure = rec.result_code != "SUCCESS"
+
+            for node in [tower, bsc, msc_node, smsc_node] {
+                if node not in self._node_totals {
+                    self._node_totals[node] = 0
+                    self._node_failures[node] = 0
+                }
+                self._node_totals[node] = self._node_totals[node] + 1
+                if is_failure {
+                    self._node_failures[node] = self._node_failures[node] + 1
+                }
+            }
+        }
+    }
+
+    /// Add a directed edge to the graph.
+    fn _add_edge(self, from_node: string, to_node: string) {
+        if from_node not in self._graph {
+            self._graph[from_node] = []
+        }
+        let children = self._graph[from_node]
+        if to_node not in children {
+            children.append(to_node)
+        }
+    }
+
+    /// Detect common-cause failures: multiple towers failing under same BSC/RNC.
+    fn _common_cause_analysis(self, profiles: List[TowerProfile]) -> List[EvidenceItem] {
+        let evidence: List[EvidenceItem] = []
+
+        let bsc_towers: Dict[string, List[TowerProfile]] = {}
+        for p in profiles {
+            let bsc = p.rnc_bsc
+            if bsc == "unknown" { continue }
+            if bsc not in bsc_towers {
+                bsc_towers[bsc] = []
+            }
+            bsc_towers[bsc].append(p)
+        }
+
+        for bsc, towers in bsc_towers.items() {
+            if len(towers) < 2 { continue }
+
+            let failing_towers: List[string] = []
+            let total_fail_rate = 0.0
+            for t in towers {
+                if t.failure_rate > 0.15 {
+                    append(failing_towers, t.cell_id)
+                }
+                total_fail_rate += t.failure_rate
+            }
+            let avg_rate = total_fail_rate / float(len(towers))
+
+            if len(failing_towers) < 2 { continue }
+
+            let ratio = float(len(failing_towers)) / float(len(towers))
+            if ratio < 0.5 { continue }
+
+            let score = _clamp(ratio * avg_rate * 3.0, 0.3, 1.0)
+            let tower_list = join(failing_towers, ", ")
+
+            append(evidence, EvidenceItem {
+                dimension: "GRAPH",
+                metric: "common_cause_bsc",
+                anomaly_score: score,
+                confidence: _clamp(float(len(towers)) / 5.0, 0.4, 0.9),
+                row_indices: [],
+                reasoning: "BSC/RNC " + bsc + ": " + str(len(failing_towers)) + "/" + str(len(towers)) + " towers failing (" + tower_list + ") — upstream BSC/RNC fault likely, not individual tower issue",
+                tower_id: bsc,
+                comparison_value: "failing=" + str(len(failing_towers)) + "/" + str(len(towers)) + " avg_rate=" + format_float(avg_rate, 3)
+            })
+        }
+
+        return evidence
+    }
+
+    /// Determine if fault is at leaf (tower) or intermediate node.
+    fn _path_isolation(self, prof: TowerProfile) -> Optional[EvidenceItem] {
+        let tower_node = "tower:" + prof.cell_id
+        let bsc_node = "bsc:" + prof.rnc_bsc
+
+        let tower_fail_rate = _safe_div(
+            float(self._node_failures.get(tower_node, 0)),
+            float(self._node_totals.get(tower_node, 1))
+        )
+        let bsc_fail_rate = _safe_div(
+            float(self._node_failures.get(bsc_node, 0)),
+            float(self._node_totals.get(bsc_node, 1))
+        )
+
+        if tower_fail_rate < 0.1 { return None }
+
+        let isolation_ratio = _safe_div(tower_fail_rate, max(bsc_fail_rate, 0.001))
+
+        if isolation_ratio > 2.0 {
+            let score = _clamp((isolation_ratio - 1.0) / 5.0, 0.0, 0.9)
+            return EvidenceItem {
+                dimension: "GRAPH",
+                metric: "path_isolation_leaf",
+                anomaly_score: score,
+                confidence: 0.7,
+                row_indices: [],
+                reasoning: "Tower " + prof.cell_id + " failure rate " + format_float(tower_fail_rate, 3) + " is " + format_float(isolation_ratio, 1) + "x its BSC " + prof.rnc_bsc + " rate " + format_float(bsc_fail_rate, 3) + " — fault isolated to tower (leaf node)",
+                tower_id: prof.cell_id,
+                comparison_value: "tower_rate=" + format_float(tower_fail_rate, 3) + " bsc_rate=" + format_float(bsc_fail_rate, 3)
+            }
+        }
+
+        if isolation_ratio < 1.2 and bsc_fail_rate > 0.15 {
+            let score = _clamp(bsc_fail_rate, 0.0, 0.8)
+            return EvidenceItem {
+                dimension: "GRAPH",
+                metric: "path_isolation_upstream",
+                anomaly_score: score,
+                confidence: 0.6,
+                row_indices: [],
+                reasoning: "Tower " + prof.cell_id + " failure rate " + format_float(tower_fail_rate, 3) + " tracks BSC " + prof.rnc_bsc + " rate " + format_float(bsc_fail_rate, 3) + " — fault likely upstream at BSC/RNC level",
+                tower_id: prof.cell_id,
+                comparison_value: "isolation_ratio=" + format_float(isolation_ratio, 2) + " bsc=" + prof.rnc_bsc
+            }
+        }
+
+        return None
+    }
+
+    /// Detect single points of failure in the network graph.
+    fn _single_point_of_failure(self, profiles: List[TowerProfile]) -> List[EvidenceItem] {
+        let evidence: List[EvidenceItem] = []
+
+        let msc_towers: Dict[string, int] = {}
+        let msc_failing: Dict[string, int] = {}
+
+        for p in profiles {
+            let msc_key = p.rnc_bsc
+            if msc_key == "unknown" { continue }
+            if msc_key not in msc_towers {
+                msc_towers[msc_key] = 0
+                msc_failing[msc_key] = 0
+            }
+            msc_towers[msc_key] = msc_towers[msc_key] + 1
+            if p.failure_rate > 0.15 {
+                msc_failing[msc_key] = msc_failing[msc_key] + 1
+            }
+        }
+
+        for node, total in msc_towers.items() {
+            let failing = msc_failing.get(node, 0)
+            if total < 3 or failing < 2 { continue }
+
+            let fail_ratio = _safe_div(float(failing), float(total))
+            if fail_ratio < 0.6 { continue }
+
+            let score = _clamp(fail_ratio * 0.8, 0.0, 0.9)
+            append(evidence, EvidenceItem {
+                dimension: "GRAPH",
+                metric: "single_point_of_failure",
+                anomaly_score: score,
+                confidence: _clamp(float(total) / 5.0, 0.4, 0.85),
+                row_indices: [],
+                reasoning: "Node " + node + " is a single point of failure: " + str(failing) + "/" + str(total) + " downstream towers are failing — upstream fault probable",
+                tower_id: node,
+                comparison_value: "spof_ratio=" + format_float(fail_ratio, 3) + " downstream=" + str(total)
+            })
+        }
+
+        return evidence
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 10 — EVIDENCE FUSION
+// ═══════════════════════════════════════════════════════════════════
+
+/// Aggregates evidence across all 5 analysis dimensions, applies weighted
+/// scoring, cross-dimension agreement bonuses, and ranks fault hypotheses.
+class EvidenceFusion {
+    fn init(self) {
+        self._weights = DIMENSION_WEIGHTS
+        self._agreement_bonus = CROSS_DIMENSION_BONUS
+    }
+
+    /// Fuse all evidence into ranked fault hypotheses.
+    fn fuse(self, all_evidence: List[EvidenceItem], profiles: List[TowerProfile]) -> List[FaultHypothesis] {
+        let tower_evidence: Dict[string, List[EvidenceItem]] = {}
+        for ev in all_evidence {
+            let tid = ev.tower_id
+            if tid not in tower_evidence {
+                tower_evidence[tid] = []
+            }
+            tower_evidence[tid].append(ev)
+        }
+
+        let profile_map: Dict[string, TowerProfile] = {}
+        for p in profiles {
+            profile_map[p.cell_id] = p
+        }
+
+        let hypotheses: List[FaultHypothesis] = []
+        for tower_id, evs in tower_evidence.items() {
+            let hyp = self._build_hypothesis(tower_id, evs, profile_map)
+            append(hypotheses, hyp)
+        }
+
+        hypotheses.sort_by(fn(h) { return -h.confidence })
+        return hypotheses
+    }
+
+    /// Build a single fault hypothesis for a tower from its evidence.
+    fn _build_hypothesis(self, tower_id: string, evidence: List[EvidenceItem], profile_map: Dict[string, TowerProfile]) -> FaultHypothesis {
+        let weighted_score = 0.0
+        let total_weight = 0.0
+        let dimensions_present: Dict[string, bool] = {}
+        let all_rows: List[int] = []
+
+        for ev in evidence {
+            let dim = ev.dimension
+            let w = self._weights.get(dim, 0.1)
+            weighted_score += ev.anomaly_score * ev.confidence * w
+            total_weight += w
+            dimensions_present[dim] = true
+            for ri in ev.row_indices {
+                if ri not in all_rows {
+                    append(all_rows, ri)
+                }
+            }
+        }
+
+        let base_confidence = _safe_div(weighted_score, max(total_weight, 0.01))
+
+        let dim_count = len(dimensions_present)
+        let agreement_bonus = 0.0
+        if dim_count >= 4 {
+            agreement_bonus = self._agreement_bonus
+        } else if dim_count >= 3 {
+            agreement_bonus = self._agreement_bonus * 0.6
+        } else if dim_count >= 2 {
+            agreement_bonus = self._agreement_bonus * 0.3
+        }
+
+        let confidence = _clamp(base_confidence + agreement_bonus, 0.0, 0.99)
+
+        let fault_domain = self._determine_fault_domain(evidence)
+        let fault_severity = self._determine_severity(confidence, evidence)
+        let root_cause = self._determine_root_cause(evidence, profile_map.get(tower_id, None))
+        let explanation = self._build_explanation(tower_id, evidence, confidence, fault_domain, root_cause)
+        let recommendations = self._generate_recommendations(fault_domain, root_cause, evidence)
+
+        let change_point = self._find_change_point(evidence)
+
+        let prov_data = tower_id + ":" + format_float(confidence, 6) + ":" + str(len(evidence)) + ":" + str(dim_count)
+        let prov_hash = _hash_string(prov_data)
+
+        return FaultHypothesis {
+            tower_id: tower_id,
+            fault_domain: fault_domain,
+            fault_severity: fault_severity,
+            confidence: confidence,
+            evidence: evidence,
+            root_cause: root_cause,
+            explanation: explanation,
+            recommendations: recommendations,
+            change_point: change_point,
+            provenance_hash: prov_hash
+        }
+    }
+
+    /// Determine the dominant fault domain from evidence.
+    fn _determine_fault_domain(self, evidence: List[EvidenceItem]) -> string {
+        let domain_scores: Dict[string, float] = {}
+
+        for ev in evidence {
+            let cv = ev.comparison_value
+            if cv.startswith("domain=") {
+                let domain = cv.replace("domain=", "").split(" ")[0]
+                if domain in domain_scores {
+                    domain_scores[domain] = domain_scores[domain] + ev.anomaly_score
+                } else {
+                    domain_scores[domain] = ev.anomaly_score
+                }
+            }
+
+            if "error=" in cv {
+                let parts = cv.split(" ")
+                for part in parts {
+                    if part.startswith("domain=") {
+                        let d = part.replace("domain=", "")
+                        if d in domain_scores {
+                            domain_scores[d] = domain_scores[d] + ev.anomaly_score
+                        } else {
+                            domain_scores[d] = ev.anomaly_score
+                        }
+                    }
+                }
+            }
+        }
+
+        if len(domain_scores) == 0 { return "UNKNOWN" }
+
+        let best_domain = "UNKNOWN"
+        let best_score = 0.0
+        for domain, score in domain_scores.items() {
+            if score > best_score {
+                best_score = score
+                best_domain = domain
+            }
+        }
+        return best_domain
+    }
+
+    /// Determine fault severity from confidence and evidence.
+    fn _determine_severity(self, confidence: float, evidence: List[EvidenceItem]) -> string {
+        let has_critical_sig = false
+        for ev in evidence {
+            if "CRITICAL" in ev.comparison_value or "equipment" in ev.reasoning.lower() or "hardware" in ev.reasoning.lower() {
+                has_critical_sig = true
+            }
+        }
+
+        if confidence >= 0.8 and has_critical_sig { return "CRITICAL" }
+        if confidence >= 0.7 { return "MAJOR" }
+        if confidence >= 0.5 { return "MINOR" }
+        if confidence >= 0.3 { return "WARNING" }
+        return "INFO"
+    }
+
+    /// Determine root cause from dominant evidence patterns.
+    fn _determine_root_cause(self, evidence: List[EvidenceItem], prof: Optional[TowerProfile]) -> string {
+        let best_ev: Optional[EvidenceItem] = None
+        let best_score = 0.0
+
+        for ev in evidence {
+            if ev.dimension == "SIGNALING" and ev.anomaly_score > best_score {
+                best_score = ev.anomaly_score
+                best_ev = ev
+            }
+        }
+
+        if best_ev == None {
+            for ev in evidence {
+                if ev.anomaly_score > best_score {
+                    best_score = ev.anomaly_score
+                    best_ev = ev
+                }
+            }
+        }
+
+        if best_ev == None { return "Insufficient evidence for root cause determination" }
+
+        let cause = best_ev.metric + ": " + best_ev.reasoning
+        if len(cause) > 200 {
+            cause = cause.slice(0, 200) + "..."
+        }
+        return cause
+    }
+
+    /// Build a human-readable explanation of the fault hypothesis.
+    fn _build_explanation(self, tower_id: string, evidence: List[EvidenceItem], confidence: float, domain: string, root_cause: string) -> string {
+        let dims: List[string] = []
+        let dim_set: Dict[string, bool] = {}
+        for ev in evidence {
+            if ev.dimension not in dim_set {
+                dim_set[ev.dimension] = true
+                append(dims, ev.dimension)
+            }
+        }
+
+        let parts: List[string] = []
+        append(parts, "Fault hypothesis for " + tower_id + " (confidence: " + format_float(confidence * 100.0, 1) + "%)")
+        append(parts, "Domain: " + domain)
+        append(parts, "Evidence from " + str(len(dims)) + " dimensions: " + join(dims, ", "))
+        append(parts, "Total evidence items: " + str(len(evidence)))
+        append(parts, "Root cause: " + root_cause)
+
+        return join(parts, "\n")
+    }
+
+    /// Generate actionable recommendations based on fault domain and evidence.
+    fn _generate_recommendations(self, domain: string, root_cause: string, evidence: List[EvidenceItem]) -> List[string] {
+        let recs: List[string] = []
+
+        if domain == "RADIO" {
+            append(recs, "Dispatch field team to inspect tower hardware and antenna alignment")
+            append(recs, "Check BTS power amplifier and transceiver modules")
+            append(recs, "Verify radio frequency interference levels")
+            append(recs, "Review paging channel configuration")
+        } else if domain == "CORE" {
+            append(recs, "Check MSC/VLR process health and restart if necessary")
+            append(recs, "Verify HLR subscriber data consistency")
+            append(recs, "Review VLR-HLR synchronization logs")
+            append(recs, "Check core network element software versions")
+        } else if domain == "TRANSPORT" {
+            append(recs, "Check SCCP/SIGTRAN link status and error counters")
+            append(recs, "Verify signaling link capacity and congestion levels")
+            append(recs, "Review MTP3 routing tables")
+            append(recs, "Test end-to-end signaling path connectivity")
+        } else if domain == "SMSC" {
+            append(recs, "Check SMSC routing tables for the affected destination")
+            append(recs, "Verify SMSC-MSC GT translation configuration")
+            append(recs, "Review SMSC queue depths and processing latency")
+            append(recs, "Check MAP dialogue handling capacity")
+        } else if domain == "CONFIG" {
+            append(recs, "Audit provisioning data for affected subscribers")
+            append(recs, "Verify call barring and supplementary service settings")
+            append(recs, "Check routing and numbering plan configuration")
+            append(recs, "Review recent configuration changes in the area")
+        } else {
+            append(recs, "Collect additional diagnostic data from all network elements in the path")
+            append(recs, "Correlate with NOC alarm history for the time period")
+            append(recs, "Escalate to L2/L3 support with this analysis report")
+        }
+
+        // Band-specific recommendations from evidence
+        let has_band_issue = false
+        let affected_band = ""
+        let affected_tech = ""
+        for ev in evidence {
+            if ev.metric == "band_failure_concentration" or ev.metric == "band_disparity" {
+                has_band_issue = true
+                let cv = ev.comparison_value
+                if "band=" in cv {
+                    let parts = cv.split(" ")
+                    for part in parts {
+                        if part.startswith("band=") or part.startswith("worst=") {
+                            affected_band = part.split("=")[1].split("(")[0]
+                        }
+                    }
+                }
+                affected_tech = _band_to_technology(affected_band)
+            }
+        }
+
+        if has_band_issue and affected_band != "" {
+            append(recs, "Band-specific issue detected on " + affected_band + " (" + affected_tech + ") -- inspect band-specific RF chain")
+            if affected_tech == "4G" {
+                append(recs, "Check LTE " + affected_band + " antenna, duplexer/filter, and PA module")
+                append(recs, "Verify " + affected_band + " EARFCN and PCI configuration")
+                append(recs, "Run drive test on " + affected_band + " to check coverage and interference")
+            }
+            if affected_tech == "3G" {
+                append(recs, "Check UMTS " + affected_band + " NodeB TRX and combiner")
+                append(recs, "Verify scrambling code and UARFCN settings for " + affected_band)
+            }
+            if affected_tech == "2G" {
+                append(recs, "Check GSM " + affected_band + " TRX, combiner, and antenna feeder")
+                append(recs, "Verify BCCH/TCH ARFCN allocation and frequency hopping on " + affected_band)
+            }
+            if affected_tech == "5G" {
+                append(recs, "Check NR " + affected_band + " massive MIMO panel and beamforming config")
+                append(recs, "Verify SSB beam configuration and NR-ARFCN for " + affected_band)
+            }
+            append(recs, "Compare " + affected_band + " performance against neighboring towers on same band")
+        }
+
+        append(recs, "Monitor the identified tower for 24h after remediation to confirm fix")
+        return recs
+    }
+
+    /// Extract change point from temporal evidence if present.
+    fn _find_change_point(self, evidence: List[EvidenceItem]) -> Optional[ChangePoint] {
+        for ev in evidence {
+            if ev.metric == "cusum_change_point" {
+                let cv = ev.comparison_value
+                let before_val = 0.0
+                let after_val = 0.0
+
+                if cv.startswith("before=") {
+                    let parts = cv.split(" ")
+                    for part in parts {
+                        if part.startswith("before=") {
+                            before_val = float(part.replace("before=", ""))
+                        }
+                        if part.startswith("after=") {
+                            after_val = float(part.replace("after=", ""))
+                        }
+                    }
+                }
+
+                let row_idx = 0
+                if len(ev.row_indices) > 0 {
+                    row_idx = ev.row_indices[0]
+                }
+
+                return ChangePoint {
+                    timestamp: 0.0,
+                    metric: "failure_rate",
+                    before_value: before_val,
+                    after_value: after_val,
+                    significance: ev.anomaly_score,
+                    row_index: row_idx
+                }
+            }
+        }
+        return None
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 11 — VERIFICATION GATE
+// ═══════════════════════════════════════════════════════════════════
+
+/// Cross-checks analysis results, calibrates confidence, assigns trust
+/// levels, and computes provenance hashes.
+class TelecomVerificationGate {
+    fn init(self) {
+        self._min_dimensions_for_trust = 2
+        self._calibration_factor = 0.95
+    }
+
+    /// Verify and enrich the analysis report.
+    fn verify(self, report: AnalysisReport) -> AnalysisReport {
+        report = self._cross_check_dimensions(report)
+        report = self._sanity_check(report)
+        report = self._calibrate_confidence(report)
+        report = self._assign_trust_level(report)
+        report = self._compute_provenance(report)
+        return report
+    }
+
+    /// Cross-check: do independent dimensions agree on the primary fault?
+    fn _cross_check_dimensions(self, report: AnalysisReport) -> AnalysisReport {
+        let primary = report.primary_fault
+        let dims: Dict[string, bool] = {}
+        for ev in primary.evidence {
+            dims[ev.dimension] = true
+        }
+
+        let dim_count = len(dims)
+        if dim_count < self._min_dimensions_for_trust {
+            append(report.reasoning_chain, "WARNING: Primary fault supported by only " + str(dim_count) + " dimension(s) — cross-validation incomplete")
+            primary.confidence = primary.confidence * 0.8
+        } else {
+            append(report.reasoning_chain, "Cross-check: " + str(dim_count) + "/5 dimensions independently support primary fault at " + primary.tower_id)
+        }
+
+        let agreeing_alts = 0
+        for alt in report.alternative_hypotheses {
+            if alt.tower_id == primary.tower_id {
+                agreeing_alts += 1
+            }
+        }
+
+        report.primary_fault = primary
+        return report
+    }
+
+    /// Sanity check: is the identified tower actually in the dataset?
+    fn _sanity_check(self, report: AnalysisReport) -> AnalysisReport {
+        let primary = report.primary_fault
+
+        if primary.confidence <= 0.0 {
+            append(report.reasoning_chain, "SANITY FAIL: Primary fault has zero confidence")
+            primary.confidence = 0.01
+        }
+
+        if len(primary.evidence) == 0 {
+            append(report.reasoning_chain, "SANITY FAIL: Primary fault has no evidence items")
+            primary.confidence = 0.01
+        }
+
+        if primary.tower_id == "" or primary.tower_id == "unknown" {
+            append(report.reasoning_chain, "SANITY FAIL: Primary fault tower ID is empty or unknown")
+            primary.confidence = 0.01
+        }
+
+        report.primary_fault = primary
+        return report
+    }
+
+    /// Calibrate confidence to avoid overconfidence.
+    fn _calibrate_confidence(self, report: AnalysisReport) -> AnalysisReport {
+        let primary = report.primary_fault
+
+        primary.confidence = primary.confidence * self._calibration_factor
+
+        if report.total_records < 50 {
+            let volume_penalty = _safe_div(float(report.total_records), 50.0)
+            primary.confidence = primary.confidence * volume_penalty
+            append(report.reasoning_chain, "Volume penalty applied: only " + str(report.total_records) + " records (confidence scaled by " + format_float(volume_penalty, 2) + ")")
+        }
+
+        if report.total_towers < 3 {
+            primary.confidence = primary.confidence * 0.7
+            append(report.reasoning_chain, "Low tower count penalty: only " + str(report.total_towers) + " towers — limited comparison baseline")
+        }
+
+        primary.confidence = _clamp(primary.confidence, 0.0, 0.99)
+
+        for i in range(len(report.alternative_hypotheses)) {
+            let alt = report.alternative_hypotheses[i]
+            alt.confidence = _clamp(alt.confidence * self._calibration_factor, 0.0, 0.99)
+            report.alternative_hypotheses[i] = alt
+        }
+
+        report.primary_fault = primary
+        return report
+    }
+
+    /// Assign trust level based on evidence quality and confidence.
+    fn _assign_trust_level(self, report: AnalysisReport) -> AnalysisReport {
+        let primary = report.primary_fault
+        let dim_count = 0
+        let dim_set: Dict[string, bool] = {}
+        for ev in primary.evidence {
+            if ev.dimension not in dim_set {
+                dim_set[ev.dimension] = true
+                dim_count += 1
+            }
+        }
+
+        if primary.confidence >= 0.8 and dim_count >= 4 and report.total_records >= 100 {
+            report.trust_level = "CERTIFIED"
+            append(report.reasoning_chain, "Trust level: CERTIFIED — high confidence, multi-dimensional agreement, sufficient data volume")
+        } else if primary.confidence >= 0.6 and dim_count >= 3 {
+            report.trust_level = "TRUSTED"
+            append(report.reasoning_chain, "Trust level: TRUSTED — good confidence with cross-dimensional support")
+        } else if primary.confidence >= 0.3 and dim_count >= 2 {
+            report.trust_level = "VALIDATED"
+            append(report.reasoning_chain, "Trust level: VALIDATED — moderate confidence with some cross-validation")
+        } else {
+            report.trust_level = "RAW"
+            append(report.reasoning_chain, "Trust level: RAW — insufficient evidence or low confidence for higher trust")
+        }
+
+        return report
+    }
+
+    /// Compute provenance hash over the entire report.
+    fn _compute_provenance(self, report: AnalysisReport) -> AnalysisReport {
+        let payload_parts: List[string] = []
+        append(payload_parts, report.report_id)
+        append(payload_parts, str(report.total_records))
+        append(payload_parts, str(report.total_towers))
+        append(payload_parts, report.primary_fault.tower_id)
+        append(payload_parts, format_float(report.primary_fault.confidence, 8))
+        append(payload_parts, report.primary_fault.fault_domain)
+        append(payload_parts, str(len(report.primary_fault.evidence)))
+        append(payload_parts, report.trust_level)
+
+        for ev in report.primary_fault.evidence {
+            append(payload_parts, ev.dimension + ":" + ev.metric + ":" + format_float(ev.anomaly_score, 6))
+        }
+
+        let payload = join(payload_parts, "|")
+        report.provenance_hash = _hash_string(payload)
+        report.primary_fault.provenance_hash = _hash_string(report.primary_fault.tower_id + ":" + payload)
+
+        append(report.reasoning_chain, "Provenance hash computed: " + report.provenance_hash.slice(0, 16) + "...")
+        return report
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 12 — MASTER ORCHESTRATOR
+// ═══════════════════════════════════════════════════════════════════
+
+/// Top-level fault isolation engine. Orchestrates the full pipeline:
+/// Parse → Profile → Analyze (5 dimensions) → Fuse → Verify → Report.
+class TelecomFaultIsolator {
+    fn init(self) {
+        self._parser = AdaptiveParser {}
+        self._parser.init()
+        self._profiler = StatisticalProfiler {}
+        self._profiler.init()
+        self._temporal = TemporalAnalyzer {}
+        self._temporal.init()
+        self._spatial = SpatialCorrelator {}
+        self._spatial.init()
+        self._signaling = SignalingPatternDetector {}
+        self._signaling.init()
+        self._graph = NetworkGraphAnalyzer {}
+        self._graph.init()
+        self._fusion = EvidenceFusion {}
+        self._fusion.init()
+        self._verifier = TelecomVerificationGate {}
+        self._verifier.init()
+    }
+
+    /// Run the full fault isolation pipeline.
+    fn analyze(self, raw_data: string, format_hint: string) -> AnalysisReport {
+        let start_time = time.time()
+        let reasoning: List[string] = []
+
+        append(reasoning, "=== NRS Telecom Fault Isolation Engine ===")
+        append(reasoning, "Analysis started at " + str(start_time))
+
+        // Phase 1: Parse
+        let phase1_start = time.time()
+        let records = self._parser.parse(raw_data, format_hint)
+        let phase1_ms = (time.time() - phase1_start) * 1000.0
+        append(reasoning, "Phase 1 — Parse: " + str(len(records)) + " records in " + format_float(phase1_ms, 1) + "ms")
+
+        if len(records) == 0 {
+            return self._empty_report(start_time, reasoning)
+        }
+
+        // Phase 2: Profile
+        let phase2_start = time.time()
+        let profiles = self._profiler.profile(records)
+        let phase2_ms = (time.time() - phase2_start) * 1000.0
+        append(reasoning, "Phase 2 — Profile: " + str(len(profiles)) + " towers in " + format_float(phase2_ms, 1) + "ms")
+
+        // Phase 3: Statistical anomaly detection
+        let phase3_start = time.time()
+        let stat_evidence = self._profiler.detect_anomalies(profiles)
+        let phase3_ms = (time.time() - phase3_start) * 1000.0
+        append(reasoning, "Phase 3 — Statistical: " + str(len(stat_evidence)) + " evidence items in " + format_float(phase3_ms, 1) + "ms")
+
+        // Phase 4: Temporal analysis
+        let phase4_start = time.time()
+        let temp_evidence = self._temporal.analyze(records, profiles)
+        let phase4_ms = (time.time() - phase4_start) * 1000.0
+        append(reasoning, "Phase 4 — Temporal: " + str(len(temp_evidence)) + " evidence items in " + format_float(phase4_ms, 1) + "ms")
+
+        // Phase 5: Spatial correlation
+        let phase5_start = time.time()
+        let spat_evidence = self._spatial.analyze(records, profiles)
+        let phase5_ms = (time.time() - phase5_start) * 1000.0
+        append(reasoning, "Phase 5 — Spatial: " + str(len(spat_evidence)) + " evidence items in " + format_float(phase5_ms, 1) + "ms")
+
+        // Phase 6: Signaling pattern detection
+        let phase6_start = time.time()
+        let sig_evidence = self._signaling.analyze(records, profiles)
+        let phase6_ms = (time.time() - phase6_start) * 1000.0
+        append(reasoning, "Phase 6 — Signaling: " + str(len(sig_evidence)) + " evidence items in " + format_float(phase6_ms, 1) + "ms")
+
+        // Phase 7: Network graph analysis
+        let phase7_start = time.time()
+        let graph_evidence = self._graph.analyze(records, profiles)
+        let phase7_ms = (time.time() - phase7_start) * 1000.0
+        append(reasoning, "Phase 7 — Graph: " + str(len(graph_evidence)) + " evidence items in " + format_float(phase7_ms, 1) + "ms")
+
+        // Phase 8: Evidence fusion
+        let all_evidence: List[EvidenceItem] = []
+        for ev in stat_evidence { append(all_evidence, ev) }
+        for ev in temp_evidence { append(all_evidence, ev) }
+        for ev in spat_evidence { append(all_evidence, ev) }
+        for ev in sig_evidence { append(all_evidence, ev) }
+        for ev in graph_evidence { append(all_evidence, ev) }
+
+        append(reasoning, "Total evidence items: " + str(len(all_evidence)))
+
+        let phase8_start = time.time()
+        let hypotheses = self._fusion.fuse(all_evidence, profiles)
+        let phase8_ms = (time.time() - phase8_start) * 1000.0
+        append(reasoning, "Phase 8 — Fusion: " + str(len(hypotheses)) + " hypotheses in " + format_float(phase8_ms, 1) + "ms")
+
+        if len(hypotheses) == 0 {
+            return self._empty_report(start_time, reasoning)
+        }
+
+        // Build report
+        let primary = hypotheses[0]
+        let alternatives: List[FaultHypothesis] = []
+        if len(hypotheses) > 1 {
+            let ai = 1
+            while ai < min(len(hypotheses), 6) {
+                append(alternatives, hypotheses[ai])
+                ai += 1
+            }
+        }
+
+        let network_health = self._compute_network_health(profiles)
+        let data_quality = self._assess_data_quality(records, profiles)
+
+        let elapsed = (time.time() - start_time) * 1000.0
+        append(reasoning, "Total elapsed: " + format_float(elapsed, 1) + "ms")
+        append(reasoning, "Primary fault: " + primary.tower_id + " (confidence: " + format_float(primary.confidence * 100.0, 1) + "%)")
+
+        let report_id = _hash_string(str(start_time) + ":" + str(len(records))).slice(0, 16)
+
+        let report = AnalysisReport {
+            report_id: report_id,
+            timestamp: start_time,
+            elapsed_ms: elapsed,
+            total_records: len(records),
+            total_towers: len(profiles),
+            primary_fault: primary,
+            alternative_hypotheses: alternatives,
+            network_health: network_health,
+            data_quality: data_quality,
+            reasoning_chain: reasoning,
+            trust_level: "RAW",
+            provenance_hash: ""
+        }
+
+        // Phase 9: Verification
+        let phase9_start = time.time()
+        report = self._verifier.verify(report)
+        let phase9_ms = (time.time() - phase9_start) * 1000.0
+        append(report.reasoning_chain, "Phase 9 — Verification: " + format_float(phase9_ms, 1) + "ms")
+
+        return report
+    }
+
+    /// Generate a human-readable explanation of the analysis report.
+    fn explain(self, report: AnalysisReport) -> string {
+        let lines: List[string] = []
+
+        append(lines, "╔══════════════════════════════════════════════════════════════╗")
+        append(lines, "║  NRS TELECOM FAULT ISOLATION REPORT                         ║")
+        append(lines, "╚══════════════════════════════════════════════════════════════╝")
+        append(lines, "")
+        append(lines, "Report ID:     " + report.report_id)
+        append(lines, "Trust Level:   " + report.trust_level)
+        append(lines, "Records:       " + str(report.total_records))
+        append(lines, "Towers:        " + str(report.total_towers))
+        append(lines, "Elapsed:       " + format_float(report.elapsed_ms, 1) + "ms")
+        append(lines, "Provenance:    " + report.provenance_hash.slice(0, 24) + "...")
+        append(lines, "")
+
+        let pf = report.primary_fault
+        append(lines, "┌─ PRIMARY FAULT ──────────────────────────────────────────────┐")
+        append(lines, "│ Tower:       " + pf.tower_id)
+        append(lines, "│ Domain:      " + pf.fault_domain)
+        append(lines, "│ Severity:    " + pf.fault_severity)
+        append(lines, "│ Confidence:  " + format_float(pf.confidence * 100.0, 1) + "%")
+        append(lines, "│ Evidence:    " + str(len(pf.evidence)) + " items")
+        append(lines, "│")
+        append(lines, "│ Root Cause:")
+
+        let rc_lines = pf.root_cause.split("\n")
+        for rcl in rc_lines {
+            append(lines, "│   " + rcl)
+        }
+
+        append(lines, "│")
+        append(lines, "│ Recommendations:")
+        for rec in pf.recommendations {
+            append(lines, "│   • " + rec)
+        }
+        append(lines, "└──────────────────────────────────────────────────────────────┘")
+
+        if len(report.alternative_hypotheses) > 0 {
+            append(lines, "")
+            append(lines, "┌─ ALTERNATIVE HYPOTHESES ─────────────────────────────────────┐")
+            for alt in report.alternative_hypotheses {
+                append(lines, "│ " + alt.tower_id + " | " + alt.fault_domain + " | " + alt.fault_severity + " | " + format_float(alt.confidence * 100.0, 1) + "% | " + str(len(alt.evidence)) + " evidence items")
+            }
+            append(lines, "└──────────────────────────────────────────────────────────────┘")
+        }
+
+        append(lines, "")
+        append(lines, "┌─ NETWORK HEALTH ─────────────────────────────────────────────┐")
+        for key, val in report.network_health.items() {
+            append(lines, "│ " + key + ": " + format_float(val, 3))
+        }
+        append(lines, "└──────────────────────────────────────────────────────────────┘")
+
+        append(lines, "")
+        append(lines, "┌─ REASONING CHAIN ────────────────────────────────────────────┐")
+        for step in report.reasoning_chain {
+            append(lines, "│ " + step)
+        }
+        append(lines, "└──────────────────────────────────────────────────────────────┘")
+
+        append(lines, "")
+        append(lines, "┌─ EVIDENCE DETAIL ────────────────────────────────────────────┐")
+        let ev_idx = 0
+        for ev in pf.evidence {
+            ev_idx += 1
+            append(lines, "│ [" + str(ev_idx) + "] " + ev.dimension + " / " + ev.metric)
+            append(lines, "│     Score: " + format_float(ev.anomaly_score, 3) + "  Confidence: " + format_float(ev.confidence, 3))
+            append(lines, "│     " + ev.reasoning)
+            if len(ev.row_indices) > 0 {
+                let row_strs: List[string] = []
+                let max_show = min(len(ev.row_indices), 10)
+                let ri = 0
+                while ri < max_show {
+                    append(row_strs, str(ev.row_indices[ri]))
+                    ri += 1
+                }
+                let row_display = join(row_strs, ", ")
+                if len(ev.row_indices) > 10 {
+                    row_display = row_display + " ... +" + str(len(ev.row_indices) - 10) + " more"
+                }
+                append(lines, "│     Rows: [" + row_display + "]")
+            }
+            append(lines, "│")
+        }
+        append(lines, "└──────────────────────────────────────────────────────────────┘")
+
+        return join(lines, "\n")
+    }
+
+    /// Compute network-wide health metrics.
+    fn _compute_network_health(self, profiles: List[TowerProfile]) -> Dict[string, float] {
+        let health: Dict[string, float] = {}
+        if len(profiles) == 0 { return health }
+
+        let total_events = 0
+        let total_success = 0
+        let total_failure = 0
+        let max_failure_rate = 0.0
+        let healthy_towers = 0
+
+        for p in profiles {
+            total_events += p.total_events
+            total_success += p.success_count
+            total_failure += p.failure_count
+            if p.failure_rate > max_failure_rate {
+                max_failure_rate = p.failure_rate
+            }
+            if p.failure_rate < 0.05 {
+                healthy_towers += 1
+            }
+        }
+
+        health["overall_success_rate"] = _safe_div(float(total_success), float(total_events))
+        health["overall_failure_rate"] = _safe_div(float(total_failure), float(total_events))
+        health["max_tower_failure_rate"] = max_failure_rate
+        health["healthy_tower_ratio"] = _safe_div(float(healthy_towers), float(len(profiles)))
+        health["mean_failure_rate"] = self._profiler._network_mean_failure_rate
+        health["median_failure_rate"] = self._profiler._network_median_failure_rate
+
+        // Band-level health: aggregate per-band failure rates across all towers
+        let band_events: Dict[string, int] = {}
+        let band_failures: Dict[string, int] = {}
+        let tech_events: Dict[string, int] = {}
+        let tech_failures: Dict[string, int] = {}
+        let bands_seen = 0
+
+        for p in profiles {
+            for bk in p.band_distribution {
+                bands_seen += 1
+                let bc = p.band_distribution[bk]
+                if bk in band_events { band_events[bk] = band_events[bk] + bc }
+                else { band_events[bk] = bc }
+                let bf = 0
+                if bk in p.band_failure_rates {
+                    bf = int(p.band_failure_rates[bk] * float(bc))
+                }
+                if bk in band_failures { band_failures[bk] = band_failures[bk] + bf }
+                else { band_failures[bk] = bf }
+            }
+            for tk in p.technology_distribution {
+                let tc = p.technology_distribution[tk]
+                if tk in tech_events { tech_events[tk] = tech_events[tk] + tc }
+                else { tech_events[tk] = tc }
+            }
+        }
+
+        health["bands_detected"] = float(len(band_events))
+        health["technologies_detected"] = float(len(tech_events))
+        health["band_data_coverage"] = _safe_div(float(bands_seen), float(len(profiles)))
+
+        for bk in band_events {
+            let bfr = _safe_div(float(band_failures.get(bk, 0)), float(band_events[bk]))
+            health["band_" + bk + "_failure_rate"] = bfr
+        }
+
+        return health
+    }
+
+    /// Assess data quality metrics.
+    fn _assess_data_quality(self, records: List[SignalingRecord], profiles: List[TowerProfile]) -> Dict[string, float] {
+        let quality: Dict[string, float] = {}
+        let total = float(len(records))
+        if total == 0.0 { return quality }
+
+        let has_timestamp = 0
+        let has_cell = 0
+        let has_result = 0
+        let has_imsi = 0
+
+        let has_band = 0
+        let has_tech = 0
+
+        for rec in records {
+            if rec.timestamp > 0.0 { has_timestamp += 1 }
+            if rec.cell_id != "unknown" { has_cell += 1 }
+            if rec.result_code != "UNKNOWN_ERROR" { has_result += 1 }
+            if rec.imsi_hash != "unknown" { has_imsi += 1 }
+            if rec.frequency_band != "unknown" { has_band += 1 }
+            if rec.technology != "unknown" { has_tech += 1 }
+        }
+
+        quality["timestamp_completeness"] = float(has_timestamp) / total
+        quality["cell_id_completeness"] = float(has_cell) / total
+        quality["result_code_completeness"] = float(has_result) / total
+        quality["subscriber_completeness"] = float(has_imsi) / total
+        quality["band_completeness"] = float(has_band) / total
+        quality["technology_completeness"] = float(has_tech) / total
+        quality["record_count"] = total
+        quality["tower_count"] = float(len(profiles))
+
+        let overall = (quality["timestamp_completeness"] + quality["cell_id_completeness"] + quality["result_code_completeness"]) / 3.0
+        quality["overall_quality"] = overall
+
+        return quality
+    }
+
+    /// Build an empty report when no data or no hypotheses are available.
+    fn _empty_report(self, start_time: float, reasoning: List[string]) -> AnalysisReport {
+        append(reasoning, "No data or no fault hypotheses generated")
+        let elapsed = (time.time() - start_time) * 1000.0
+
+        let empty_fault = FaultHypothesis {
+            tower_id: "none",
+            fault_domain: "UNKNOWN",
+            fault_severity: "INFO",
+            confidence: 0.0,
+            evidence: [],
+            root_cause: "No fault detected — insufficient data or all towers healthy",
+            explanation: "Analysis completed with no actionable fault hypothesis",
+            recommendations: ["Verify data completeness and re-run analysis"],
+            change_point: None,
+            provenance_hash: _hash_string("empty:" + str(start_time))
+        }
+
+        return AnalysisReport {
+            report_id: _hash_string("empty:" + str(start_time)).slice(0, 16),
+            timestamp: start_time,
+            elapsed_ms: elapsed,
+            total_records: 0,
+            total_towers: 0,
+            primary_fault: empty_fault,
+            alternative_hypotheses: [],
+            network_health: {},
+            data_quality: {},
+            reasoning_chain: reasoning,
+            trust_level: "RAW",
+            provenance_hash: _hash_string("empty-report:" + str(start_time))
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 13 — CONVENIENCE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════
+
+/// Create a fully-initialized TelecomFaultIsolator instance.
+fn _make_isolator() -> TelecomFaultIsolator {
+    let iso = TelecomFaultIsolator {}
+    iso.init()
+    return iso
+}
+
+/// One-shot analysis: parse raw data and return a full report.
+fn analyze_telecom_data(raw_data: string, format_hint: string) -> AnalysisReport {
+    let isolator = _make_isolator()
+    return isolator.analyze(raw_data, format_hint)
+}
+
+/// One-shot analysis with human-readable output.
+fn analyze_and_explain(raw_data: string, format_hint: string) -> string {
+    let isolator = _make_isolator()
+    let report = isolator.analyze(raw_data, format_hint)
+    return isolator.explain(report)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 14 — NORMS
+// ═══════════════════════════════════════════════════════════════════
+
+/// Cannot assign a fault to a tower without evidence from at least 2
+/// independent analysis dimensions. Prevents single-dimension false positives.
+norm require_evidence_for_fault {
+    type: prohibition,
+    scope: domain("telecom_fault_isolation"),
+    action: "assign_fault_without_multi_dimension_evidence",
+    priority: 95,
+    condition: evidence_dimensions < 2
+}
+
+/// Cannot assign >0.9 confidence to a tower with fewer than 10 events.
+/// Small samples cannot support high-confidence conclusions.
+norm no_high_confidence_without_volume {
+    type: prohibition,
+    scope: domain("telecom_fault_isolation"),
+    action: "assign_high_confidence_low_volume",
+    priority: 90,
+    condition: confidence > 0.9 and tower_events < 10
+}
+
+/// Fault isolation must always use deterministic analysis mode.
+/// Same input data must produce identical output every time.
+norm prefer_deterministic_analysis {
+    type: obligation,
+    scope: domain("telecom_fault_isolation"),
+    action: "use_deterministic_mode",
+    priority: 85,
+    condition: true
+}
+
+/// All fault conclusions must include traceable provenance hashes.
+norm require_provenance_for_conclusions {
+    type: obligation,
+    scope: domain("telecom_fault_isolation"),
+    action: "include_provenance_hash",
+    priority: 88,
+    condition: trust_level != "RAW"
+}
+
+/// Prohibit suppressing alternative hypotheses — transparency requirement.
+norm no_suppression_of_alternatives {
+    type: prohibition,
+    scope: domain("telecom_fault_isolation"),
+    action: "suppress_alternative_hypotheses",
+    priority: 80,
+    condition: alternative_count > 0
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 15 — EXPORTS
+// ═══════════════════════════════════════════════════════════════════
+
+export SignalingEventType, ResultCode, FaultDomain, FaultSeverity, AnalysisDimension
+export SignalingRecord, TowerProfile, EvidenceItem, ChangePoint
+export FaultHypothesis, AnalysisReport
+export AdaptiveParser
+export StatisticalProfiler
+export TemporalAnalyzer
+export SpatialCorrelator
+export SignalingPatternDetector
+export NetworkGraphAnalyzer
+export EvidenceFusion
+export TelecomVerificationGate
+export TelecomFaultIsolator
+export analyze_telecom_data, analyze_and_explain
+export require_evidence_for_fault, no_high_confidence_without_volume
+export prefer_deterministic_analysis, require_provenance_for_conclusions
+export no_suppression_of_alternatives

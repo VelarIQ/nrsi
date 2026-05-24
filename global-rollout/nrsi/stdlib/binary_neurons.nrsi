@@ -1,0 +1,192 @@
+/// NRSI Binary Neurons — PVS-4 binary hypervector neurons.
+///
+/// Full implementation of `nrsip/binary_neurons.py`.
+/// Patent-covered: Binary neuron bank, hypervector pattern matching.
+
+module binary_neurons
+
+/// ---------- Constants ----------
+
+let _DOMAINS = [
+    "general", "language", "vision", "audio", "reasoning",
+    "memory", "motor", "social", "spatial", "temporal"
+]
+
+/// ---------- Data types ----------
+
+type BinaryNeuron {
+    neuron_id: int,
+    domain: string,
+    vector: bytes,
+    activation_count: int
+}
+
+type ActivationResult {
+    active_ids: List[int],
+    similarities: Dict[int, float],
+    domain_signals: Dict[string, int],
+    total_neurons: int,
+    query_hash: string,
+    sparsity: float
+}
+
+/// ---------- ActivationResult helpers ----------
+
+fn activation_result_active_count(ar: ActivationResult) -> int {
+    return len(ar.active_ids)
+}
+
+fn activation_result_signature(ar: ActivationResult) -> string {
+    let sorted_ids = sorted(ar.active_ids)
+    let parts = []
+    for i in sorted_ids {
+        append(parts, str(i))
+    }
+    let sig_data = join(parts, ",")
+    return sha256_hex(sig_data)
+}
+
+/// ---------- BinaryNeuronBank ----------
+
+class BinaryNeuronBank {
+    fn new(self, total_neurons: int, active_k: int, vector_bits: int) {
+        self._total_neurons = total_neurons
+        self._active_k = active_k
+        self._vector_bits = vector_bits
+        self._vector_bytes = (vector_bits + 7) / 8
+        self._neurons = {}
+        self._total_fires = 0
+        self._init_neurons()
+    }
+
+    fn _init_neurons(self) {
+        for i in range(self._total_neurons) {
+            self._neurons[i] = BinaryNeuron {
+                neuron_id: i,
+                domain: _DOMAINS[i % len(_DOMAINS)],
+                vector: b"",
+                activation_count: 0
+            }
+        }
+    }
+
+    fn _compute_vector(self, neuron_id: int) -> bytes {
+        let seed = sha256_bytes("neuron:" + str(neuron_id))
+        let parts = []
+        let counter = 0
+        let remaining = self._vector_bytes
+        while remaining > 0 {
+            let block = sha256_bytes(concat_bytes(seed, int_to_bytes(counter, 4)))
+            let take = min(32, remaining)
+            append(parts, slice_bytes(block, 0, take))
+            remaining -= take
+            counter += 1
+        }
+        return join_bytes(parts)
+    }
+
+    fn encode_query(self, query: string) -> bytes {
+        let seed = sha256_bytes("query:" + query)
+        let parts = []
+        let counter = 0
+        let remaining = self._vector_bytes
+        while remaining > 0 {
+            let block = sha256_bytes(concat_bytes(seed, int_to_bytes(counter, 4)))
+            let take = min(32, remaining)
+            append(parts, slice_bytes(block, 0, take))
+            remaining -= take
+            counter += 1
+        }
+        return join_bytes(parts)
+    }
+
+    fn hamming_similarity(a: bytes, b: bytes) -> float {
+        let distance = 0
+        for i in range(len(a)) {
+            let ba = int(byte_at(a, i))
+            let bb = int(byte_at(b, i))
+            let x = ba
+            let y = bb
+            for _ in range(8) {
+                if x % 2 != y % 2 {
+                    distance += 1
+                }
+                x = x / 2
+                y = y / 2
+            }
+        }
+        return 1.0 - distance / (len(a) * 8)
+    }
+
+    fn fire(self, query: string) -> ActivationResult {
+        self._total_fires += 1
+        let query_vector = self.encode_query(query)
+        let query_hash = sha256_hex(query)
+
+        let candidate_count = min(self._total_neurons, self._active_k * 10)
+        let candidate_set = {}
+        for i in range(candidate_count) {
+            let nid = hex_to_int(
+                slice_string(sha256_hex(query_hash + ":" + str(i)), 0, 8)
+            ) % self._total_neurons
+            candidate_set[nid] = true
+        }
+        let candidates = keys(candidate_set)
+
+        let similarities = {}
+        for nid in candidates {
+            let neuron_vector = self._compute_vector(nid)
+            similarities[nid] = BinaryNeuronBank.hamming_similarity(query_vector, neuron_vector)
+        }
+
+        let sorted_nids = sorted_by_value_desc(similarities)
+        let top_ids = slice_list(sorted_nids, 0, self._active_k)
+
+        let domain_signals = {}
+        let active_similarities = {}
+        for nid in top_ids {
+            let neuron = self._neurons[nid]
+            neuron.activation_count += 1
+            active_similarities[nid] = similarities[nid]
+            let dom = neuron.domain
+            if dom in domain_signals {
+                domain_signals[dom] += 1
+            } else {
+                domain_signals[dom] = 1
+            }
+        }
+
+        return ActivationResult {
+            active_ids: top_ids,
+            similarities: active_similarities,
+            domain_signals: domain_signals,
+            total_neurons: self._total_neurons,
+            query_hash: query_hash,
+            sparsity: 1.0 - (self._active_k / self._total_neurons)
+        }
+    }
+
+    fn stats(self) -> Dict[string, Any] {
+        return {
+            "total_neurons": self._total_neurons,
+            "active_k": self._active_k,
+            "vector_bits": self._vector_bits,
+            "total_fires": self._total_fires
+        }
+    }
+}
+
+/// ---------- Convenience constructors ----------
+
+fn make_neuron_bank() -> BinaryNeuronBank {
+    return BinaryNeuronBank.new(100000, 100, 10000)
+}
+
+fn make_neuron_bank_custom(total_neurons: int, active_k: int, vector_bits: int) -> BinaryNeuronBank {
+    return BinaryNeuronBank.new(total_neurons, active_k, vector_bits)
+}
+
+export BinaryNeuron, ActivationResult
+export activation_result_active_count, activation_result_signature
+export BinaryNeuronBank
+export make_neuron_bank, make_neuron_bank_custom

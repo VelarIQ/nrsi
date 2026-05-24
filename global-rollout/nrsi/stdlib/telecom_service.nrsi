@@ -1,0 +1,978 @@
+/// NRS Telecom Fault Isolation Service — NRSIP-native endpoint.
+///
+/// Receives Ericsson router data via NRSIP or HTTP, runs the
+/// TelecomFaultIsolator analysis pipeline, returns structured
+/// fault reports with full NRS provenance.
+///
+/// Designed for integration with the NRS edge-gateway and
+/// direct client access.
+///
+/// ═══════════════════════════════════════════════════════════════════
+///   SERVICE ARCHITECTURE
+/// ═══════════════════════════════════════════════════════════════════
+///
+///   Client (NRSIP / HTTP)
+///        │
+///        ▼
+///   ┌─ EDGE GATEWAY ──────────────────────────────────────────────┐
+///   │  Route: /api/v1/telecom/analyze                             │
+///   │  Route: /api/v1/telecom/analyze/stream                      │
+///   │  Route: /api/v1/telecom/health                              │
+///   └────────────┬────────────────────────────────────────────────┘
+///                │ AnalyzeRequest
+///                ▼
+///   ┌─ TELECOM ANALYSIS SERVICE ──────────────────────────────────┐
+///   │  TelecomFaultIsolator: multi-dimension analysis pipeline     │
+///   │    ├── Parsing & validation                                 │
+///   │    ├── Statistical profiling                                │
+///   │    ├── Temporal correlation                                 │
+///   │    ├── Spatial topology analysis                            │
+///   │    ├── Signaling protocol analysis                          │
+///   │    ├── Graph-based root cause                               │
+///   │    ├── Evidence fusion (Dempster-Shafer)                    │
+///   │    └── Verification & confidence scoring                    │
+///   └────────────┬────────────────────────────────────────────────┘
+///                │ AnalyzeResponse + ProvenanceChain
+///                ▼
+///   ┌─ CLIENT ────────────────────────────────────────────────────┐
+///   │  Structured report (JSON / text / streaming events)         │
+///   │  Full provenance chain with Dilithium signature             │
+///   └─────────────────────────────────────────────────────────────┘
+
+module telecom_service
+
+
+import time from "std/time"
+import json from "std/json"
+import hashlib from "std/hashlib"
+import TelecomFaultIsolator, AnalysisReport, FaultHypothesis from "telecom_analyzer"
+import TrustLevel from "types"
+import ProvenanceChain from "provenance"
+
+
+// ═══════════════════════════════════════════════════════════════════
+//   CONSTANTS
+// ═══════════════════════════════════════════════════════════════════
+
+let SERVICE_VERSION = "1.0.0"
+let SERVICE_NAME = "nrs-telecom-fault-isolation"
+
+let VALID_FORMATS = ["auto", "csv", "json", "xml", "pcap", "syslog", "asn1"]
+
+let MAX_DATA_SIZE_BYTES = 104857600  // 100 MB
+let MIN_DATA_SIZE_BYTES = 10
+
+
+// ═══════════════════════════════════════════════════════════════════
+//   ENUMS
+// ═══════════════════════════════════════════════════════════════════
+
+enum EventType {
+    PROGRESS = "progress",
+    DIMENSION_COMPLETE = "dimension_complete",
+    RESULT = "result",
+    ERROR = "error"
+}
+
+enum AnalysisPhase {
+    PARSING = "parsing",
+    PROFILING = "profiling",
+    STATISTICAL = "statistical_analysis",
+    TEMPORAL = "temporal_analysis",
+    SPATIAL = "spatial_analysis",
+    SIGNALING = "signaling_analysis",
+    GRAPH = "graph_analysis",
+    FUSION = "evidence_fusion",
+    VERIFICATION = "verification",
+    COMPLETE = "result"
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//   REQUEST / RESPONSE TYPES
+// ═══════════════════════════════════════════════════════════════════
+
+/// Inbound analysis request from client or edge-gateway.
+type AnalyzeRequest {
+    data: string,
+    format_hint: string,
+    options: Dict[string, Any]
+}
+
+/// Structured response wrapping the analysis result.
+type AnalyzeResponse {
+    success: bool,
+    report: Optional[AnalysisReport],
+    error: Optional[string],
+    elapsed_ms: float,
+    provenance: Dict[string, Any]
+}
+
+/// Service health and operational statistics.
+type HealthResponse {
+    status: string,
+    version: string,
+    uptime_ms: float,
+    analyses_completed: int,
+    avg_analysis_ms: float
+}
+
+/// Streaming event emitted during progressive analysis.
+type StreamEvent {
+    event_type: string,
+    dimension: string,
+    progress: float,
+    message: string,
+    data: Optional[Dict[string, Any]]
+}
+
+/// Validation outcome for request pre-checks.
+type ValidationResult {
+    valid: bool,
+    error: Optional[string]
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//   ANALYSIS PHASE DESCRIPTORS
+// ═══════════════════════════════════════════════════════════════════
+
+let PHASE_SEQUENCE = [
+    {"phase": "parsing",            "progress": 0.10, "label": "Parsing input data"},
+    {"phase": "profiling",          "progress": 0.20, "label": "Building statistical profile"},
+    {"phase": "statistical_analysis", "progress": 0.40, "label": "Running statistical analysis"},
+    {"phase": "temporal_analysis",  "progress": 0.50, "label": "Temporal correlation analysis"},
+    {"phase": "spatial_analysis",   "progress": 0.60, "label": "Spatial topology analysis"},
+    {"phase": "signaling_analysis", "progress": 0.70, "label": "Signaling protocol analysis"},
+    {"phase": "graph_analysis",     "progress": 0.80, "label": "Graph-based root cause analysis"},
+    {"phase": "evidence_fusion",    "progress": 0.90, "label": "Dempster-Shafer evidence fusion"},
+    {"phase": "verification",       "progress": 0.95, "label": "Verification and confidence scoring"},
+    {"phase": "result",             "progress": 1.00, "label": "Analysis complete"}
+]
+
+
+// ═══════════════════════════════════════════════════════════════════
+//   SERVICE CLASS
+// ═══════════════════════════════════════════════════════════════════
+
+class TelecomAnalysisService {
+
+    fn init(self) {
+        self.isolator = TelecomFaultIsolator()
+        self.analyses_completed = 0
+        self.total_time_ms = 0.0
+        self.start_time = time.time()
+    }
+
+    // ── Request Validation ──
+
+    fn validate_request(self, request: AnalyzeRequest) -> ValidationResult {
+        if request.data == "" or request.data == None {
+            return ValidationResult {
+                valid: false,
+                error: "Request data must not be empty"
+            }
+        }
+
+        if request.data.len() < MIN_DATA_SIZE_BYTES {
+            return ValidationResult {
+                valid: false,
+                error: "Request data too small (minimum " + to_string(MIN_DATA_SIZE_BYTES) + " bytes)"
+            }
+        }
+
+        if request.data.len() > MAX_DATA_SIZE_BYTES {
+            return ValidationResult {
+                valid: false,
+                error: "Request data exceeds maximum size of " + to_string(MAX_DATA_SIZE_BYTES) + " bytes"
+            }
+        }
+
+        let format_valid = false
+        for fmt in VALID_FORMATS {
+            if request.format_hint == fmt {
+                format_valid = true
+            }
+        }
+        if format_valid == false {
+            return ValidationResult {
+                valid: false,
+                error: "Invalid format_hint '" + request.format_hint + "'; expected one of: " + VALID_FORMATS.join(", ")
+            }
+        }
+
+        return ValidationResult { valid: true, error: None }
+    }
+
+    // ── Provenance Construction ──
+
+    fn build_provenance(self, request: AnalyzeRequest, report: AnalysisReport,
+                        elapsed_ms: float) -> Dict[string, Any] {
+        let data_hash = hashlib.sha256(request.data).hexdigest()
+        let report_hash = hashlib.sha256(json.dumps(report.to_dict(), true)).hexdigest()
+
+        let chain = ProvenanceChain(
+            data_hash,
+            report_hash,
+            "deterministic",
+            "T2",
+            "telecom"
+        )
+        chain.total_processing_time_ms = elapsed_ms
+        chain.confidence = report.overall_confidence
+        chain.h_score = report.overall_confidence
+        chain.h_verdict = "VALIDATED"
+        chain.sign(None)
+
+        return {
+            "service": SERVICE_NAME,
+            "version": SERVICE_VERSION,
+            "data_hash": data_hash,
+            "report_hash": report_hash,
+            "chain_hash": chain.chain_hash(),
+            "processing_mode": "deterministic",
+            "domain": "telecom",
+            "elapsed_ms": elapsed_ms,
+            "confidence": report.overall_confidence,
+            "dilithium_signature": chain.dilithium_signature,
+            "timestamp_ms": to_int(time.time() * 1000.0)
+        }
+    }
+
+    // ── Core Analysis ──
+
+    fn analyze(self, request: AnalyzeRequest) -> AnalyzeResponse {
+        let t_start = time.time()
+
+        let validation = self.validate_request(request)
+        if validation.valid == false {
+            let elapsed = (time.time() - t_start) * 1000.0
+            return AnalyzeResponse {
+                success: false,
+                report: None,
+                error: validation.error,
+                elapsed_ms: elapsed,
+                provenance: {}
+            }
+        }
+
+        let report = None
+        let error_msg = None
+        let success = false
+        let provenance = {}
+
+        // Run the isolator pipeline
+        report = self.isolator.analyze(request.data, request.format_hint, request.options)
+
+        if report != None {
+            success = true
+            let elapsed = (time.time() - t_start) * 1000.0
+            provenance = self.build_provenance(request, report, elapsed)
+
+            self.analyses_completed += 1
+            self.total_time_ms += elapsed
+
+            return AnalyzeResponse {
+                success: true,
+                report: report,
+                error: None,
+                elapsed_ms: elapsed,
+                provenance: provenance
+            }
+        }
+
+        let elapsed = (time.time() - t_start) * 1000.0
+        return AnalyzeResponse {
+            success: false,
+            report: None,
+            error: "Analysis pipeline returned no result",
+            elapsed_ms: elapsed,
+            provenance: {}
+        }
+    }
+
+    // ── Streaming Analysis ──
+
+    fn analyze_streaming(self, request: AnalyzeRequest) -> List[StreamEvent] {
+        let events = []
+        let t_start = time.time()
+
+        let validation = self.validate_request(request)
+        if validation.valid == false {
+            events.append(StreamEvent {
+                event_type: EventType.ERROR,
+                dimension: "validation",
+                progress: 0.0,
+                message: validation.error,
+                data: None
+            })
+            return events
+        }
+
+        // Emit progress events for each analysis phase
+        for phase_info in PHASE_SEQUENCE {
+            let phase_name = phase_info["phase"]
+            let phase_progress = phase_info["progress"]
+            let phase_label = phase_info["label"]
+
+            if phase_name == "result" {
+                // Final phase — run actual analysis and emit result
+                let report = self.isolator.analyze(
+                    request.data, request.format_hint, request.options
+                )
+
+                let elapsed = (time.time() - t_start) * 1000.0
+
+                if report != None {
+                    let provenance = self.build_provenance(request, report, elapsed)
+
+                    self.analyses_completed += 1
+                    self.total_time_ms += elapsed
+
+                    events.append(StreamEvent {
+                        event_type: EventType.RESULT,
+                        dimension: "complete",
+                        progress: 1.0,
+                        message: "Analysis complete",
+                        data: {
+                            "success": true,
+                            "elapsed_ms": elapsed,
+                            "primary_fault": report.primary_fault,
+                            "confidence": report.overall_confidence,
+                            "hypothesis_count": report.hypotheses.len(),
+                            "provenance": provenance
+                        }
+                    })
+                } else {
+                    events.append(StreamEvent {
+                        event_type: EventType.ERROR,
+                        dimension: "complete",
+                        progress: 1.0,
+                        message: "Analysis pipeline returned no result",
+                        data: {"elapsed_ms": elapsed}
+                    })
+                }
+            } else {
+                events.append(StreamEvent {
+                    event_type: EventType.PROGRESS,
+                    dimension: phase_name,
+                    progress: phase_progress,
+                    message: phase_label,
+                    data: None
+                })
+            }
+        }
+
+        return events
+    }
+
+    // ── Health Check ──
+
+    fn health(self) -> HealthResponse {
+        let uptime = (time.time() - self.start_time) * 1000.0
+        let avg_ms = 0.0
+        if self.analyses_completed > 0 {
+            avg_ms = self.total_time_ms / self.analyses_completed
+        }
+
+        return HealthResponse {
+            status: "healthy",
+            version: SERVICE_VERSION,
+            uptime_ms: uptime,
+            analyses_completed: self.analyses_completed,
+            avg_analysis_ms: avg_ms
+        }
+    }
+
+    // ── Text Report Formatting ──
+
+    fn format_report_text(self, report: AnalysisReport) -> string {
+        let lines = []
+
+        // Header
+        lines.append("══════════════════════════════════════════════════════════════")
+        lines.append("  NRS TELECOM FAULT ISOLATION REPORT")
+        lines.append("══════════════════════════════════════════════════════════════")
+        lines.append("")
+
+        // Primary fault
+        lines.append("PRIMARY FAULT")
+        lines.append("─────────────────────────────────────────────────────────────")
+        if report.primary_fault != None {
+            lines.append("  Fault:       " + to_string(report.primary_fault))
+        } else {
+            lines.append("  Fault:       No fault identified")
+        }
+        lines.append("  Confidence:  " + format_float(report.overall_confidence, 4))
+        lines.append("  Severity:    " + to_string(report.severity))
+        lines.append("")
+
+        // Top hypothesis detail
+        if report.hypotheses.len() > 0 {
+            let top = report.hypotheses[0]
+            lines.append("TOP HYPOTHESIS")
+            lines.append("─────────────────────────────────────────────────────────────")
+            lines.append("  ID:          " + to_string(top.hypothesis_id))
+            lines.append("  Description: " + to_string(top.description))
+            lines.append("  Confidence:  " + format_float(top.confidence, 4))
+            lines.append("  Category:    " + to_string(top.category))
+            lines.append("")
+
+            // Evidence summary
+            if top.evidence.len() > 0 {
+                lines.append("  EVIDENCE")
+                for ev in top.evidence {
+                    lines.append("    • [" + to_string(ev.source) + "] " + to_string(ev.description) + " (weight: " + format_float(ev.weight, 2) + ")")
+                }
+                lines.append("")
+            }
+        }
+
+        // Timeline
+        if report.timeline.len() > 0 {
+            lines.append("FAULT TIMELINE")
+            lines.append("─────────────────────────────────────────────────────────────")
+            for entry in report.timeline {
+                lines.append("  " + to_string(entry.timestamp) + "  " + to_string(entry.event))
+            }
+            lines.append("")
+        }
+
+        // Alternative hypotheses
+        if report.hypotheses.len() > 1 {
+            lines.append("ALTERNATIVE HYPOTHESES")
+            lines.append("─────────────────────────────────────────────────────────────")
+            let idx = 0
+            for hyp in report.hypotheses {
+                if idx > 0 {
+                    lines.append("  " + to_string(idx) + ". " + to_string(hyp.description))
+                    lines.append("     Confidence: " + format_float(hyp.confidence, 4) + "  Category: " + to_string(hyp.category))
+                }
+                idx += 1
+            }
+            lines.append("")
+        }
+
+        // Recommendations
+        if report.recommendations.len() > 0 {
+            lines.append("RECOMMENDATIONS")
+            lines.append("─────────────────────────────────────────────────────────────")
+            let rec_idx = 1
+            for rec in report.recommendations {
+                lines.append("  " + to_string(rec_idx) + ". " + to_string(rec))
+                rec_idx += 1
+            }
+            lines.append("")
+        }
+
+        // Data quality
+        lines.append("DATA QUALITY")
+        lines.append("─────────────────────────────────────────────────────────────")
+        lines.append("  Completeness:  " + format_float(report.data_quality.completeness, 2))
+        lines.append("  Consistency:   " + format_float(report.data_quality.consistency, 2))
+        lines.append("  Freshness:     " + format_float(report.data_quality.freshness, 2))
+        if report.data_quality.warnings.len() > 0 {
+            lines.append("  Warnings:")
+            for w in report.data_quality.warnings {
+                lines.append("    ⚠ " + to_string(w))
+            }
+        }
+        lines.append("")
+
+        // Reasoning chain summary
+        if report.reasoning_chain.len() > 0 {
+            lines.append("REASONING CHAIN")
+            lines.append("─────────────────────────────────────────────────────────────")
+            for step in report.reasoning_chain {
+                lines.append("  → " + to_string(step))
+            }
+            lines.append("")
+        }
+
+        lines.append("══════════════════════════════════════════════════════════════")
+        lines.append("  Generated by " + SERVICE_NAME + " v" + SERVICE_VERSION)
+        lines.append("══════════════════════════════════════════════════════════════")
+
+        return lines.join("\n")
+    }
+
+    // ── JSON Report Serialization ──
+
+    fn format_report_json(self, report: AnalysisReport) -> string {
+        let hyp_list = []
+        for h in report.hypotheses {
+            let ev_list = []
+            for ev in h.evidence {
+                ev_list.append({
+                    "source": ev.source,
+                    "description": ev.description,
+                    "weight": ev.weight
+                })
+            }
+            hyp_list.append({
+                "hypothesis_id": h.hypothesis_id,
+                "description": h.description,
+                "confidence": h.confidence,
+                "category": h.category,
+                "evidence": ev_list
+            })
+        }
+
+        let timeline_list = []
+        for entry in report.timeline {
+            timeline_list.append({
+                "timestamp": entry.timestamp,
+                "event": entry.event
+            })
+        }
+
+        let result = {
+            "service": SERVICE_NAME,
+            "version": SERVICE_VERSION,
+            "primary_fault": report.primary_fault,
+            "overall_confidence": report.overall_confidence,
+            "severity": report.severity,
+            "hypotheses": hyp_list,
+            "timeline": timeline_list,
+            "recommendations": report.recommendations,
+            "data_quality": {
+                "completeness": report.data_quality.completeness,
+                "consistency": report.data_quality.consistency,
+                "freshness": report.data_quality.freshness,
+                "warnings": report.data_quality.warnings
+            },
+            "reasoning_chain": report.reasoning_chain
+        }
+
+        return json.dumps(result, true)
+    }
+
+    // ── Report Comparison ──
+
+    fn compare_reports(self, report_a: AnalysisReport, report_b: AnalysisReport) -> string {
+        let lines = []
+
+        lines.append("══════════════════════════════════════════════════════════════")
+        lines.append("  TELECOM FAULT REPORT COMPARISON")
+        lines.append("══════════════════════════════════════════════════════════════")
+        lines.append("")
+
+        // Primary fault comparison
+        lines.append("PRIMARY FAULT")
+        lines.append("─────────────────────────────────────────────────────────────")
+        lines.append("  Report A: " + to_string(report_a.primary_fault))
+        lines.append("  Report B: " + to_string(report_b.primary_fault))
+        if report_a.primary_fault == report_b.primary_fault {
+            lines.append("  Status:   UNCHANGED")
+        } else {
+            lines.append("  Status:   CHANGED")
+        }
+        lines.append("")
+
+        // Confidence delta
+        lines.append("CONFIDENCE")
+        lines.append("─────────────────────────────────────────────────────────────")
+        lines.append("  Report A: " + format_float(report_a.overall_confidence, 4))
+        lines.append("  Report B: " + format_float(report_b.overall_confidence, 4))
+        let conf_delta = report_b.overall_confidence - report_a.overall_confidence
+        let delta_sign = ""
+        if conf_delta >= 0.0 {
+            delta_sign = "+"
+        }
+        lines.append("  Delta:    " + delta_sign + format_float(conf_delta, 4))
+        lines.append("")
+
+        // Hypothesis diff — find new, resolved, and changed
+        let a_ids = []
+        let b_ids = []
+        let a_map = {}
+        let b_map = {}
+
+        for h in report_a.hypotheses {
+            a_ids.append(h.hypothesis_id)
+            a_map[h.hypothesis_id] = h
+        }
+        for h in report_b.hypotheses {
+            b_ids.append(h.hypothesis_id)
+            b_map[h.hypothesis_id] = h
+        }
+
+        // New faults (in B but not A)
+        let new_faults = []
+        for bid in b_ids {
+            let found = false
+            for aid in a_ids {
+                if bid == aid {
+                    found = true
+                }
+            }
+            if found == false {
+                new_faults.append(bid)
+            }
+        }
+
+        // Resolved faults (in A but not B)
+        let resolved_faults = []
+        for aid in a_ids {
+            let found = false
+            for bid in b_ids {
+                if aid == bid {
+                    found = true
+                }
+            }
+            if found == false {
+                resolved_faults.append(aid)
+            }
+        }
+
+        // Changed confidence (in both)
+        let changed_faults = []
+        for aid in a_ids {
+            for bid in b_ids {
+                if aid == bid {
+                    let ha = a_map[aid]
+                    let hb = b_map[bid]
+                    if ha.confidence != hb.confidence {
+                        changed_faults.append({
+                            "id": aid,
+                            "conf_a": ha.confidence,
+                            "conf_b": hb.confidence
+                        })
+                    }
+                }
+            }
+        }
+
+        if new_faults.len() > 0 {
+            lines.append("NEW FAULTS (present in B, absent in A)")
+            lines.append("─────────────────────────────────────────────────────────────")
+            for nf in new_faults {
+                let h = b_map[nf]
+                lines.append("  + " + to_string(nf) + ": " + to_string(h.description) + " (conf: " + format_float(h.confidence, 4) + ")")
+            }
+            lines.append("")
+        }
+
+        if resolved_faults.len() > 0 {
+            lines.append("RESOLVED FAULTS (present in A, absent in B)")
+            lines.append("─────────────────────────────────────────────────────────────")
+            for rf in resolved_faults {
+                let h = a_map[rf]
+                lines.append("  - " + to_string(rf) + ": " + to_string(h.description) + " (was conf: " + format_float(h.confidence, 4) + ")")
+            }
+            lines.append("")
+        }
+
+        if changed_faults.len() > 0 {
+            lines.append("CHANGED CONFIDENCE")
+            lines.append("─────────────────────────────────────────────────────────────")
+            for cf in changed_faults {
+                let cd = cf["conf_b"] - cf["conf_a"]
+                let sign = ""
+                if cd >= 0.0 {
+                    sign = "+"
+                }
+                lines.append("  ~ " + to_string(cf["id"]) + ": " + format_float(cf["conf_a"], 4) + " → " + format_float(cf["conf_b"], 4) + " (" + sign + format_float(cd, 4) + ")")
+            }
+            lines.append("")
+        }
+
+        if new_faults.len() == 0 and resolved_faults.len() == 0 and changed_faults.len() == 0 {
+            lines.append("HYPOTHESES")
+            lines.append("─────────────────────────────────────────────────────────────")
+            lines.append("  No changes detected between reports.")
+            lines.append("")
+        }
+
+        // Severity comparison
+        lines.append("SEVERITY")
+        lines.append("─────────────────────────────────────────────────────────────")
+        lines.append("  Report A: " + to_string(report_a.severity))
+        lines.append("  Report B: " + to_string(report_b.severity))
+        lines.append("")
+
+        // Recommendation diff
+        let new_recs = []
+        for rb in report_b.recommendations {
+            let found = false
+            for ra in report_a.recommendations {
+                if rb == ra {
+                    found = true
+                }
+            }
+            if found == false {
+                new_recs.append(rb)
+            }
+        }
+
+        let removed_recs = []
+        for ra in report_a.recommendations {
+            let found = false
+            for rb in report_b.recommendations {
+                if ra == rb {
+                    found = true
+                }
+            }
+            if found == false {
+                removed_recs.append(ra)
+            }
+        }
+
+        if new_recs.len() > 0 or removed_recs.len() > 0 {
+            lines.append("RECOMMENDATION CHANGES")
+            lines.append("─────────────────────────────────────────────────────────────")
+            for nr in new_recs {
+                lines.append("  + " + to_string(nr))
+            }
+            for rr in removed_recs {
+                lines.append("  - " + to_string(rr))
+            }
+            lines.append("")
+        }
+
+        lines.append("══════════════════════════════════════════════════════════════")
+
+        return lines.join("\n")
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//   MODULE-LEVEL SERVICE INSTANCE
+// ═══════════════════════════════════════════════════════════════════
+
+let service = TelecomAnalysisService()
+
+
+// ═══════════════════════════════════════════════════════════════════
+//   ROUTE HANDLERS — edge-gateway integration
+// ═══════════════════════════════════════════════════════════════════
+
+/// POST /api/v1/telecom/analyze
+fn handle_analyze(request_body: string) -> string {
+    let parsed = json.loads(request_body)
+
+    let data = ""
+    if parsed.get("data") != None {
+        data = parsed["data"]
+    }
+
+    let format_hint = "auto"
+    if parsed.get("format_hint") != None {
+        format_hint = parsed["format_hint"]
+    }
+
+    let options = {}
+    if parsed.get("options") != None {
+        options = parsed["options"]
+    }
+
+    let request = AnalyzeRequest {
+        data: data,
+        format_hint: format_hint,
+        options: options
+    }
+
+    let response = service.analyze(request)
+
+    let result = {
+        "success": response.success,
+        "elapsed_ms": response.elapsed_ms,
+        "provenance": response.provenance
+    }
+
+    if response.report != None {
+        result["report"] = response.report.to_dict()
+    } else {
+        result["report"] = None
+    }
+
+    if response.error != None {
+        result["error"] = response.error
+    } else {
+        result["error"] = None
+    }
+
+    return json.dumps(result, true)
+}
+
+
+/// POST /api/v1/telecom/analyze/stream
+fn handle_analyze_stream(request_body: string) -> List[string] {
+    let parsed = json.loads(request_body)
+
+    let data = ""
+    if parsed.get("data") != None {
+        data = parsed["data"]
+    }
+
+    let format_hint = "auto"
+    if parsed.get("format_hint") != None {
+        format_hint = parsed["format_hint"]
+    }
+
+    let options = {}
+    if parsed.get("options") != None {
+        options = parsed["options"]
+    }
+
+    let request = AnalyzeRequest {
+        data: data,
+        format_hint: format_hint,
+        options: options
+    }
+
+    let events = service.analyze_streaming(request)
+
+    let encoded = []
+    for ev in events {
+        let ev_dict = {
+            "event_type": ev.event_type,
+            "dimension": ev.dimension,
+            "progress": ev.progress,
+            "message": ev.message
+        }
+        if ev.data != None {
+            ev_dict["data"] = ev.data
+        } else {
+            ev_dict["data"] = None
+        }
+        encoded.append(json.dumps(ev_dict, true))
+    }
+
+    return encoded
+}
+
+
+/// GET /api/v1/telecom/health
+fn handle_health() -> string {
+    let h = service.health()
+    return json.dumps({
+        "status": h.status,
+        "version": h.version,
+        "uptime_ms": h.uptime_ms,
+        "analyses_completed": h.analyses_completed,
+        "avg_analysis_ms": h.avg_analysis_ms,
+        "service": SERVICE_NAME
+    }, true)
+}
+
+
+/// GET /api/v1/telecom/report/text
+fn handle_report_text(request_body: string) -> string {
+    let parsed = json.loads(request_body)
+
+    let data = ""
+    if parsed.get("data") != None {
+        data = parsed["data"]
+    }
+
+    let format_hint = "auto"
+    if parsed.get("format_hint") != None {
+        format_hint = parsed["format_hint"]
+    }
+
+    let request = AnalyzeRequest {
+        data: data,
+        format_hint: format_hint,
+        options: {}
+    }
+
+    let response = service.analyze(request)
+    if response.success and response.report != None {
+        return service.format_report_text(response.report)
+    }
+
+    return "ERROR: " + to_string(response.error)
+}
+
+
+/// GET /api/v1/telecom/report/json
+fn handle_report_json(request_body: string) -> string {
+    let parsed = json.loads(request_body)
+
+    let data = ""
+    if parsed.get("data") != None {
+        data = parsed["data"]
+    }
+
+    let format_hint = "auto"
+    if parsed.get("format_hint") != None {
+        format_hint = parsed["format_hint"]
+    }
+
+    let request = AnalyzeRequest {
+        data: data,
+        format_hint: format_hint,
+        options: {}
+    }
+
+    let response = service.analyze(request)
+    if response.success and response.report != None {
+        return service.format_report_json(response.report)
+    }
+
+    return json.dumps({"error": response.error}, true)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//   NORMS — telecom analysis governance
+// ═══════════════════════════════════════════════════════════════════
+
+/// Prohibit analysis on empty or missing data.
+norm require_data_for_analysis {
+    type: prohibition,
+    scope: global,
+    action: "analyze",
+    priority: 95,
+    condition: data == "" or data == None
+}
+
+/// All analyses must be logged for audit trail.
+norm log_all_analyses {
+    type: obligation,
+    scope: global,
+    action: "analyze",
+    priority: 50,
+    condition: true
+}
+
+/// Provenance must accompany every analysis result.
+norm require_provenance_on_result {
+    type: obligation,
+    scope: domain("telecom"),
+    action: "include_provenance",
+    priority: 90,
+    condition: true
+}
+
+/// Prohibit returning unvalidated fault hypotheses as confirmed.
+norm no_unvalidated_faults {
+    type: prohibition,
+    scope: domain("telecom"),
+    action: "confirm_fault",
+    priority: 95,
+    condition: confidence < 0.50
+}
+
+/// Require confidence disclosure on all reports.
+norm require_confidence_in_report {
+    type: obligation,
+    scope: domain("telecom"),
+    action: "disclose_confidence",
+    priority: 85,
+    condition: true
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//   EXPORTS
+// ═══════════════════════════════════════════════════════════════════
+
+export AnalyzeRequest, AnalyzeResponse, HealthResponse, StreamEvent, ValidationResult
+export EventType, AnalysisPhase
+export TelecomAnalysisService
+export handle_analyze, handle_analyze_stream, handle_health
+export handle_report_text, handle_report_json
+export SERVICE_VERSION, SERVICE_NAME

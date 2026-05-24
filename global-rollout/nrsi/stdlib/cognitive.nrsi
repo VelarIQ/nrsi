@@ -1,0 +1,53 @@
+/// NRSI Cognitive Primitives -- AGI Gap-Closing Operations
+///
+/// This module exposes the 5 NRSI-native cognitive primitives that close
+/// remaining AGI gaps without external ML frameworks:
+///
+///   compose           -- compositional synthesis from knowledge fragments
+///   persist           -- persistent belief store with decay and reinforcement
+///   semantic_distance -- graph-based meaning similarity (expression-level)
+///   decompose         -- recursive goal decomposition (expression-level)
+///   intent_match      -- semantic pattern matching (expression-level)
+
+module cognitive
+
+// Compositional synthesis from knowledge fragments
+
+compose synthesis_demo from knowledge_base, web_facts {
+    strategy: "synthesis"
+    provenance: "epistemic"
+    domain: "science"
+}
+
+// Persistent belief store with decay and reinforcement
+
+persist learned_facts {
+    decay: 0.01
+    reinforcement: 0.1
+    conflict_resolution: "revision"
+    backing: "memory"
+}
+
+// Semantic distance (expression-level, used in let bindings)
+
+fn check_similarity(a: string, b: string) -> float {
+    let sim = semantic_distance(a, b)
+    return sim
+}
+
+// Goal decomposition (expression-level)
+
+fn plan_goal(query: string) -> string {
+    let plan = decompose(query)
+    return plan
+}
+
+// Intent matching (expression-level)
+
+fn classify_intent(query: string, beliefs: string) -> string {
+    let intent = intent_match(query, beliefs)
+    return intent
+}
+
+export synthesis_demo, learned_facts
+export check_similarity, plan_goal, classify_intent

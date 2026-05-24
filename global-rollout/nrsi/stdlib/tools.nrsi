@@ -1,0 +1,103 @@
+/// NRSI Tool Framework — Schema-Validated Tool Execution with Trust
+///
+/// Each tool has:
+///   - Input schema (Pydantic-backed, declared here as NRSI types)
+///   - Two-phase validation: schema parse → domain validateInput
+///   - Permission gates using NRSI validation
+///   - Capability flags: concurrent_safe, read_only, destructive
+///   - H-Score tracking on every tool call output
+
+module tools
+
+import TrustLevel, NRSIData, EpistemicType from "types"
+import factual_verify from "gates"
+
+/// ---------- Tool Capability Flags ----------
+
+enum ToolCapability {
+    CONCURRENT_SAFE,
+    READ_ONLY,
+    DESTRUCTIVE,
+    NETWORK,
+    FILE_SYSTEM,
+    CODE_EXECUTION
+}
+
+/// ---------- Permission Verdicts ----------
+
+enum PermissionVerdict {
+    ALLOW,
+    DENY,
+    ASK
+}
+
+/// ---------- Tool Use Context ----------
+
+type ToolUseContext {
+    session_id: string,
+    user_id: string,
+    domain: string,
+    tier: string,
+    working_directory: string,
+    max_execution_time_s: float
+}
+
+/// ---------- Tool Result ----------
+
+type ToolResult {
+    output: string,
+    is_error: bool,
+    error_message: string,
+    execution_time_ms: float,
+    h_score: float,
+    trust_level: TrustLevel
+}
+
+/// ---------- Tool Validation Gate ----------
+/// Two-phase: schema validation then domain validation
+
+gate tool_input_verify(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.50
+    validate schema_parse
+    validate domain_check
+}
+
+/// ---------- Tool Permission Gate ----------
+
+gate tool_permission_check(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain != "unknown"
+    validate capability_allowed
+    validate path_permitted
+    validate rate_limit_ok
+}
+
+/// ---------- Tool Output Gate ----------
+/// Validates tool output before returning to the cognitive loop
+
+gate tool_output_verify(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.40
+    validate output_not_empty
+    validate no_error_state
+    validate h_score_attached
+}
+
+/// ---------- Tool Execution Pipeline ----------
+
+fn validate_tool_input(tool_name: string, input: string) -> validated[NRSIData] {
+    let data = raw(input, "tool_input")
+    return tool_input_verify(data)
+}
+
+fn check_tool_permission(tool_name: string, context: string) -> validated[NRSIData] {
+    let data = raw(context, "tool_permission")
+    return tool_permission_check(data)
+}
+
+fn validate_tool_output(output: string) -> validated[NRSIData] {
+    let data = raw(output, "tool_output")
+    return tool_output_verify(data)
+}
+
+export ToolCapability, PermissionVerdict, ToolUseContext, ToolResult
+export tool_input_verify, tool_permission_check, tool_output_verify
+export validate_tool_input, check_tool_permission, validate_tool_output

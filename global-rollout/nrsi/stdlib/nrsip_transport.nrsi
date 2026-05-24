@@ -1,0 +1,493 @@
+/// NRSIP Transport Pipeline — full serving-path enforcement.
+///
+/// Full implementation of `nrsip/nrsip_transport.py`.
+/// Patent coverage: NRS-5 Claims 1-7, Cont. A Claims 1-10, Cont. C Claims 1-8.
+
+module nrsip_transport
+
+
+import time from "std/time"
+import uuid from "std/uuid"
+import HopRecord, Message, NRSIPHeader, PaymentHeader,
+       PaymentType, QoSPriority, ValidationTier from "nrsip_messages"
+import KeyResolver, compute_hop_hash, sign_envelope, sign_hop,
+       sign_payment_proof, verify_envelope, verify_hop_chain,
+       verify_payment_proof from "nrsip_signing"
+
+/// ---------- Result types ----------
+
+enum Verdict {
+    ACCEPT,
+    REJECT
+}
+
+type TransportResult {
+    verdict: Verdict,
+    reason: string,
+    message: Optional[Message],
+    evidence: Dict[string, Any]
+}
+
+fn transport_result_accepted(tr: TransportResult) -> bool {
+    return tr.verdict == Verdict.ACCEPT
+}
+
+/// ---------- Access policy (NRS-5 Claim 6) ----------
+
+type AccessPolicy {
+    banned_identities: Set[string],
+    banned_ips: Set[string],
+    quarantined_identities: Set[string],
+    quarantined_ips: Set[string],
+    reputation: Dict[string, float],
+    min_reputation: float,
+    degrade_reputation: float
+}
+
+fn default_access_policy() -> AccessPolicy {
+    return AccessPolicy {
+        banned_identities: {},
+        banned_ips: {},
+        quarantined_identities: {},
+        quarantined_ips: {},
+        reputation: {},
+        min_reputation: 0.20,
+        degrade_reputation: 0.35
+    }
+}
+
+fn access_policy_check(policy: AccessPolicy, signer_id: string, source_ip: string) -> Tuple[bool, string] {
+    if signer_id in policy.banned_identities {
+        return (false, "identity banned")
+    }
+    if source_ip != "" and source_ip in policy.banned_ips {
+        return (false, "source IP banned")
+    }
+    if signer_id in policy.quarantined_identities {
+        return (false, "identity quarantined")
+    }
+    if source_ip != "" and source_ip in policy.quarantined_ips {
+        return (false, "source IP quarantined")
+    }
+    let rep = get_or_default(policy.reputation, signer_id, 0.5)
+    if rep < policy.min_reputation {
+        return (false, "reputation too low (" + format_float(rep, 2) + ")")
+    }
+    return (true, "access policy passed")
+}
+
+fn access_policy_should_degrade_qos(policy: AccessPolicy, signer_id: string) -> bool {
+    let rep = get_or_default(policy.reputation, signer_id, 0.5)
+    return rep < policy.degrade_reputation
+}
+
+/// ---------- QoS Scheduling Queue (Cont. A Claims 4-6) ----------
+
+type _QueueEntry {
+    neg_priority: int,
+    sequence: int,
+    arrival_seq: int,
+    message: Message
+}
+
+class QoSScheduler {
+    fn new(self, window_seconds: float) {
+        self._heap = []
+        self._arrival_counter = 0
+        self._window_seconds = window_seconds
+        self._window_open_at = None
+    }
+
+    fn window_seconds(self) -> float {
+        return self._window_seconds
+    }
+
+    fn enqueue(self, msg: Message, now: Optional[float]) {
+        if now == None {
+            now = time.time()
+        }
+        if self._window_open_at == None {
+            self._window_open_at = now
+        }
+        let entry = _QueueEntry {
+            neg_priority: -int(msg.header.qos),
+            sequence: msg.header.sequence,
+            arrival_seq: self._arrival_counter,
+            message: msg
+        }
+        self._arrival_counter += 1
+        heap_push(self._heap, entry)
+    }
+
+    fn dequeue(self, now: Optional[float]) -> Optional[Message] {
+        if len(self._heap) == 0 {
+            return None
+        }
+        if now == None {
+            now = time.time()
+        }
+        if self._window_seconds > 0 and self._window_open_at != None {
+            if (now - self._window_open_at) < self._window_seconds {
+                return None
+            }
+        }
+        let entry = heap_pop(self._heap)
+        if len(self._heap) == 0 {
+            self._window_open_at = None
+        }
+        return entry.message
+    }
+
+    fn dequeue_batch(self, now: Optional[float]) -> List[any] {
+        let result = []
+        while true {
+            let msg = self.dequeue(now)
+            if msg == None {
+                break
+            }
+            append(result, msg)
+        }
+        return result
+    }
+
+    fn flush(self) -> List[any] {
+        self._window_open_at = None
+        let ordered = sorted(self._heap)
+        let result = []
+        for e in ordered {
+            append(result, e.message)
+        }
+        self._heap = []
+        self._arrival_counter = 0
+        return result
+    }
+
+    fn size(self) -> int {
+        return len(self._heap)
+    }
+}
+
+/// ---------- Nonce ledger (replay prevention) ----------
+
+class NonceLedger {
+    fn new(self, ttl_seconds: float) {
+        self._seen = {}
+        self._ttl = ttl_seconds
+    }
+
+    fn _purge_expired(self, now: Optional[float]) {
+        if now == None {
+            now = time.time()
+        }
+        let cutoff = now - self._ttl
+        let expired = []
+        for k in keys(self._seen) {
+            if self._seen[k] < cutoff {
+                append(expired, k)
+            }
+        }
+        for k in expired {
+            delete(self._seen, k)
+        }
+    }
+
+    fn is_replay(self, nonce: string) -> bool {
+        self._purge_expired(None)
+        return nonce in self._seen
+    }
+
+    fn record(self, nonce: string) {
+        self._seen[nonce] = time.time()
+    }
+
+    fn clear(self) {
+        self._seen = {}
+    }
+}
+
+/// ---------- Transport Pipeline (NRS-5 Claim 7, Cont. A Claim 10) ----------
+
+class TransportPipeline {
+    fn new(self, node_id: string, node_key_id: string, signing_key: string,
+           key_resolver: KeyResolver, supported_tiers: Set[ValidationTier],
+           access_policy: Optional[AccessPolicy], scheduler: Optional[QoSScheduler],
+           payment_hook: Optional[Callable]) {
+        self.node_id = node_id
+        self.node_key_id = node_key_id
+        self.signing_key = signing_key
+        self.key_resolver = key_resolver
+        self.supported_tiers = supported_tiers
+        if access_policy != None {
+            self.access_policy = access_policy
+        } else {
+            self.access_policy = default_access_policy()
+        }
+        if scheduler != None {
+            self.scheduler = scheduler
+        } else {
+            self.scheduler = QoSScheduler.new(0.0)
+        }
+        self.payment_hook = payment_hook
+        self.nonce_ledger = NonceLedger.new(3600.0)
+        self._audit_log = []
+    }
+
+    fn receive(self, msg: Message, source_ip: string) -> TransportResult {
+        let evidence = {
+            "message_id": msg.message_id,
+            "node_id": self.node_id,
+            "stages": []
+        }
+
+        fn _stage(name: string, ok: bool, detail: string) {
+            append(evidence["stages"], {"stage": name, "ok": ok, "detail": detail})
+        }
+
+        /// 1. Envelope signature verification (NRS-5 Claim 1)
+        let env_key = self._resolve_envelope_key(msg)
+        let sig_ok = verify_envelope(msg, env_key)
+        if sig_ok {
+            _stage("envelope_signature", true, "")
+        } else {
+            _stage("envelope_signature", false, "signature invalid")
+        }
+        if !sig_ok {
+            return self._reject("envelope signature verification failed", msg, evidence)
+        }
+
+        /// 2. Hop-chain validation (NRS-5 Claims 2-5)
+        if len(msg.hops) > 0 {
+            let chain_result = verify_hop_chain(msg.hops, self.key_resolver, msg.message_id)
+            let chain_ok = chain_result[0]
+            let chain_reason = chain_result[1]
+            _stage("hop_chain", chain_ok, chain_reason)
+            if !chain_ok {
+                return self._reject("hop-chain: " + chain_reason, msg, evidence)
+            }
+        } else {
+            _stage("hop_chain", true, "no prior hops (origin message)")
+        }
+
+        /// 3. Access policy (NRS-5 Claim 6)
+        let policy_result = access_policy_check(self.access_policy, msg.signer_id, source_ip)
+        let policy_ok = policy_result[0]
+        let policy_reason = policy_result[1]
+        _stage("access_policy", policy_ok, policy_reason)
+        if !policy_ok {
+            return self._reject("access policy: " + policy_reason, msg, evidence)
+        }
+        if access_policy_should_degrade_qos(self.access_policy, msg.signer_id) {
+            msg.header.qos = QoSPriority.BULK
+        }
+
+        /// 4. TTL enforcement (Cont. A Claims 2-3)
+        let ttl_result = self._enforce_ttl(msg)
+        let ttl_ok = ttl_result[0]
+        let ttl_reason = ttl_result[1]
+        _stage("ttl", ttl_ok, ttl_reason)
+        if !ttl_ok {
+            return self._reject("TTL: " + ttl_reason, msg, evidence)
+        }
+
+        /// 5. Tier gating (Cont. A Claims 7-9)
+        let tier_result = self._enforce_tier_gate(msg)
+        let tier_ok = tier_result[0]
+        let tier_reason = tier_result[1]
+        _stage("tier_gate", tier_ok, tier_reason)
+        if !tier_ok {
+            return self._reject("tier gate: " + tier_reason, msg, evidence)
+        }
+
+        /// 6. Payment enforcement (Cont. C Claims 1-8)
+        let pay_result = self._enforce_payment(msg)
+        let pay_ok = pay_result[0]
+        let pay_reason = pay_result[1]
+        _stage("payment", pay_ok, pay_reason)
+        if !pay_ok {
+            return self._reject("payment: " + pay_reason, msg, evidence)
+        }
+
+        /// 7. Append hop for this node (NRS-5 Claim 2)
+        self._append_hop(msg)
+        _stage("hop_append", true, "hop " + str(len(msg.hops) - 1) + " appended")
+
+        /// 8. QoS scheduling (Cont. A Claims 4-6)
+        self.scheduler.enqueue(msg, None)
+        _stage("qos_enqueue", true, "priority=" + qos_name(msg.header.qos))
+
+        let result = TransportResult {
+            verdict: Verdict.ACCEPT,
+            reason: "message accepted",
+            message: msg,
+            evidence: evidence
+        }
+        self._record_audit(result)
+        return result
+    }
+
+    fn next_scheduled(self, now: Optional[float]) -> Optional[Message] {
+        return self.scheduler.dequeue(now)
+    }
+
+    fn drain_scheduled(self, now: Optional[float]) -> List[any] {
+        return self.scheduler.dequeue_batch(now)
+    }
+
+    fn audit_log(self) -> List[any] {
+        return list_copy(self._audit_log)
+    }
+
+    fn _resolve_envelope_key(self, msg: Message) -> string {
+        let key = self.key_resolver.resolve(msg.signer_id, msg.key_id)
+        if key == None {
+            return self.signing_key
+        }
+        return key
+    }
+
+    fn _enforce_ttl(self, msg: Message) -> Tuple[bool, string] {
+        if msg.header.ttl <= 0 {
+            return (false, "TTL exhausted (<=0)")
+        }
+        msg.header.ttl -= 1
+        return (true, "TTL decremented to " + str(msg.header.ttl))
+    }
+
+    fn _enforce_tier_gate(self, msg: Message) -> Tuple[bool, string] {
+        let dest = msg.header.destination_validation_tier
+        if dest not in self.supported_tiers {
+            let supported_names = []
+            for t in sorted(self.supported_tiers) {
+                append(supported_names, tier_name(t))
+            }
+            return (false,
+                "destination tier " + tier_name(dest) + " not supported "
+                + "(supported: " + str(supported_names) + ")")
+        }
+        return (true, "tier " + tier_name(dest) + " supported")
+    }
+
+    fn _enforce_payment(self, msg: Message) -> Tuple[bool, string] {
+        if msg.payment == None {
+            return (true, "no payment required")
+        }
+        let pay = msg.payment
+
+        let proof_key = self.key_resolver.resolve(msg.signer_id, pay.proof_key_id)
+        if proof_key == None {
+            proof_key = self.signing_key
+        }
+        if !verify_payment_proof(pay, proof_key) {
+            return (false, "payment proof signature invalid")
+        }
+
+        if pay.payer_address != "" and pay.payer_address != msg.signer_id {
+            return (false, "payer_address does not match signer_id")
+        }
+
+        if self.nonce_ledger.is_replay(pay.nonce) {
+            return (false, "payment nonce replay detected")
+        }
+        self.nonce_ledger.record(pay.nonce)
+
+        if self.payment_hook != None {
+            let hook_result = self.payment_hook(msg)
+            let hook_ok = hook_result[0]
+            let hook_reason = hook_result[1]
+            if !hook_ok {
+                return (false, "payment hook: " + hook_reason)
+            }
+        }
+        return (true, "payment verified")
+    }
+
+    fn _append_hop(self, msg: Message) {
+        let prev_hash = ""
+        if len(msg.hops) > 0 {
+            prev_hash = msg.hops[len(msg.hops) - 1].hop_hash
+        }
+        let hop = HopRecord {
+            hop_index: len(msg.hops),
+            node_id: self.node_id,
+            key_id: self.node_key_id,
+            prev_hop_hash: prev_hash,
+            message_id: msg.message_id,
+            decision: "recv",
+            confidence: None,
+            latency_ms: None,
+            hop_hash: "",
+            signature: ""
+        }
+        sign_hop(hop, self.signing_key)
+        append(msg.hops, hop)
+    }
+
+    fn _reject(self, reason: string, msg: Message, evidence: Dict[string, Any]) -> TransportResult {
+        let result = TransportResult {
+            verdict: Verdict.REJECT,
+            reason: reason,
+            message: msg,
+            evidence: evidence
+        }
+        self._record_audit(result)
+        return result
+    }
+
+    fn _record_audit(self, result: TransportResult) {
+        let msg_id = None
+        if result.message != None {
+            msg_id = result.message.message_id
+        }
+        append(self._audit_log, {
+            "timestamp": time.time(),
+            "message_id": msg_id,
+            "verdict": verdict_value(result.verdict),
+            "reason": result.reason,
+            "evidence": result.evidence
+        })
+    }
+}
+
+/// ---------- Convenience: message builder ----------
+
+fn build_signed_message(
+    signer_id: string, key_id: string, signing_key: string,
+    message_type: string, payload: Optional[Dict[string, Any]],
+    qos: QoSPriority, ttl: int, sequence: int,
+    source_tier: ValidationTier, dest_tier: ValidationTier,
+    payment: Optional[PaymentHeader]
+) -> Message {
+    if payload == None {
+        payload = {}
+    }
+    let msg = Message {
+        message_id: uuid.uuid4().hex,
+        message_type: message_type,
+        payload: payload,
+        signer_id: signer_id,
+        key_id: key_id,
+        signature: "",
+        header: NRSIPHeader {
+            version: 1,
+            flags: 0,
+            ttl: ttl,
+            sequence: sequence,
+            qos: qos,
+            source_validation_tier: source_tier,
+            destination_validation_tier: dest_tier
+        },
+        payment: payment,
+        hops: [],
+        created_at: time.time()
+    }
+    if payment != None and payment.proof_signature == "" {
+        payment.proof_signature = sign_payment_proof(payment, signing_key)
+    }
+    msg.signature = sign_envelope(msg, signing_key)
+    return msg
+}
+
+export Verdict, TransportResult, transport_result_accepted
+export AccessPolicy, default_access_policy, access_policy_check, access_policy_should_degrade_qos
+export QoSScheduler, NonceLedger, TransportPipeline
+export build_signed_message

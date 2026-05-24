@@ -1,0 +1,953 @@
+/// NRSIP Media & Streaming Pipeline.
+///
+/// Seven modalities: text, image, video, audio, document, 3D mesh, sensor.
+///
+/// Three-Plane Architecture:
+///   CONTROL PLANE (NRSIP): 128–160 byte routing packets
+///   DATA PLANE (storage):  bulk media at rest (S3/GCS/Azure Blob)
+///   STREAM PLANE (live):   SRT/RTMP ingest → ABR → HLS/DASH → CDN
+///
+/// Raw media NEVER crosses NRSIP. Only 160-byte MediaRoutingPacket is transmitted.
+///
+/// Patent-covered: Media pipeline, 7 modalities, stream plane, MediaDigest.
+/// Ported from nrsip/media_pipeline.py.
+
+module media_pipeline
+
+
+import time from "std/time"
+import log from "logging"
+import hashlib from "std/hashlib"
+import struct from "std/struct"
+import math from "std/math"
+
+/// ── Modality Types ──
+
+enum Modality {
+    TEXT = "text",
+    IMAGE = "image",
+    VIDEO = "video",
+    AUDIO = "audio",
+    DOCUMENT = "document",
+    MESH_3D = "3d_mesh",
+    SENSOR = "sensor"
+}
+
+enum MediaBackendMode {
+    SIMULATED = "simulated",
+    ADAPTER = "adapter"
+}
+
+let MODALITY_SPECS = {
+    "text": {
+        "max_size_mb": 10, "compression": "utf-8",
+        "validation_rps": 6433, "raw_size_avg": 200,
+        "feature_dim": 768, "gpu_ms": 2
+    },
+    "image": {
+        "max_size_mb": 100, "compression": "webp/avif",
+        "validation_rps": 500, "raw_size_avg": 5000000,
+        "feature_dim": 768, "gpu_ms": 15
+    },
+    "video": {
+        "max_size_mb": 10000, "compression": "h265/av1",
+        "validation_rps": 0.25, "raw_size_avg": 150000000,
+        "feature_dim": 768, "gpu_ms": 200
+    },
+    "audio": {
+        "max_size_mb": 500, "compression": "opus/flac",
+        "validation_rps": 10, "raw_size_avg": 1500000,
+        "feature_dim": 768, "gpu_ms": 50
+    },
+    "document": {
+        "max_size_mb": 200, "compression": "zstd",
+        "validation_rps": 100, "raw_size_avg": 10000000,
+        "feature_dim": 768, "gpu_ms": 100
+    },
+    "3d_mesh": {
+        "max_size_mb": 1000, "compression": "draco",
+        "validation_rps": 50, "raw_size_avg": 50000000,
+        "feature_dim": 768, "gpu_ms": 300
+    },
+    "sensor": {
+        "max_size_mb": 50, "compression": "protobuf",
+        "validation_rps": 1000, "raw_size_avg": 500000,
+        "feature_dim": 768, "gpu_ms": 10
+    }
+}
+
+/// ── Content Reference (Data-Plane Pointer) ──
+
+type ContentRef {
+    content_hash: string,
+    modality: Modality,
+    size_bytes: int,
+    storage_uri: string,
+    cached_locally: bool
+}
+
+fn content_ref_wire_size() -> int { return 32 }
+
+fn content_ref_from_raw(raw_bytes: bytes, modality: Modality) -> ContentRef {
+    let content_hash = hashlib.sha256(to_hex(raw_bytes)).hexdigest()
+    return ContentRef {
+        content_hash: content_hash,
+        modality: modality,
+        size_bytes: raw_bytes.len(),
+        storage_uri: "",
+        cached_locally: true
+    }
+}
+
+/// ── Media Entity ──
+
+type MediaEntity {
+    entity_type: string,
+    label: string,
+    confidence: float,
+    bounding_box: Optional[Map[string, float]],
+    timestamp_ms: Optional[int]
+}
+
+type MediaFeature {
+    feature_type: string,
+    value: any,
+    confidence: float
+}
+
+/// ── Media Digest ──
+
+type MediaDigest {
+    modality: Modality,
+    content_ref: ContentRef,
+    feature_embedding: List[float],
+    entities: Map[string, any],
+    extracted_text: string,
+    metadata: Map[string, any],
+    extraction_time_ms: float,
+    created_at: float,
+    digest_id: string,
+    content_size_bytes: int,
+    domain: string,
+    language: string,
+    instance_id: string
+}
+
+fn digest_content_hash(d: MediaDigest) -> string {
+    return d.content_ref.content_hash
+}
+
+fn digest_estimated_bytes(d: MediaDigest) -> int {
+    return d.feature_embedding.len() * 4 + 1024
+}
+
+fn digest_has_text_path(d: MediaDigest) -> bool {
+    return d.extracted_text.len() > 0
+}
+
+fn digest_to_query_embedding(d: MediaDigest) -> List[any] {
+    return d.feature_embedding
+}
+
+fn digest_to_routing_metadata(d: MediaDigest) -> any {
+    return {
+        "modality": d.modality.value,
+        "content_hash": d.content_ref.content_hash.slice(0, 32),
+        "content_size": d.content_ref.size_bytes,
+        "entity_count": d.entities.len(),
+        "domain": d.domain
+    }
+}
+
+/// ── Media Processor ──
+
+class MediaProcessor {
+    fn init(self, embedding_dim: int, feature_extractor: Optional[any],
+            entity_extractor: Optional[any], text_extractor: Optional[any]) {
+        self.embedding_dim = embedding_dim
+        self._feature_extractor = feature_extractor
+        self._entity_extractor = entity_extractor
+        self._text_extractor = text_extractor
+        self._backend_mode = MediaBackendMode.SIMULATED
+        if feature_extractor != nil || entity_extractor != nil || text_extractor != nil {
+            self._backend_mode = MediaBackendMode.ADAPTER
+        }
+        self._processed = 0
+        self._bytes_processed = 0
+        self._bytes_output = 0
+    }
+
+    fn process(self, raw_bytes: bytes, modality: Modality,
+               metadata: Optional[Map[string, any]]) -> MediaDigest {
+        let t0 = time.time()
+        let content_ref = content_ref_from_raw(raw_bytes, modality)
+        let embedding = self._extract_features(raw_bytes, modality)
+        let entities = self._detect_entities(raw_bytes, modality)
+        let extracted_text = self._extract_text(raw_bytes, modality)
+        let elapsed_ms = (time.time() - t0) * 1000.0
+
+        self._processed += 1
+        self._bytes_processed += raw_bytes.len()
+
+        let md = metadata
+        if md == nil { md = {} }
+        md["backend_mode"] = self._backend_mode.value
+
+        let digest = MediaDigest {
+            modality: modality,
+            content_ref: content_ref,
+            feature_embedding: embedding,
+            entities: entities,
+            extracted_text: extracted_text,
+            metadata: md,
+            extraction_time_ms: elapsed_ms,
+            created_at: time.time(),
+            digest_id: "",
+            content_size_bytes: content_ref.size_bytes,
+            domain: "general",
+            language: "en",
+            instance_id: ""
+        }
+        self._bytes_output += digest_estimated_bytes(digest)
+        return digest
+    }
+
+    fn _extract_features(self, raw: bytes, modality: Modality) -> List[any] {
+        if self._feature_extractor != nil {
+            let extracted = self._feature_extractor(raw, modality)
+            if extracted.len() != self.embedding_dim {
+                raise "feature_extractor must return " + to_string(self.embedding_dim) +
+                      " floats; got " + to_string(extracted.len())
+            }
+            return extracted
+        }
+
+        let h = hashlib.sha256(to_hex(raw)).digest()
+        let embedding = []
+        for i in range(0, self.embedding_dim) {
+            let chunk = hashlib.sha256(to_hex(h) + ":" + to_string(i)).digest()
+            let val = to_float(struct.unpack(">I", chunk.slice(0, 4))[0]) / 4294967295.0
+            embedding.append(val * 2.0 - 1.0)
+        }
+
+        let norm = 0.0
+        for x in embedding { norm += x * x }
+        norm = pow(norm, 0.5)
+        if norm > 0.0 {
+            let normalized = []
+            for x in embedding {
+                normalized.append(x / norm)
+            }
+            return normalized
+        }
+        return embedding
+    }
+
+    fn _detect_entities(self, raw: bytes, modality: Modality) -> any {
+        if self._entity_extractor != nil {
+            return self._entity_extractor(raw, modality)
+        }
+        let h = hashlib.sha256(to_hex(raw)).hexdigest()
+
+        if modality == Modality.IMAGE {
+            return {
+                "objects": self._sim_objects(h, 3),
+                "scene": self._sim_label(h, "scene",
+                    [ "indoor", "outdoor", "medical", "document",
+                        "satellite", "microscopy", "portrait", "landscape" ]),
+                "faces_count": hex_to_int(h.slice(0, 1)) % 5,
+                "has_text": hex_to_int(h.slice(1, 2)) > 8
+            }
+        }
+        if modality == Modality.VIDEO {
+            return {
+                "keyframe_count": max(1, hex_to_int(h.slice(0, 2)) % 60),
+                "scenes": self._sim_objects(h, 2),
+                "actions": self._sim_objects(h, 2),
+                "has_speech": hex_to_int(h.slice(2, 3)) > 4
+            }
+        }
+        if modality == Modality.AUDIO {
+            return {
+                "has_speech": hex_to_int(h.slice(0, 1)) > 3,
+                "speaker_count": hex_to_int(h.slice(1, 2)) % 4 + 1,
+                "language": self._sim_label(h, "lang",
+                    [ "en", "es", "fr", "de", "zh", "ar", "ja" ]),
+                "duration_sec": hex_to_int(h.slice(2, 4)) % 300 + 1
+            }
+        }
+        if modality == Modality.DOCUMENT {
+            return {
+                "pages": max(1, hex_to_int(h.slice(0, 2)) % 50),
+                "tables": hex_to_int(h.slice(2, 3)) % 5,
+                "figures": hex_to_int(h.slice(3, 4)) % 8,
+                "has_ocr_text": true,
+                "doc_type": self._sim_label(h, "doctype",
+                    [ "report", "invoice", "contract", "letter",
+                        "manual", "form", "research_paper", "spreadsheet" ])
+            }
+        }
+        if modality == Modality.MESH_3D {
+            return {
+                "vertices": hex_to_int(h.slice(0, 4)) % 1000000 + 100,
+                "faces": hex_to_int(h.slice(4, 8)) % 500000 + 50,
+                "watertight": hex_to_int(h.slice(8, 9)) > 8
+            }
+        }
+        if modality == Modality.SENSOR {
+            return {
+                "channels": hex_to_int(h.slice(0, 1)) % 8 + 1,
+                "sample_rate_hz": [ 100, 500, 1000, 5000 ][hex_to_int(h.slice(1, 2)) % 4],
+                "anomalies_detected": hex_to_int(h.slice(2, 3)) % 3,
+                "duration_sec": hex_to_int(h.slice(3, 5)) % 3600 + 1
+            }
+        }
+        return {}
+    }
+
+    fn _extract_text(self, raw: bytes, modality: Modality) -> string {
+        if self._text_extractor != nil {
+            return self._text_extractor(raw, modality)
+        }
+        let h = hashlib.sha256(to_hex(raw)).hexdigest()
+        if modality == Modality.IMAGE {
+            if hex_to_int(h.slice(1, 2)) > 8 {
+                return "[OCR: extracted text from image " + h.slice(0, 8) + "]"
+            }
+        }
+        if modality == Modality.AUDIO {
+            if hex_to_int(h.slice(0, 1)) > 3 {
+                return "[ASR: transcribed speech from audio " + h.slice(0, 8) + "]"
+            }
+        }
+        if modality == Modality.VIDEO {
+            if hex_to_int(h.slice(2, 3)) > 4 {
+                return "[ASR: transcribed speech from video " + h.slice(0, 8) + "]"
+            }
+        }
+        if modality == Modality.DOCUMENT {
+            return "[OCR: extracted " + to_string(hex_to_int(h.slice(0, 2)) % 5000 + 100) +
+                   " words from document " + h.slice(0, 8) + "]"
+        }
+        return ""
+    }
+
+    fn _sim_label(self, h: string, prefix: string, options: List[string]) -> string {
+        let idx = hex_to_int(hashlib.sha256(h + ":" + prefix).hexdigest().slice(0, 4))
+        return options[idx % options.len()]
+    }
+
+    fn _sim_objects(self, h: string, count: int) -> List[any] {
+        let objects = [
+            "person", "vehicle", "building", "text", "chart",
+            "logo", "medical_scan", "circuit", "landscape", "food",
+            "document", "screen", "equipment", "animal", "furniture"
+        ]
+        let result = []
+        for i in range(0, count) {
+            let sub_h = hashlib.sha256(h + ":obj:" + to_string(i)).hexdigest()
+            let idx = hex_to_int(sub_h.slice(0, 4)) % objects.len()
+            let conf = 0.5 + to_float(hex_to_int(sub_h.slice(4, 8)) % 5000) / 10000.0
+            result.append({ "label": objects[idx], "confidence": round(conf, 3) })
+        }
+        return result
+    }
+
+    fn compression_stats(self) -> any {
+        let ratio = 0.0
+        if self._bytes_output > 0 {
+            ratio = to_float(self._bytes_processed) / to_float(self._bytes_output)
+        }
+        return {
+            "media_processed": self._processed,
+            "raw_bytes_in": self._bytes_processed,
+            "digest_bytes_out": self._bytes_output,
+            "compression_ratio": to_string(to_int(ratio)) + "x",
+            "bytes_kept_local": self._bytes_processed - self._bytes_output,
+            "backend_mode": self._backend_mode.value
+        }
+    }
+}
+
+/// ── Media Routing Packet (160 bytes on NRSIP) ──
+
+type MediaRoutingPacket {
+    query_hash: string,
+    tier: string,
+    domain: Optional[string],
+    confidence: float,
+    content_ref: ContentRef,
+    modality: Modality,
+    has_text_path: bool,
+    entity_summary: Map[string, any],
+    source_instance_id: string,
+    created_at: float
+}
+
+fn packet_estimated_bytes() -> int { return 160 }
+
+fn packet_raw_media_size(p: MediaRoutingPacket) -> int {
+    return p.content_ref.size_bytes
+}
+
+fn packet_wire_compression(p: MediaRoutingPacket) -> string {
+    let ratio = to_float(p.content_ref.size_bytes) / 160.0
+    return to_string(to_int(ratio)) + "x"
+}
+
+/// ── Media Coordinator ──
+
+class MediaCoordinator {
+    fn init(self) {
+        self._processor = MediaProcessor()
+        self._processor.init(768, nil, nil, nil)
+        self._cache = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cognitive_bridge = nil
+    }
+
+    fn set_cognitive_bridge(self, bridge: any) {
+        self._cognitive_bridge = bridge
+        log.info("Media pipeline cognitive bridge wired")
+    }
+
+    fn ingest(self, raw_bytes: bytes, modality: Modality,
+              metadata: Optional[Map[string, any]]) -> any {
+        let content_hash = hashlib.sha256(to_hex(raw_bytes)).hexdigest()
+
+        let digest = nil
+        if self._cache.get(content_hash, nil) != nil {
+            self._cache_hits += 1
+            digest = self._cache[content_hash]
+        } else {
+            self._cache_misses += 1
+            digest = self._processor.process(raw_bytes, modality, metadata)
+            self._cache[content_hash] = digest
+        }
+
+        let domain_estimate = self._estimate_domain(digest)
+        let conf_estimate = 0.0
+        if digest.feature_embedding.len() > 0 {
+            conf_estimate = digest.feature_embedding[0]
+        }
+
+        if self._cognitive_bridge != nil && digest_has_text_path(digest) {
+            try {
+                let cog = self._cognitive_bridge.think(
+                    digest.extracted_text.slice(0, 500), domain_estimate)
+                if cog.epistemic != nil {
+                    let sd = cog.epistemic.strongest_domain
+                    if sd != nil { domain_estimate = sd }
+                }
+                conf_estimate = max(conf_estimate, cog.confidence)
+            } catch(exc) {
+                pass
+            }
+        }
+
+        let packet = MediaRoutingPacket {
+            query_hash: content_hash.slice(0, 32),
+            tier: self._estimate_tier(digest),
+            domain: domain_estimate,
+            confidence: conf_estimate,
+            content_ref: digest.content_ref,
+            modality: modality,
+            has_text_path: digest_has_text_path(digest),
+            entity_summary: self._compress_entities(digest.entities),
+            source_instance_id: "",
+            created_at: time.time()
+        }
+        return { "digest": digest, "packet": packet }
+    }
+
+    fn _estimate_tier(self, digest: MediaDigest) -> string {
+        let spec = MODALITY_SPECS.get(digest.modality.value, nil)
+        let gpu_ms = 100
+        if spec != nil { gpu_ms = to_int(spec.get("gpu_ms", 100)) }
+        if gpu_ms <= 10 { return "T1" }
+        if gpu_ms <= 50 { return "T2" }
+        if gpu_ms <= 200 { return "T3" }
+        return "T4"
+    }
+
+    fn _estimate_domain(self, digest: MediaDigest) -> string {
+        let entities = digest.entities
+        for k in entities.keys() {
+            let v_str = to_string(entities[k]).lower()
+            if v_str.contains("medical") { return "medical" }
+            if v_str.contains("scan") { return "medical" }
+        }
+        let doc_type = entities.get("doc_type", nil)
+        if doc_type == "invoice" || doc_type == "spreadsheet" || doc_type == "form" {
+            return "financial"
+        }
+        if digest.modality == Modality.MESH_3D || digest.modality == Modality.SENSOR {
+            return "engineering"
+        }
+        return "general"
+    }
+
+    fn _compress_entities(self, entities: Map[string, any]) -> any {
+        let compressed = {}
+        for k in entities.keys() {
+            let v = entities[k]
+            if is_list(v) {
+                let top_label = nil
+                if v.len() > 0 {
+                    if is_map(v[0]) {
+                        top_label = v[0].get("label", to_string(v[0]))
+                    } else {
+                        top_label = to_string(v[0])
+                    }
+                }
+                compressed[k] = { "count": v.len(), "top": top_label }
+            } else if is_int(v) || is_float(v) || is_bool(v) || is_string(v) {
+                compressed[k] = v
+            }
+        }
+        return compressed
+    }
+
+    fn stats(self) -> any {
+        let total = self._cache_hits + self._cache_misses
+        let hit_rate = 0.0
+        if total > 0 {
+            hit_rate = to_float(self._cache_hits) / to_float(total)
+        }
+        return {
+            "total_ingested": total,
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "cache_hit_rate": to_string(to_int(hit_rate * 100.0)) + "%",
+            "cached_digests": self._cache.len(),
+            "processor_stats": self._processor.compression_stats()
+        }
+    }
+}
+
+/// ── Streaming Enumerations ──
+
+enum Resolution {
+    RES_480P = "480p",
+    RES_720P = "720p",
+    RES_1080P = "1080p",
+    RES_1440P = "1440p",
+    RES_2160P = "2160p",
+    RES_4320P = "4320p",
+    RES_8640P = "8640p"
+}
+
+enum Codec {
+    H264 = "h264",
+    H265 = "h265",
+    H266 = "h266",
+    AV1 = "av1",
+    VP9 = "vp9"
+}
+
+enum IngestProtocol {
+    RTMP = "rtmp",
+    SRT = "srt",
+    WEBRTC = "webrtc",
+    RTSP = "rtsp",
+    NDI = "ndi",
+    RIST = "rist"
+}
+
+enum DeliveryProtocol {
+    HLS = "hls",
+    DASH = "dash",
+    CMAF = "cmaf",
+    WEBRTC = "webrtc",
+    LL_HLS = "ll-hls"
+}
+
+/// ── Resolution Specifications ──
+
+let RESOLUTION_SPECS = {
+    "480p": { "width": 640, "height": 480, "h265_mbps": 1.5, "h266_mbps": 0.8, "gpu_encode_fraction": 0.05 },
+    "720p": { "width": 1280, "height": 720, "h265_mbps": 3.0, "h266_mbps": 1.5, "gpu_encode_fraction": 0.1 },
+    "1080p": { "width": 1920, "height": 1080, "h265_mbps": 8.0, "h266_mbps": 4.0, "gpu_encode_fraction": 0.2 },
+    "1440p": { "width": 2560, "height": 1440, "h265_mbps": 16.0, "h266_mbps": 8.0, "gpu_encode_fraction": 0.35 },
+    "2160p": { "width": 3840, "height": 2160, "h265_mbps": 35.0, "h266_mbps": 18.0, "gpu_encode_fraction": 0.6 },
+    "4320p": { "width": 7680, "height": 4320, "h265_mbps": 80.0, "h266_mbps": 40.0, "gpu_encode_fraction": 1.0 },
+    "8640p": { "width": 15360, "height": 8640, "h265_mbps": 200.0, "h266_mbps": 100.0, "gpu_encode_fraction": 2.5 }
+}
+
+let ABR_LADDERS = {
+    "8k_full": [ "4320p", "2160p", "1080p", "720p", "480p" ],
+    "4k_standard": [ "2160p", "1080p", "720p", "480p" ],
+    "1080p_web": [ "1080p", "720p", "480p" ],
+    "low_latency": [ "1080p", "720p" ]
+}
+
+/// ── Stream Segment ──
+
+type StreamSegment {
+    segment_id: string,
+    stream_id: string,
+    sequence_number: int,
+    duration_sec: float,
+    resolution: string,
+    codec: string,
+    size_bytes: int,
+    keyframe_bytes: Optional[bytes],
+    nrs_validated: bool,
+    nrs_domain: Optional[string],
+    nrs_tier: Optional[string],
+    nrs_h_score: Optional[float],
+    nrs_entities: Map[string, any],
+    nrs_safety_pass: bool
+}
+
+fn segment_bitrate_mbps(s: StreamSegment) -> float {
+    if s.duration_sec <= 0.0 { return 0.0 }
+    return (to_float(s.size_bytes) * 8.0) / (s.duration_sec * 1000000.0)
+}
+
+/// ── Stream Config ──
+
+type StreamConfig {
+    stream_id: string,
+    source_resolution: string,
+    source_codec: string,
+    source_fps: int,
+    ingest_protocol: string,
+    target_codec: string,
+    abr_ladder: string,
+    segment_duration_sec: float,
+    delivery_protocol: string,
+    nrs_validation_enabled: bool,
+    nrs_keyframes_per_segment: int,
+    nrs_safety_check: bool
+}
+
+fn stream_ladder_resolutions(config: StreamConfig) -> List[any] {
+    let ladder = ABR_LADDERS.get(config.abr_ladder, nil)
+    if ladder == nil {
+        return ABR_LADDERS["4k_standard"]
+    }
+    return ladder
+}
+
+/// ── Keyframe Validation ──
+
+type KeyframeValidation {
+    frame_index: int,
+    timestamp_ms: int,
+    content_hash: string,
+    h_score: float,
+    h_verdict: string,
+    processing_time_ms: float,
+    entities: List[MediaEntity]
+}
+
+/// ── Stream Pipeline ──
+
+class StreamPipeline {
+    fn init(self, config: Optional[StreamConfig],
+            media_processor: Optional[MediaProcessor],
+            keyframe_extractor: Optional[any],
+            h_score_calculator: Optional[any],
+            safety_checker: Optional[any]) {
+        self._streams = {}
+        self._segments = {}
+        self._media_processor = media_processor
+        if self._media_processor == nil {
+            self._media_processor = MediaProcessor()
+            self._media_processor.init(768, nil, nil, nil)
+        }
+        self._keyframe_extractor = keyframe_extractor
+        self._h_score_calculator = h_score_calculator
+        self._safety_checker = safety_checker
+
+        self._segments_processed = 0
+        self._segments_validated = 0
+        self._segments_blocked = 0
+        self._segments_delivered = 0
+        self._total_stream_bytes = 0
+        self._total_nrsip_bytes = 0
+        self._keyframes_validated_list = []
+        self._stream_start_ms = nil
+        self._is_live = false
+
+        if config != nil {
+            self.register_stream(config)
+        }
+    }
+
+    fn register_stream(self, config: StreamConfig) -> any {
+        self._streams[config.stream_id] = config
+        self._segments[config.stream_id] = []
+        return self._calculate_resources(config)
+    }
+
+    fn start(self) {
+        self._stream_start_ms = to_int(time.time() * 1000.0)
+        self._is_live = true
+    }
+
+    fn stop(self) -> any {
+        self._is_live = false
+        let elapsed_ms = to_int(time.time() * 1000.0) - self._stream_start_ms
+        let avg_h = 0.0
+        if self._keyframes_validated_list.len() > 0 {
+            let total_h = 0.0
+            for kf in self._keyframes_validated_list { total_h += kf.h_score }
+            avg_h = total_h / to_float(self._keyframes_validated_list.len())
+        }
+        return {
+            "duration_ms": elapsed_ms,
+            "segments_processed": self._segments_processed,
+            "segments_validated": self._segments_validated,
+            "segments_delivered": self._segments_delivered,
+            "segments_blocked": self._segments_blocked,
+            "avg_h_score": avg_h
+        }
+    }
+
+    fn ingest(self, stream_id: string, raw_data: bytes,
+              sequence_number: int, duration_sec: float) -> StreamSegment {
+        let config = self._streams.get(stream_id, nil)
+        if config == nil { raise "Stream " + stream_id + " not registered" }
+        return self.segment(stream_id, raw_data, sequence_number, duration_sec)
+    }
+
+    fn segment(self, stream_id: string, segment_data: bytes,
+               sequence_number: int, duration_sec: float) -> StreamSegment {
+        let config = self._streams.get(stream_id, nil)
+        if config == nil { raise "Stream " + stream_id + " not registered" }
+
+        let seg_id = hashlib.sha256(stream_id + ":" + to_string(sequence_number)).hexdigest().slice(0, 16)
+        let keyframe = self._extract_keyframe(segment_data, config)
+
+        let seg = StreamSegment {
+            segment_id: seg_id,
+            stream_id: stream_id,
+            sequence_number: sequence_number,
+            duration_sec: duration_sec,
+            resolution: config.source_resolution,
+            codec: config.target_codec,
+            size_bytes: segment_data.len(),
+            keyframe_bytes: keyframe,
+            nrs_validated: false,
+            nrs_domain: nil,
+            nrs_tier: nil,
+            nrs_h_score: nil,
+            nrs_entities: {},
+            nrs_safety_pass: true
+        }
+        self._total_stream_bytes += segment_data.len()
+        self._segments[stream_id].append(seg)
+        self._segments_processed += 1
+
+        if config.nrs_validation_enabled && seg.keyframe_bytes != nil {
+            self._validate_segment(seg, config)
+        }
+        return seg
+    }
+
+    fn _validate_segment(self, seg: StreamSegment, config: StreamConfig) {
+        let digest = self._media_processor.process(
+            seg.keyframe_bytes, Modality.IMAGE,
+            {
+                "source": "stream_keyframe",
+                "stream_id": seg.stream_id,
+                "sequence": seg.sequence_number,
+                "resolution": seg.resolution
+            })
+
+        let computed_h = self._compute_h_score(digest)
+        seg.nrs_validated = true
+        seg.nrs_h_score = computed_h
+        seg.nrs_domain = self._detect_domain(digest)
+        seg.nrs_entities = digest.entities
+
+        if config.nrs_safety_check {
+            seg.nrs_safety_pass = self._safety_check(digest)
+            if !seg.nrs_safety_pass { self._segments_blocked += 1 }
+        }
+
+        self._segments_validated += 1
+        self._total_nrsip_bytes += 160
+
+        let verdict = "PASS"
+        if computed_h < 0.7 { verdict = "FAIL" }
+        self._keyframes_validated_list.append(KeyframeValidation {
+            frame_index: seg.sequence_number,
+            timestamp_ms: to_int(time.time() * 1000.0),
+            content_hash: digest.content_ref.content_hash,
+            h_score: computed_h,
+            h_verdict: verdict,
+            processing_time_ms: 0.0,
+            entities: []
+        })
+    }
+
+    fn deliver(self, segment: StreamSegment) -> any {
+        let config = self._streams.get(segment.stream_id, nil)
+        if config == nil { raise "Stream " + segment.stream_id + " not registered" }
+        if !segment.nrs_safety_pass {
+            return {
+                "segment_id": segment.segment_id,
+                "delivered": false,
+                "reason": "blocked_by_safety_check"
+            }
+        }
+        let ladder = stream_ladder_resolutions(config)
+        let ladder_segments = []
+        for res in ladder {
+            let spec = RESOLUTION_SPECS.get(res, nil)
+            if spec == nil { continue }
+            let bitrate = to_float(spec.get("h265_mbps", 5.0))
+            let rung_bytes = to_int((bitrate * segment.duration_sec * 1000000.0) / 8.0)
+            ladder_segments.append({
+                "resolution": res, "bitrate_mbps": bitrate, "size_bytes": rung_bytes
+            })
+        }
+        self._segments_delivered += 1
+        return {
+            "segment_id": segment.segment_id,
+            "delivered": true,
+            "protocol": config.delivery_protocol,
+            "ladder": ladder_segments,
+            "nrs_validated": segment.nrs_validated,
+            "nrs_h_score": segment.nrs_h_score
+        }
+    }
+
+    fn _extract_keyframe(self, segment_data: bytes, config: StreamConfig) -> bytes {
+        if self._keyframe_extractor != nil {
+            return self._keyframe_extractor(segment_data, config)
+        }
+        let keyframe_size = min(50000, segment_data.len())
+        return segment_data.slice(0, keyframe_size)
+    }
+
+    fn _detect_domain(self, digest: MediaDigest) -> string {
+        for k in digest.entities.keys() {
+            let v_str = to_string(digest.entities[k]).lower()
+            if v_str.contains("medical") { return "medical" }
+            if v_str.contains("chart") || v_str.contains("document") { return "financial" }
+        }
+        return "general"
+    }
+
+    fn _compute_h_score(self, digest: MediaDigest) -> float {
+        if self._h_score_calculator != nil {
+            let score = to_float(self._h_score_calculator(digest))
+            return max(0.0, min(1.0, score))
+        }
+        let h = hashlib.sha256(digest.content_ref.content_hash).digest()
+        return 0.7 + (to_float(struct.unpack(">H", h.slice(0, 2))[0]) / 65535.0) * 0.3
+    }
+
+    fn _safety_check(self, digest: MediaDigest) -> bool {
+        if self._safety_checker != nil {
+            return self._safety_checker(digest)
+        }
+        let h = hashlib.sha256(digest.content_ref.content_hash).hexdigest()
+        return hex_to_int(h.slice(0, 1)) > 0
+    }
+
+    fn _calculate_resources(self, config: StreamConfig) -> any {
+        let source_spec = RESOLUTION_SPECS.get(config.source_resolution, {})
+        let per_viewer_mbps = to_float(source_spec.get("h265_mbps", 50.0))
+        let segment_mb = (per_viewer_mbps * config.segment_duration_sec) / 8.0
+        let segments_per_hour = 3600.0 / config.segment_duration_sec
+        let ladder = stream_ladder_resolutions(config)
+        let storage_gb_per_hour = (segment_mb * segments_per_hour * to_float(ladder.len())) / 1024.0
+        let nrs_qps = to_float(config.nrs_keyframes_per_segment) / config.segment_duration_sec
+        let nrsip_bps = nrs_qps * 160.0
+
+        return {
+            "stream_id": config.stream_id,
+            "source": config.source_resolution + " @ " + to_string(config.source_fps) + "fps",
+            "codec": config.target_codec,
+            "nrs_queries_per_sec": round(nrs_qps, 2),
+            "nrsip_bytes_per_sec": to_int(nrsip_bps),
+            "storage_gb_per_hour": round(storage_gb_per_hour, 1),
+            "source_bitrate_mbps": per_viewer_mbps
+        }
+    }
+
+    fn keyframes_validated(self) -> int {
+        return self._keyframes_validated_list.len()
+    }
+
+    fn is_live(self) -> bool {
+        return self._is_live
+    }
+
+    fn stats(self) -> any {
+        let nrsip_ratio = "0%"
+        if self._total_stream_bytes > 0 {
+            let pct = to_float(self._total_nrsip_bytes) /
+                      to_float(self._total_stream_bytes) * 100.0
+            nrsip_ratio = to_string(pct) + "%"
+        }
+        return {
+            "active_streams": self._streams.len(),
+            "segments_processed": self._segments_processed,
+            "segments_validated": self._segments_validated,
+            "segments_delivered": self._segments_delivered,
+            "segments_blocked": self._segments_blocked,
+            "total_stream_bytes": self._total_stream_bytes,
+            "total_nrsip_bytes": self._total_nrsip_bytes,
+            "nrsip_vs_stream_ratio": nrsip_ratio,
+            "processor_stats": self._media_processor.compression_stats()
+        }
+    }
+}
+
+/// ── Network Plane Separation ──
+
+enum NetworkPlane {
+    CONTROL = "CONTROL",
+    DATA = "DATA",
+    STREAM = "STREAM"
+}
+
+type PlaneConfig {
+    plane: NetworkPlane,
+    protocol: string,
+    bandwidth_class: string,
+    description: string
+}
+
+let THREE_PLANE_CONFIG = {
+    "CONTROL": PlaneConfig {
+        plane: NetworkPlane.CONTROL,
+        protocol: "UDP 7470 / TCP 7470 / QUIC 7470 / HTTP/3 443",
+        bandwidth_class: "negligible (<3 MB/s at 20K RPS)",
+        description: "NRSIP routing packets only. Tier, domain, confidence, h_score."
+    },
+    "DATA": PlaneConfig {
+        plane: NetworkPlane.DATA,
+        protocol: "S3/GCS/Azure Blob object storage APIs",
+        bandwidth_class: "scales with content volume, independent of NRSIP",
+        description: "Bulk content: raw media, documents, model weights, training data."
+    },
+    "STREAM": PlaneConfig {
+        plane: NetworkPlane.STREAM,
+        protocol: "SRT/RTMP ingest -> ABR -> HLS/DASH delivery",
+        bandwidth_class: "scales with concurrent streams, independent of NRSIP",
+        description: "Live video transcoding and delivery. Raw video never on NRSIP."
+    }
+}
+
+export Modality, MediaBackendMode, MODALITY_SPECS
+export ContentRef, content_ref_wire_size, content_ref_from_raw
+export MediaEntity, MediaFeature
+export MediaDigest, digest_content_hash, digest_estimated_bytes
+export digest_has_text_path, digest_to_query_embedding, digest_to_routing_metadata
+export MediaProcessor
+export MediaRoutingPacket, packet_estimated_bytes, packet_raw_media_size, packet_wire_compression
+export MediaCoordinator
+export Resolution, Codec, IngestProtocol, DeliveryProtocol
+export RESOLUTION_SPECS, ABR_LADDERS
+export StreamSegment, segment_bitrate_mbps
+export StreamConfig, stream_ladder_resolutions
+export KeyframeValidation, StreamPipeline
+export NetworkPlane, PlaneConfig, THREE_PLANE_CONFIG

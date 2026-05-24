@@ -1,0 +1,495 @@
+/// NRS Reasoning — Knowledge Governance.
+///
+/// Validates every edge before it enters the causal graph. Detects
+/// contradictions, enforces confidence floors, checks source credibility,
+/// and maintains graph coherence.
+///
+/// All transformer-free. No external ML dependencies.
+/// Ported from nrsip/reasoning_governance.py.
+
+module reasoning_governance
+
+import log from "logging"
+import time from "std/time"
+import CausalGraph, GraphEdge, GraphNode, RelationType from "reasoning_graph"
+
+/// ── Contradiction pairs ──
+
+let _CONTRADICTING_PAIRS = [
+    ["CAUSES", "PREVENTS"],
+    ["PREVENTS", "CAUSES"],
+    ["ENABLES", "INHIBITS"],
+    ["INHIBITS", "ENABLES"],
+    ["ENABLES", "PREVENTS"],
+    ["PREVENTS", "ENABLES"],
+    ["PRODUCES", "INHIBITS"],
+    ["INHIBITS", "PRODUCES"]
+]
+
+fn _is_contradicting(rel_a: RelationType, rel_b: RelationType) -> bool {
+    for pair in _CONTRADICTING_PAIRS {
+        if rel_a.value == pair[0] && rel_b.value == pair[1] {
+            return true
+        }
+    }
+    return false
+}
+
+/// ── Enumerations ──
+
+enum GateVerdict {
+    ACCEPT = "accept",
+    REJECT = "reject",
+    QUARANTINE = "quarantine"
+}
+
+enum RejectionReason {
+    BELOW_CONFIDENCE_FLOOR = "below_confidence_floor",
+    CONTRADICTS_EXISTING = "contradicts_existing_edge",
+    SELF_LOOP = "self_loop",
+    CONCEPT_TOO_SHORT = "concept_too_short",
+    CONCEPT_TOO_LONG = "concept_too_long",
+    DUPLICATE_EDGE = "duplicate_edge",
+    CYCLE_DETECTED = "would_create_tight_cycle",
+    LOW_SOURCE_CREDIBILITY = "low_source_credibility",
+    MAX_GRAPH_SIZE_REACHED = "max_graph_size",
+    INCOHERENT_DOMAIN = "incoherent_domain_mix"
+}
+
+/// ── Data Types ──
+
+type GateDecision {
+    verdict: GateVerdict,
+    edge_id: string,
+    reason: Optional[RejectionReason],
+    details: string,
+    confidence_adjusted: float,
+    contradictions_found: List[string],
+    timestamp: float
+}
+
+type IngestionAuditEntry {
+    edge_source: string,
+    edge_target: string,
+    relation: string,
+    original_confidence: float,
+    decision: GateVerdict,
+    reason: string,
+    timestamp: float
+}
+
+/// ── Contradiction Detector ──
+
+class ContradictionDetector {
+    fn init(self, graph: CausalGraph = None, max_transitive_depth: int = 3) {
+        self._graph = graph
+        self._max_depth = max_transitive_depth
+    }
+
+    fn check(self, source: string, relation: RelationType,
+             target: string, confidence: float) -> List[any] {
+        let contradictions = []
+        let src = source.lower().strip()
+        let tgt = target.lower().strip()
+
+        let direct = self._check_direct(src, relation, tgt)
+        for c in direct { contradictions.append(c) }
+
+        let transitive = self._check_transitive(src, relation, tgt)
+        for c in transitive { contradictions.append(c) }
+
+        let circular = self._check_circular_taxonomy(src, relation, tgt)
+        for c in circular { contradictions.append(c) }
+
+        return contradictions
+    }
+
+    fn _check_direct(self, source: string, relation: RelationType,
+                     target: string) -> List[any] {
+        let results = []
+        let outgoing = self._graph.outgoing(source)
+        for existing in outgoing {
+            if existing.target != target { continue }
+            if _is_contradicting(relation, existing.relation) {
+                results.append(
+                    "Direct contradiction: proposed '" + source + " " +
+                    relation.value + " " + target + "' conflicts with existing '" +
+                    source + " " + existing.relation.value + " " + target +
+                    "' (conf=" + to_string(existing.confidence) + ")")
+            }
+        }
+
+        let reverse_out = self._graph.outgoing(target)
+        for existing in reverse_out {
+            if existing.target != source { continue }
+            if relation == existing.relation {
+                if relation == RelationType.CAUSES || relation == RelationType.PREVENTS ||
+                   relation == RelationType.ENABLES || relation == RelationType.INHIBITS {
+                    results.append(
+                        "Reverse-direction conflict: proposed '" + source + " " +
+                        relation.value + " " + target + "' but '" + target + " " +
+                        existing.relation.value + " " + source + "' already exists")
+                }
+            }
+        }
+        return results
+    }
+
+    fn _check_transitive(self, source: string, relation: RelationType,
+                         target: string) -> List[any] {
+        if relation != RelationType.CAUSES && relation != RelationType.PREVENTS {
+            return []
+        }
+        let results = []
+        let visited = set()
+        visited.add(source)
+        let frontier = [source]
+
+        for depth in range(0, self._max_depth) {
+            let next_frontier = []
+            for node in frontier {
+                let edges = self._graph.outgoing(node)
+                for edge in edges {
+                    if visited.contains(edge.target) { continue }
+                    visited.add(edge.target)
+                    if edge.target == target {
+                        if _is_contradicting(relation, edge.relation) {
+                            results.append(
+                                "Transitive contradiction at depth " +
+                                to_string(depth + 1) + ": chain from '" + source +
+                                "' reaches '" + target + "' via '" +
+                                edge.relation.value + "' but proposed relation is '" +
+                                relation.value + "'")
+                        }
+                    }
+                    next_frontier.append(edge.target)
+                }
+            }
+            frontier = next_frontier
+        }
+        return results
+    }
+
+    fn _check_circular_taxonomy(self, source: string, relation: RelationType,
+                                target: string) -> List[any] {
+        if relation != RelationType.IS_A && relation != RelationType.PART_OF {
+            return []
+        }
+        let visited = set()
+        let current = target
+        for _ in range(0, 10) {
+            let edges = self._graph.outgoing_by_relation(current, relation)
+            let found_next = false
+            for edge in edges {
+                if edge.target == source {
+                    return [
+                        "Circular taxonomy: '" + source + " " + relation.value +
+                        " " + target + "' would create a cycle since '" + target +
+                        "' already " + relation.value + " ... '" + source + "'"
+                    ]
+                }
+                if !visited.contains(edge.target) {
+                    visited.add(edge.target)
+                    current = edge.target
+                    found_next = true
+                    break
+                }
+            }
+            if !found_next { break }
+        }
+        return []
+    }
+}
+
+/// ── Source Credibility Tracker ──
+
+class SourceCredibilityTracker {
+    fn init(self) {
+        self._credibility = {
+            "knowledge_pack": 0.9,
+            "user_correction": 0.85,
+            "web_retrieval": 0.55,
+            "derivation": 0.6,
+            "curiosity": 0.4,
+            "analogy_transfer": 0.35
+        }
+        self._default_credibility = {
+            "knowledge_pack": 0.9,
+            "user_correction": 0.85,
+            "web_retrieval": 0.55,
+            "derivation": 0.6,
+            "curiosity": 0.4,
+            "analogy_transfer": 0.35
+        }
+        self._accept_count = {}
+        self._reject_count = {}
+    }
+
+    fn get_credibility(self, source_type: string) -> float {
+        return self._credibility.get(source_type, 0.3)
+    }
+
+    fn record_accept(self, source_type: string) {
+        let c = self._accept_count.get(source_type, 0)
+        self._accept_count[source_type] = c + 1
+        self._adjust(source_type)
+    }
+
+    fn record_reject(self, source_type: string) {
+        let c = self._reject_count.get(source_type, 0)
+        self._reject_count[source_type] = c + 1
+        self._adjust(source_type)
+    }
+
+    fn _adjust(self, source_type: string) {
+        let accepts = self._accept_count.get(source_type, 0)
+        let rejects = self._reject_count.get(source_type, 0)
+        let total = accepts + rejects
+        if total < 5 { return }
+        let base = self._default_credibility.get(source_type, 0.3)
+        let ratio = to_float(accepts) / to_float(total)
+        self._credibility[source_type] = base * (0.5 + 0.5 * ratio)
+    }
+
+    fn stats(self) -> any {
+        return {
+            "credibility": self._credibility,
+            "accepts": self._accept_count,
+            "rejects": self._reject_count
+        }
+    }
+}
+
+/// ── Knowledge Ingestion Gate ──
+
+class KnowledgeIngestionGate {
+    fn init(self, graph: CausalGraph = None, confidence_floor: float = 0.5,
+            min_concept_len: int = 2, max_concept_len: int = 200,
+            max_edges: int = 100000, quarantine_on_contradiction: bool = true) {
+        self._graph = graph
+        self._confidence_floor = confidence_floor
+        self._min_concept_len = min_concept_len
+        self._max_concept_len = max_concept_len
+        self._max_edges = max_edges
+        self._quarantine_on_contradiction = quarantine_on_contradiction
+        self._contradiction_detector = ContradictionDetector(graph, 3)
+        self._credibility = SourceCredibilityTracker()
+        self._quarantine = []
+        self._audit_log = []
+    }
+
+    fn quarantine(self) -> List[any] { return self._quarantine.copy() }
+
+    fn audit_log(self) -> List[any] { return self._audit_log.copy() }
+
+    fn evaluate(self, source: string, target: string,
+                relation: RelationType, confidence: float,
+                source_type: string, domain: string,
+                evidence: string) -> GateDecision {
+        let source_clean = source.lower().strip()
+        let target_clean = target.lower().strip()
+        let edge_id = source_clean + "|" + relation.value + "|" + target_clean
+
+        /// Gate 1: concept quality
+        if source_clean.len() < self._min_concept_len {
+            return self._reject(edge_id, RejectionReason.CONCEPT_TOO_SHORT,
+                "source concept '" + source_clean + "' too short",
+                source_clean, target_clean, relation, confidence, source_type)
+        }
+        if source_clean.len() > self._max_concept_len {
+            return self._reject(edge_id, RejectionReason.CONCEPT_TOO_LONG,
+                "source concept '" + source_clean + "' too long",
+                source_clean, target_clean, relation, confidence, source_type)
+        }
+        if target_clean.len() < self._min_concept_len {
+            return self._reject(edge_id, RejectionReason.CONCEPT_TOO_SHORT,
+                "target concept '" + target_clean + "' too short",
+                source_clean, target_clean, relation, confidence, source_type)
+        }
+        if target_clean.len() > self._max_concept_len {
+            return self._reject(edge_id, RejectionReason.CONCEPT_TOO_LONG,
+                "target concept '" + target_clean + "' too long",
+                source_clean, target_clean, relation, confidence, source_type)
+        }
+
+        /// Gate 2: self-loop
+        if source_clean == target_clean {
+            return self._reject(edge_id, RejectionReason.SELF_LOOP,
+                "Source equals target",
+                source_clean, target_clean, relation, confidence, source_type)
+        }
+
+        /// Gate 3: duplicate
+        let existing = self._graph.get_edge(source_clean, relation, target_clean)
+        if existing != nil && existing.confidence >= confidence {
+            return self._reject(edge_id, RejectionReason.DUPLICATE_EDGE,
+                "Edge already exists with conf=" + to_string(existing.confidence),
+                source_clean, target_clean, relation, confidence, source_type)
+        }
+
+        /// Gate 4: confidence floor (adjusted by source credibility)
+        let cred = self._credibility.get_credibility(source_type)
+        let adjusted_conf = confidence * cred
+        if adjusted_conf < self._confidence_floor {
+            return self._reject(edge_id, RejectionReason.BELOW_CONFIDENCE_FLOOR,
+                "Adjusted confidence " + to_string(adjusted_conf) +
+                " (raw=" + to_string(confidence) + " x cred=" + to_string(cred) +
+                ") below floor " + to_string(self._confidence_floor),
+                source_clean, target_clean, relation, confidence, source_type)
+        }
+
+        /// Gate 5: contradiction detection
+        let contradictions = self._contradiction_detector.check(
+            source_clean, relation, target_clean, confidence)
+        if contradictions.len() > 0 {
+            let details = contradictions.join("; ")
+            if self._quarantine_on_contradiction {
+                self._quarantine.append({
+                    "source": source_clean, "relation": relation.value,
+                    "target": target_clean, "confidence": confidence,
+                    "reason": details
+                })
+                let decision = GateDecision {
+                    verdict: GateVerdict.QUARANTINE,
+                    edge_id: edge_id,
+                    reason: RejectionReason.CONTRADICTS_EXISTING,
+                    details: details,
+                    confidence_adjusted: adjusted_conf,
+                    contradictions_found: contradictions,
+                    timestamp: time.time()
+                }
+                self._log(source_clean, target_clean, relation, confidence,
+                          GateVerdict.QUARANTINE, details, source_type)
+                return decision
+            } else {
+                return self._reject(edge_id, RejectionReason.CONTRADICTS_EXISTING,
+                    details, source_clean, target_clean, relation, confidence, source_type)
+            }
+        }
+
+        /// Gate 6: tight cycle detection
+        if relation == RelationType.CAUSES || relation == RelationType.PRODUCES ||
+           relation == RelationType.ENABLES || relation == RelationType.PRECEDES {
+            if self._would_create_cycle(target_clean, source_clean, 3) {
+                return self._reject(edge_id, RejectionReason.CYCLE_DETECTED,
+                    "Would create causal cycle back to '" + source_clean + "'",
+                    source_clean, target_clean, relation, confidence, source_type)
+            }
+        }
+
+        /// Gate 7: graph size
+        if self._graph.edge_count() >= self._max_edges {
+            return self._reject(edge_id, RejectionReason.MAX_GRAPH_SIZE_REACHED,
+                "Graph has " + to_string(self._graph.edge_count()) +
+                " edges (max=" + to_string(self._max_edges) + ")",
+                source_clean, target_clean, relation, confidence, source_type)
+        }
+
+        /// All gates passed
+        self._credibility.record_accept(source_type)
+        let decision = GateDecision {
+            verdict: GateVerdict.ACCEPT,
+            edge_id: edge_id,
+            reason: nil,
+            details: "",
+            confidence_adjusted: adjusted_conf,
+            contradictions_found: [],
+            timestamp: time.time()
+        }
+        self._log(source_clean, target_clean, relation, confidence,
+                  GateVerdict.ACCEPT, "passed all gates", source_type)
+        return decision
+    }
+
+    fn gated_add_edge(self, source: string, target: string,
+                      relation: RelationType, confidence: float,
+                      source_type: string, domain: string,
+                      evidence: string, fact_id: string,
+                      derived: bool, provenance: Optional[List[string]]) -> GateDecision {
+        let decision = self.evaluate(source, target, relation, confidence,
+                                      source_type, domain, evidence)
+        if decision.verdict == GateVerdict.ACCEPT {
+            self._graph.add_edge(
+                source, target, relation,
+                decision.confidence_adjusted,
+                domain, evidence, fact_id)
+        }
+        return decision
+    }
+
+    fn _would_create_cycle(self, start: string, target: string,
+                           max_depth: int) -> bool {
+        let visited = set()
+        let frontier = [start]
+        for _ in range(0, max_depth) {
+            let next_frontier = []
+            for node in frontier {
+                if visited.contains(node) { continue }
+                visited.add(node)
+                let edges = self._graph.outgoing(node)
+                for edge in edges {
+                    if edge.target == target { return true }
+                    if !visited.contains(edge.target) {
+                        next_frontier.append(edge.target)
+                    }
+                }
+            }
+            frontier = next_frontier
+        }
+        return false
+    }
+
+    fn _reject(self, edge_id: string, reason: RejectionReason, details: string,
+               source: string, target: string, relation: RelationType,
+               confidence: float, source_type: string) -> GateDecision {
+        self._credibility.record_reject(source_type)
+        let decision = GateDecision {
+            verdict: GateVerdict.REJECT,
+            edge_id: edge_id,
+            reason: reason,
+            details: details,
+            confidence_adjusted: 0.0,
+            contradictions_found: [],
+            timestamp: time.time()
+        }
+        self._log(source, target, relation, confidence,
+                  GateVerdict.REJECT, reason.value + ": " + details, source_type)
+        return decision
+    }
+
+    fn _log(self, source: string, target: string, relation: RelationType,
+            confidence: float, verdict: GateVerdict, reason: string,
+            source_type: string) {
+        self._audit_log.append(IngestionAuditEntry {
+            edge_source: source, edge_target: target,
+            relation: relation.value, original_confidence: confidence,
+            decision: verdict, reason: reason, timestamp: time.time()
+        })
+        if self._audit_log.len() > 10000 {
+            self._audit_log = self._audit_log.slice(5000, self._audit_log.len())
+        }
+    }
+
+    fn stats(self) -> any {
+        let accepts = 0
+        let rejects = 0
+        let quarantined = 0
+        for e in self._audit_log {
+            if e.decision == GateVerdict.ACCEPT { accepts += 1 }
+            if e.decision == GateVerdict.REJECT { rejects += 1 }
+            if e.decision == GateVerdict.QUARANTINE { quarantined += 1 }
+        }
+        return {
+            "total_evaluated": self._audit_log.len(),
+            "accepted": accepts,
+            "rejected": rejects,
+            "quarantined": quarantined,
+            "quarantine_queue": self._quarantine.len(),
+            "credibility": self._credibility.stats()
+        }
+    }
+}
+
+export GateVerdict, RejectionReason
+export GateDecision, IngestionAuditEntry
+export ContradictionDetector, SourceCredibilityTracker, KnowledgeIngestionGate

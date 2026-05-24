@@ -1,0 +1,44 @@
+{
+  "domain": "legal",
+  "version": "2026.1",
+  "source": "Legal treatises / statutory frameworks / compliance standards",
+  "source_tier": "t2_verified",
+  "facts": [
+    {
+      "id": "lc-contract-elements",
+      "text": "Essential elements of a valid contract: offer (definite terms, communicated to offeree), acceptance (mirror image rule, mailbox rule for timing), consideration (bargained-for exchange of value), capacity (legal ability to contract, age/mental competence), legality (lawful purpose). Defenses to enforcement: duress, undue influence, misrepresentation, unconscionability, statute of frauds (certain contracts must be in writing).",
+      "confidence": 0.96,
+      "tags": ["contract", "elements", "formation", "logical"]
+    },
+    {
+      "id": "lc-tort-law",
+      "text": "Tort categories: intentional torts (assault, battery, false imprisonment, defamation, intentional infliction of emotional distress), negligence (duty, breach, causation, damages), strict liability (abnormally dangerous activities, product liability). Negligence requires: duty of care owed, breach of that duty, actual and proximate causation, legally cognizable damages. Comparative negligence reduces recovery by plaintiff's fault percentage.",
+      "confidence": 0.95,
+      "tags": ["tort", "negligence", "liability", "causal", "logical"]
+    },
+    {
+      "id": "lc-ip-types",
+      "text": "Intellectual property types: patents (utility 20 years, design 15 years, requires novelty/non-obviousness/utility), trademarks (brand identifiers, indefinite with use and renewal), copyrights (original works of authorship, life+70 years, automatic upon creation), trade secrets (confidential business information, no registration, protected as long as secret). Patent claims define scope of protection; prior art determines patentability.",
+      "confidence": 0.96,
+      "tags": ["intellectual-property", "patent", "trademark", "copyright", "logical"]
+    },
+    {
+      "id": "lc-data-privacy",
+      "text": "Major data privacy frameworks: GDPR (EU, lawful basis required, data subject rights including access/erasure/portability, DPO requirement, 72-hour breach notification, fines up to 4% global revenue), CCPA/CPRA (California, right to know/delete/opt-out of sale, no private right of action except data breaches), LGPD (Brazil), POPIA (South Africa), PIPL (China). Common principles: purpose limitation, data minimization, storage limitation, accountability.",
+      "confidence": 0.95,
+      "tags": ["privacy", "gdpr", "ccpa", "compliance", "logical"]
+    },
+    {
+      "id": "lc-corporate-governance",
+      "text": "Corporate governance structures: board of directors (fiduciary duties of care and loyalty), officers (CEO, CFO, COO execute board directives), shareholders (elect directors, approve major transactions). Business judgment rule protects directors making informed, good-faith decisions. Derivative suits allow shareholders to sue on behalf of corporation. Sarbanes-Oxley and Dodd-Frank impose additional governance requirements on public companies.",
+      "confidence": 0.94,
+      "tags": ["governance", "corporate", "fiduciary", "logical"]
+    },
+    {
+      "id": "lc-dispute-resolution",
+      "text": "Dispute resolution methods: litigation (court proceedings, discovery, trial, appeal), arbitration (binding private adjudication, limited discovery, AAA/JAMS rules), mediation (facilitated negotiation, non-binding), negotiation (direct party resolution). Arbitration clauses in contracts can waive right to jury trial and class action. Forum selection and choice of law clauses determine where and under what law disputes are resolved.",
+      "confidence": 0.95,
+      "tags": ["dispute-resolution", "arbitration", "litigation", "logical"]
+    }
+  ]
+}

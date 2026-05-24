@@ -1,0 +1,181 @@
+/// NRSI Epistemic -- Knowledge Source Typing and Confidence Calibration
+
+module epistemic
+
+import NRSIData, EpistemicType from "types"
+
+/// ---------- Enumerations ----------
+
+enum EvidenceStrength {
+    AXIOMATIC,
+    EMPIRICAL_STRONG,
+    EMPIRICAL_MODERATE,
+    TESTIMONIAL,
+    INFERRED,
+    SPECULATIVE,
+    UNKNOWN
+}
+
+enum KnowledgeBoundary {
+    KNOWN_VERIFIED,
+    KNOWN_UNVERIFIED,
+    UNCERTAIN,
+    UNKNOWN,
+    UNKNOWABLE
+}
+
+/// ---------- Core Types ----------
+
+type EpistemicStatus {
+    epistemic_type: EpistemicType,
+    evidence_strength: EvidenceStrength,
+    boundary: KnowledgeBoundary,
+    confidence: float,
+    source_count: int,
+    defeaters: List[string]
+}
+
+/// ---------- Classification Functions ----------
+
+fn classify_evidence(claim: NRSIData, source: string) -> EpistemicStatus {
+    let src = source.lower()
+    let conf = claim.confidence
+
+    // Determine evidence strength from source characteristics
+    let strength = EvidenceStrength.UNKNOWN
+    let boundary = KnowledgeBoundary.UNCERTAIN
+    let ep_type = EpistemicType.OBSERVATIONAL
+
+    // Axiomatic: built-in belief bases, mathematical proofs, definitions
+    if src == "axiom" or src == "belief_base" or src == "definition" or src == "mathematical_proof" {
+        strength = EvidenceStrength.AXIOMATIC
+        boundary = KnowledgeBoundary.KNOWN_VERIFIED
+        ep_type = EpistemicType.FORMAL
+    }
+
+    // Strong empirical: peer-reviewed, replicated studies, official data
+    if src == "peer_reviewed" or src == "replicated_study" or src == "official_statistics" or src == "gov" or src == "edu" {
+        strength = EvidenceStrength.EMPIRICAL_STRONG
+        boundary = KnowledgeBoundary.KNOWN_VERIFIED if conf >= 0.8 else KnowledgeBoundary.KNOWN_UNVERIFIED
+        ep_type = EpistemicType.EMPIRICAL
+    }
+
+    // Moderate empirical: single studies, expert consensus, reference works
+    if src == "single_study" or src == "expert_consensus" or src == "reference" or src == "encyclopedia" {
+        strength = EvidenceStrength.EMPIRICAL_MODERATE
+        boundary = KnowledgeBoundary.KNOWN_UNVERIFIED
+        ep_type = EpistemicType.EMPIRICAL
+    }
+
+    // Testimonial: individual reports, news, commercial sources
+    if src == "news" or src == "commercial" or src == "testimonial" or src == "web_general" {
+        strength = EvidenceStrength.TESTIMONIAL
+        boundary = KnowledgeBoundary.UNCERTAIN
+        ep_type = EpistemicType.OBSERVATIONAL
+    }
+
+    // Inferred: derived from reasoning, not directly observed
+    if src == "causal_inference" or src == "logic_derivation" or src == "analogy" {
+        strength = EvidenceStrength.INFERRED
+        boundary = KnowledgeBoundary.UNCERTAIN if conf < 0.7 else KnowledgeBoundary.KNOWN_UNVERIFIED
+        ep_type = EpistemicType.FORMAL if src == "logic_derivation" else EpistemicType.OBSERVATIONAL
+    }
+
+    // Speculative: social media, unverified user input, generated content
+    if src == "social" or src == "user_unverified" or src == "generated" or src == "llm_output" {
+        strength = EvidenceStrength.SPECULATIVE
+        boundary = KnowledgeBoundary.UNKNOWN
+        ep_type = EpistemicType.SPECULATIVE
+    }
+
+    // Detect defeaters: reasons to doubt
+    let defeaters: List[string] = []
+    if conf < 0.3 { append(defeaters, "very_low_confidence") }
+    if strength == EvidenceStrength.SPECULATIVE { append(defeaters, "speculative_source") }
+    if strength == EvidenceStrength.UNKNOWN { append(defeaters, "unknown_source_type") }
+
+    return EpistemicStatus {
+        epistemic_type: ep_type,
+        evidence_strength: strength,
+        boundary: boundary,
+        confidence: conf,
+        source_count: 1,
+        defeaters: defeaters
+    }
+}
+
+fn calibrated_confidence(raw_confidence: float, evidence: EvidenceStrength, source_count: int) -> float {
+    require raw_confidence >= 0.0
+    require raw_confidence <= 1.0
+
+    // Apply evidence-strength ceiling: speculative sources can never
+    // produce high confidence regardless of what the raw score says
+    let ceiling = 1.0
+    if evidence == EvidenceStrength.AXIOMATIC { ceiling = 1.0 }
+    if evidence == EvidenceStrength.EMPIRICAL_STRONG { ceiling = 0.95 }
+    if evidence == EvidenceStrength.EMPIRICAL_MODERATE { ceiling = 0.85 }
+    if evidence == EvidenceStrength.TESTIMONIAL { ceiling = 0.70 }
+    if evidence == EvidenceStrength.INFERRED { ceiling = 0.80 }
+    if evidence == EvidenceStrength.SPECULATIVE { ceiling = 0.50 }
+    if evidence == EvidenceStrength.UNKNOWN { ceiling = 0.40 }
+
+    let capped = min(raw_confidence, ceiling)
+
+    // Source count bonus: independent corroboration increases confidence
+    // but with diminishing returns (log scale)
+    let source_bonus = 0.0
+    if source_count > 1 {
+        import math from "std/math"
+        source_bonus = min(math.log2(float(source_count)) * 0.05, 0.15)
+    }
+
+    // Source count penalty: single source gets a small penalty
+    let source_penalty = 0.0
+    if source_count <= 1 and evidence != EvidenceStrength.AXIOMATIC {
+        source_penalty = 0.05
+    }
+
+    let calibrated = min(max(capped + source_bonus - source_penalty, 0.0), 0.99)
+    return calibrated
+}
+
+/// Determine if the system should abstain from answering.
+fn should_abstain(confidence: float, evidence: EvidenceStrength,
+                  boundary: KnowledgeBoundary, threshold: float) -> bool {
+    // Always abstain if confidence is below threshold
+    if confidence < threshold { return true }
+
+    // Always abstain on unknowable questions
+    if boundary == KnowledgeBoundary.UNKNOWABLE { return true }
+
+    // Abstain on speculative evidence below a higher bar
+    if evidence == EvidenceStrength.SPECULATIVE and confidence < 0.6 { return true }
+
+    // Abstain on unknown evidence type below an even higher bar
+    if evidence == EvidenceStrength.UNKNOWN and confidence < 0.7 { return true }
+
+    return false
+}
+
+/// ---------- Norms ----------
+
+norm no_high_confidence_on_speculation {
+    type: prohibition,
+    scope: global,
+    action: "set_confidence",
+    priority: 90,
+    condition: epistemic_type == EpistemicType.SPECULATIVE and confidence > 0.6
+}
+
+norm prefer_verified_sources {
+    type: obligation,
+    scope: global,
+    action: "knowledge_retrieval",
+    priority: 80,
+    condition: verified_alternative_exists == true
+}
+
+/// ---------- Exports ----------
+
+export EvidenceStrength, KnowledgeBoundary, EpistemicStatus
+export classify_evidence, calibrated_confidence, should_abstain

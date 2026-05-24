@@ -1,0 +1,38 @@
+{
+  "domain": "finance",
+  "version": "2026.1",
+  "source": "Basel Committee / SEC / EU regulatory bodies",
+  "source_tier": "t2_verified",
+  "facts": [
+    {
+      "id": "fr-basel-iii",
+      "text": "Basel III framework requires banks to maintain: minimum CET1 (Common Equity Tier 1) ratio of 4.5%, Tier 1 capital ratio of 6%, total capital ratio of 8%, plus conservation buffer of 2.5% and countercyclical buffer of 0-2.5%. Leverage ratio minimum 3%. Liquidity Coverage Ratio (LCR) requires sufficient high-quality liquid assets to cover 30-day net cash outflows. Net Stable Funding Ratio (NSFR) ensures stable funding over 1 year.",
+      "confidence": 0.95,
+      "tags": ["basel", "capital", "regulation", "mathematical"]
+    },
+    {
+      "id": "fr-mifid-ii",
+      "text": "MiFID II (Markets in Financial Instruments Directive II, EU): requires best execution for client orders, pre/post-trade transparency, transaction reporting within T+1, product governance (target market assessment), inducement restrictions, research unbundling (separate payment for research from execution). Applies to investment firms, trading venues, and data reporting services in EU/EEA.",
+      "confidence": 0.94,
+      "tags": ["mifid", "eu", "regulation", "compliance", "logical"]
+    },
+    {
+      "id": "fr-dodd-frank",
+      "text": "Dodd-Frank Act (US, 2010): created FSOC (Financial Stability Oversight Council) for systemic risk monitoring, Volcker Rule prohibits proprietary trading by banks, mandatory clearing of standardized OTC derivatives through CCPs, swap dealer registration with CFTC/SEC, enhanced prudential standards for SIFIs (Systemically Important Financial Institutions), orderly liquidation authority for failing firms.",
+      "confidence": 0.94,
+      "tags": ["dodd-frank", "us", "regulation", "systemic-risk", "logical"]
+    },
+    {
+      "id": "fr-aml-kyc",
+      "text": "AML/KYC requirements: Customer Due Diligence (CDD) verifies identity at onboarding. Enhanced Due Diligence (EDD) for high-risk customers (PEPs, high-risk jurisdictions). Ongoing monitoring of transactions for suspicious patterns. Suspicious Activity Reports (SARs) filed with FinCEN (US) or national FIU. Currency Transaction Reports (CTRs) for transactions over $10,000. Travel Rule requires originator/beneficiary information for wire transfers.",
+      "confidence": 0.95,
+      "tags": ["aml", "kyc", "compliance", "logical"]
+    },
+    {
+      "id": "fr-sox",
+      "text": "Sarbanes-Oxley Act (SOX, US 2002): Section 302 requires CEO/CFO certification of financial reports. Section 404 mandates internal control assessment and auditor attestation. Section 802 criminalizes document destruction. Section 906 imposes criminal penalties for false certification. Applies to all US public companies and their auditors. PCAOB oversees audit firms.",
+      "confidence": 0.95,
+      "tags": ["sox", "audit", "internal-controls", "compliance", "logical"]
+    }
+  ]
+}

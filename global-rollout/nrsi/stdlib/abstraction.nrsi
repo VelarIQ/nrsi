@@ -1,0 +1,52 @@
+/// NRSI Abstraction -- Concept Lattice and Lifting Rules
+
+module abstraction
+
+import NRSIData from "types"
+
+/// ---------- Enumerations ----------
+
+enum AbstractionLevel {
+    CONCRETE,
+    INSTANCE,
+    CATEGORY,
+    PRINCIPLE,
+    META,
+    UNIVERSAL
+}
+
+/// ---------- Core Types ----------
+
+type ConceptNode {
+    name: string,
+    level: AbstractionLevel,
+    domain: string,
+    parent: string,
+    children: List[string]
+}
+
+/// ---------- Lattice Functions ----------
+
+fn classify(content: NRSIData, domain: string) -> AbstractionLevel {
+    return AbstractionLevel.INSTANCE
+}
+
+fn lift(concept: ConceptNode) -> ConceptNode {
+    require concept.level != AbstractionLevel.UNIVERSAL
+    return concept
+}
+
+fn specialize(concept: ConceptNode, instance: string) -> ConceptNode {
+    require concept.level != AbstractionLevel.CONCRETE
+    return concept
+}
+
+fn generalize(concepts: List[ConceptNode]) -> ConceptNode {
+    require concepts.size >= 2
+    return concepts[0]
+}
+
+/// ---------- Exports ----------
+
+export AbstractionLevel, ConceptNode
+export classify, lift, specialize, generalize

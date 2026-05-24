@@ -1,0 +1,481 @@
+/// NRSI Reasoning — Compositional Concept Formation.
+///
+/// Combines known concepts into novel ones by finding complementary properties,
+/// shared constraints, and emergent interactions.  Uses the CausalGraph to
+/// predict what happens when two concepts interact.
+///
+/// All transformer-free.  No external ML dependencies.
+
+module reasoning_composition
+
+from "reasoning_graph" import CausalGraph, GraphEdge, GraphNode, RelationType
+from "reasoning_inference" import InferenceEngine, InferenceResult
+
+/// ── Profile Types ──────────────────────────────────────────────────
+
+type ConceptProfile {
+    concept: string,
+    domain: string,
+    inputs: List[string],
+    outputs: List[string],
+    properties: Dict[string, Any],
+    causes: List[string],
+    caused_by: List[string],
+    enables: List[string],
+    requires: List[string],
+    produces: List[string],
+    prevents: List[string]
+}
+
+fn concept_profile_all_connections(cp: ConceptProfile) -> int {
+    return (len(cp.causes) + len(cp.caused_by) + len(cp.enables)
+            + len(cp.requires) + len(cp.produces) + len(cp.prevents))
+}
+
+type CompositionMatch {
+    provider: string,
+    consumer: string,
+    shared_channel: string,
+    match_type: string,
+    confidence: float
+}
+
+type InteractionPrediction {
+    concept_a: string,
+    concept_b: string,
+    interaction_type: string,
+    description: string,
+    confidence: float,
+    supporting_edges: List[GraphEdge]
+}
+
+type ComposedConcept {
+    name: string,
+    components: List[string],
+    composition_type: string,
+    description: string,
+    confidence: float,
+    interactions: List[InteractionPrediction],
+    matches: List[CompositionMatch],
+    is_novel: bool,
+    similar_existing: List[string]
+}
+
+/// ── Build Profile ──────────────────────────────────────────────────
+
+fn _build_profile(graph: CausalGraph, concept: string) -> Optional[ConceptProfile] {
+    let node = graph.get_node(concept)
+    if node == None {
+        return None
+    }
+
+    let causes: List[string] = []
+    for e in graph.outgoing(concept, RelationType.CAUSES) {
+        causes.append(e.target)
+    }
+    let caused_by: List[string] = []
+    for e in graph.incoming(concept, RelationType.CAUSES) {
+        caused_by.append(e.source)
+    }
+    let enables: List[string] = []
+    for e in graph.outgoing(concept, RelationType.ENABLES) {
+        enables.append(e.target)
+    }
+    let requires: List[string] = []
+    for e in graph.outgoing(concept, RelationType.REQUIRES) {
+        requires.append(e.target)
+    }
+    let produces: List[string] = []
+    for e in graph.outgoing(concept, RelationType.PRODUCES) {
+        produces.append(e.target)
+    }
+    let prevents: List[string] = []
+    for e in graph.outgoing(concept, RelationType.PREVENTS) {
+        prevents.append(e.target)
+    }
+
+    return ConceptProfile {
+        concept: node.concept, domain: node.domain,
+        inputs: node.inputs, outputs: node.outputs,
+        properties: node.properties,
+        causes: causes, caused_by: caused_by,
+        enables: enables, requires: requires,
+        produces: produces, prevents: prevents
+    }
+}
+
+/// ── Concept Composer ───────────────────────────────────────────────
+
+class ConceptComposer {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn find_output_input_matches(self, concept_a: string,
+                                  concept_b: string) -> List[any] {
+        let pa = _build_profile(self._graph, concept_a)
+        let pb = _build_profile(self._graph, concept_b)
+        if pa == None or pb == None {
+            return []
+        }
+
+        let matches: List[CompositionMatch] = []
+
+        let a_out: Set[string] = set()
+        for x in pa.outputs {
+            a_out.add(x)
+        }
+        for x in pa.produces {
+            a_out.add(x)
+        }
+        let b_in: Set[string] = set()
+        for x in pb.inputs {
+            b_in.add(x)
+        }
+        for x in pb.requires {
+            b_in.add(x)
+        }
+        for shared in a_out {
+            if shared in b_in {
+                matches.append(CompositionMatch {
+                    provider: concept_a, consumer: concept_b,
+                    shared_channel: shared, match_type: "output_feeds_input",
+                    confidence: 0.7
+                })
+            }
+        }
+
+        let b_out: Set[string] = set()
+        for x in pb.outputs {
+            b_out.add(x)
+        }
+        for x in pb.produces {
+            b_out.add(x)
+        }
+        let a_in: Set[string] = set()
+        for x in pa.inputs {
+            a_in.add(x)
+        }
+        for x in pa.requires {
+            a_in.add(x)
+        }
+        for shared in b_out {
+            if shared in a_in {
+                matches.append(CompositionMatch {
+                    provider: concept_b, consumer: concept_a,
+                    shared_channel: shared, match_type: "output_feeds_input",
+                    confidence: 0.7
+                })
+            }
+        }
+
+        let a_causes_set: Set[string] = set()
+        for x in pa.causes {
+            a_causes_set.add(x)
+        }
+        for x in pa.enables {
+            a_causes_set.add(x)
+        }
+        let b_requires_set: Set[string] = set()
+        for x in pb.requires {
+            b_requires_set.add(x)
+        }
+        for shared in a_causes_set {
+            if shared in b_requires_set {
+                matches.append(CompositionMatch {
+                    provider: concept_a, consumer: concept_b,
+                    shared_channel: shared, match_type: "enables_requirement",
+                    confidence: 0.6
+                })
+            }
+        }
+
+        return matches
+    }
+
+    fn find_causal_synergies(self, concept_a: string,
+                              concept_b: string) -> List[any] {
+        let pa = _build_profile(self._graph, concept_a)
+        let pb = _build_profile(self._graph, concept_b)
+        if pa == None or pb == None {
+            return []
+        }
+
+        let matches: List[CompositionMatch] = []
+
+        let a_caused_by: Set[string] = set()
+        for x in pa.caused_by {
+            a_caused_by.add(x)
+        }
+        let b_caused_by: Set[string] = set()
+        for x in pb.caused_by {
+            b_caused_by.add(x)
+        }
+        for cause in a_caused_by {
+            if cause in b_caused_by {
+                matches.append(CompositionMatch {
+                    provider: concept_a, consumer: concept_b,
+                    shared_channel: cause, match_type: "shared_root_cause",
+                    confidence: 0.5
+                })
+            }
+        }
+
+        for target in pa.causes {
+            if target in pb.prevents {
+                matches.append(CompositionMatch {
+                    provider: concept_a, consumer: concept_b,
+                    shared_channel: target,
+                    match_type: "cause_prevented_by_partner",
+                    confidence: 0.55
+                })
+            }
+        }
+
+        return matches
+    }
+
+    fn compose(self, concept_a: string,
+               concept_b: string) -> Optional[ComposedConcept] {
+        let oi_matches = self.find_output_input_matches(concept_a, concept_b)
+        let synergies = self.find_causal_synergies(concept_a, concept_b)
+        let all_matches: List[CompositionMatch] = []
+        for m in oi_matches {
+            all_matches.append(m)
+        }
+        for m in synergies {
+            all_matches.append(m)
+        }
+
+        if len(all_matches) == 0 {
+            return None
+        }
+
+        let best_type = "synergy"
+        if len(oi_matches) > 0 {
+            if len(oi_matches) > 1 {
+                best_type = "pipeline"
+            } else {
+                best_type = "enablement"
+            }
+        }
+
+        let total_conf = 0.0
+        for m in all_matches {
+            total_conf += m.confidence
+        }
+        let avg_conf = total_conf / len(all_matches)
+        let name = concept_a + " + " + concept_b
+
+        let desc_parts: List[string] = []
+        for m in all_matches {
+            if m.match_type == "output_feeds_input" {
+                desc_parts.append(
+                    m.provider + " provides " + m.shared_channel +
+                    " which " + m.consumer + " requires")
+            } else if m.match_type == "enables_requirement" {
+                desc_parts.append(
+                    m.provider + " enables " + m.shared_channel +
+                    " needed by " + m.consumer)
+            } else if m.match_type == "shared_root_cause" {
+                desc_parts.append(
+                    "both share root cause: " + m.shared_channel)
+            } else if m.match_type == "cause_prevented_by_partner" {
+                desc_parts.append(
+                    m.provider + " causes " + m.shared_channel +
+                    " but " + m.consumer + " can prevent it")
+            }
+        }
+
+        return ComposedConcept {
+            name: name, components: [concept_a, concept_b],
+            composition_type: best_type,
+            description: "; ".join(desc_parts),
+            confidence: avg_conf,
+            interactions: [],
+            matches: all_matches,
+            is_novel: true,
+            similar_existing: []
+        }
+    }
+}
+
+/// ── Interaction Predictor ──────────────────────────────────────────
+
+class InteractionPredictor {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._engine = InferenceEngine(graph, 3, 0.1)
+    }
+
+    fn predict(self, concept_a: string,
+               concept_b: string) -> List[any] {
+        let predictions: List[InteractionPrediction] = []
+
+        let effects_a: Set[string] = set()
+        for r in self._engine.forward(concept_a, 20) {
+            effects_a.add(r.conclusion)
+        }
+        let effects_b: Set[string] = set()
+        for r in self._engine.forward(concept_b, 20) {
+            effects_b.add(r.conclusion)
+        }
+
+        let shared: Set[string] = set()
+        for e in effects_a {
+            if e in effects_b {
+                shared.add(e)
+            }
+        }
+        for effect in shared {
+            predictions.append(InteractionPrediction {
+                concept_a: concept_a, concept_b: concept_b,
+                interaction_type: "amplification",
+                description: "Both " + concept_a + " and " + concept_b +
+                    " lead to " + effect + "; combining them may amplify this effect.",
+                confidence: 0.6,
+                supporting_edges: []
+            })
+        }
+
+        let a_prevents: Set[string] = set()
+        for e in self._graph.outgoing(concept_a, RelationType.PREVENTS) {
+            a_prevents.add(e.target)
+        }
+        let b_prevents: Set[string] = set()
+        for e in self._graph.outgoing(concept_b, RelationType.PREVENTS) {
+            b_prevents.add(e.target)
+        }
+
+        for blocked in effects_a {
+            if blocked in b_prevents {
+                predictions.append(InteractionPrediction {
+                    concept_a: concept_a, concept_b: concept_b,
+                    interaction_type: "counteraction",
+                    description: concept_a + " causes " + blocked + " but " +
+                        concept_b + " prevents it; the effect may be neutralized.",
+                    confidence: 0.55,
+                    supporting_edges: []
+                })
+            }
+        }
+
+        for blocked in effects_b {
+            if blocked in a_prevents {
+                predictions.append(InteractionPrediction {
+                    concept_a: concept_b, concept_b: concept_a,
+                    interaction_type: "counteraction",
+                    description: concept_b + " causes " + blocked + " but " +
+                        concept_a + " prevents it; the effect may be neutralized.",
+                    confidence: 0.55,
+                    supporting_edges: []
+                })
+            }
+        }
+
+        let only_a: List[string] = []
+        for e in effects_a {
+            if e not in effects_b and e not in shared {
+                only_a.append(e)
+            }
+        }
+        let only_b: List[string] = []
+        for e in effects_b {
+            if e not in effects_a and e not in shared {
+                only_b.append(e)
+            }
+        }
+        if len(only_a) > 0 and len(only_b) > 0 {
+            let limited_a: List[string] = []
+            for i in range(min(3, len(only_a))) {
+                limited_a.append(only_a[i])
+            }
+            let limited_b: List[string] = []
+            for i in range(min(3, len(only_b))) {
+                limited_b.append(only_b[i])
+            }
+            predictions.append(InteractionPrediction {
+                concept_a: concept_a, concept_b: concept_b,
+                interaction_type: "complementary",
+                description: "Unique contributions: " + concept_a + " brings " +
+                    ", ".join(limited_a) + "; " + concept_b + " brings " +
+                    ", ".join(limited_b) + ".",
+                confidence: 0.5,
+                supporting_edges: []
+            })
+        }
+
+        return predictions
+    }
+}
+
+/// ── Novelty Detector ───────────────────────────────────────────────
+
+class NoveltyDetector {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn check_novelty(self, composed: ComposedConcept) -> ComposedConcept {
+        let component_set: Set[string] = set()
+        for c in composed.components {
+            component_set.add(c.lower().strip())
+        }
+        let existing_similar: List[string] = []
+
+        for node in self._graph.all_nodes() {
+            let nid = node.node_id()
+            let node_words: Set[string] = set()
+            for w in nid.split() {
+                node_words.add(w)
+            }
+            for comp in component_set {
+                let comp_words: Set[string] = set()
+                for w in comp.split() {
+                    comp_words.add(w)
+                }
+                let overlap = 0
+                for w in node_words {
+                    if w in comp_words {
+                        overlap += 1
+                    }
+                }
+                if overlap >= 2 {
+                    existing_similar.append(nid)
+                    break
+                }
+            }
+        }
+
+        let neighbors_a = self._graph.neighbors(composed.components[0])
+        let neighbors_b: Set[string] = set()
+        if len(composed.components) > 1 {
+            neighbors_b = self._graph.neighbors(composed.components[1])
+        }
+        for n in neighbors_a {
+            if n in neighbors_b and n not in component_set {
+                existing_similar.append(n)
+            }
+        }
+
+        let deduped: Set[string] = set()
+        for s in existing_similar {
+            deduped.add(s)
+        }
+        let limited: List[string] = []
+        for s in deduped {
+            if len(limited) >= 10 {
+                break
+            }
+            limited.append(s)
+        }
+        composed.similar_existing = limited
+        composed.is_novel = len(existing_similar) == 0
+        return composed
+    }
+}
+
+/// ── Exports ────────────────────────────────────────────────────────
+
+export ConceptProfile, CompositionMatch, InteractionPrediction, ComposedConcept
+export ConceptComposer, InteractionPredictor, NoveltyDetector

@@ -1,0 +1,358 @@
+/// NRSI — Common-Sense Bootstrapper.
+///
+/// Generate obvious relations from templates, property inheritance,
+/// transitivity closure, default reasoning, and spatial/physical common sense.
+/// All transformer-free.
+
+module reasoning_commonsense
+
+
+import time from "std/time"
+from "reasoning_graph" import CausalGraph, GraphEdge, RelationType
+
+/// ---------- Taxonomic Knowledge Templates ----------
+
+let _TAXONOMY: Dict[string, List[string]] = {
+    "animal": ["mammal", "bird", "fish", "reptile", "insect", "amphibian"],
+    "mammal": ["dog", "cat", "human", "whale", "elephant", "horse", "mouse"],
+    "bird": ["eagle", "sparrow", "penguin", "parrot", "owl"],
+    "fish": ["salmon", "shark", "trout", "tuna"],
+    "reptile": ["snake", "lizard", "turtle", "crocodile"],
+    "plant": ["tree", "flower", "grass", "fern", "moss"],
+    "tree": ["oak", "pine", "maple", "birch"],
+    "fruit": ["apple", "banana", "orange", "grape", "strawberry"],
+    "vehicle": ["car", "truck", "bicycle", "airplane", "boat", "train"],
+    "body part": ["heart", "brain", "lung", "liver", "kidney", "skin"],
+    "emotion": ["happiness", "sadness", "anger", "fear", "surprise", "disgust"],
+    "metal": ["iron", "copper", "gold", "silver", "aluminum", "steel"],
+    "liquid": ["water", "oil", "blood", "milk", "gasoline"],
+    "gas": ["oxygen", "nitrogen", "carbon dioxide", "hydrogen", "methane"],
+    "energy": ["heat", "light", "electricity", "sound", "kinetic energy"],
+    "weather": ["rain", "snow", "wind", "thunder", "fog", "hail"],
+    "celestial body": ["star", "planet", "moon", "asteroid", "comet"],
+    "planet": ["earth", "mars", "jupiter", "venus", "saturn"],
+    "organ": ["heart", "brain", "liver", "kidney", "stomach", "lung"],
+    "disease": ["cancer", "diabetes", "influenza", "malaria"],
+    "material": ["wood", "stone", "plastic", "glass", "metal", "fabric"]
+}
+
+let _PROPERTY_INHERITANCE: Dict[string, Dict[string, bool]] = {
+    "animal": {"alive": true, "needs_food": true, "needs_water": true, "can_move": true},
+    "mammal": {"warm_blooded": true, "has_hair": true, "breathes_air": true},
+    "bird": {"has_feathers": true, "lays_eggs": true, "has_wings": true},
+    "fish": {"lives_in_water": true, "has_gills": true, "cold_blooded": true},
+    "plant": {"alive": true, "needs_sunlight": true, "produces_oxygen": true, "stationary": true},
+    "liquid": {"has_volume": true, "flows": true, "takes_container_shape": true},
+    "metal": {"conducts_electricity": true, "conducts_heat": true, "solid_at_room_temp": true},
+    "vehicle": {"needs_energy": true, "transports": true, "human_made": true},
+    "gas": {"fills_container": true, "compressible": true, "has_no_fixed_shape": true}
+}
+
+/// ---------- Causal Common-Sense Templates ----------
+
+let _CAUSAL_TEMPLATES: List[Tuple[string, string, RelationType, float]] = [
+    ("fire", "heat", RelationType.CAUSES, 0.95),
+    ("fire", "light", RelationType.CAUSES, 0.9),
+    ("fire", "smoke", RelationType.PRODUCES, 0.85),
+    ("rain", "wetness", RelationType.CAUSES, 0.95),
+    ("rain", "flood", RelationType.CAUSES, 0.6),
+    ("sun", "light", RelationType.PRODUCES, 0.95),
+    ("sun", "heat", RelationType.PRODUCES, 0.9),
+    ("gravity", "falling", RelationType.CAUSES, 0.95),
+    ("ice", "cold", RelationType.CORRELATES, 0.9),
+    ("exercise", "fitness", RelationType.CAUSES, 0.8),
+    ("exercise", "fatigue", RelationType.CAUSES, 0.7),
+    ("sleep", "rest", RelationType.CAUSES, 0.9),
+    ("food", "energy", RelationType.PRODUCES, 0.85),
+    ("water", "life", RelationType.ENABLES, 0.95),
+    ("oxygen", "breathing", RelationType.ENABLES, 0.95),
+    ("electricity", "light", RelationType.ENABLES, 0.85),
+    ("education", "knowledge", RelationType.CAUSES, 0.8),
+    ("wind", "erosion", RelationType.CAUSES, 0.7),
+    ("pollution", "disease", RelationType.CAUSES, 0.7),
+    ("vaccination", "immunity", RelationType.CAUSES, 0.85),
+    ("deforestation", "habitat loss", RelationType.CAUSES, 0.85),
+    ("overfishing", "species decline", RelationType.CAUSES, 0.8),
+    ("drought", "crop failure", RelationType.CAUSES, 0.8),
+    ("earthquake", "destruction", RelationType.CAUSES, 0.85),
+    ("photosynthesis", "glucose", RelationType.PRODUCES, 0.9),
+    ("photosynthesis", "oxygen", RelationType.PRODUCES, 0.9),
+    ("evaporation", "cloud formation", RelationType.CAUSES, 0.8),
+    ("condensation", "rain", RelationType.CAUSES, 0.85),
+    ("freezing", "ice", RelationType.PRODUCES, 0.95),
+    ("melting", "liquid", RelationType.PRODUCES, 0.95),
+    ("friction", "heat", RelationType.PRODUCES, 0.85),
+    ("pressure", "compression", RelationType.CAUSES, 0.8),
+    ("aging", "weakness", RelationType.CAUSES, 0.6),
+    ("stress", "anxiety", RelationType.CAUSES, 0.7),
+    ("cooperation", "success", RelationType.ENABLES, 0.7),
+    ("practice", "skill", RelationType.CAUSES, 0.8),
+    ("hunger", "eating", RelationType.CAUSES, 0.85),
+    ("thirst", "drinking", RelationType.CAUSES, 0.85),
+    ("cold", "hypothermia", RelationType.CAUSES, 0.6),
+    ("heat", "dehydration", RelationType.CAUSES, 0.6)
+]
+
+let _SPATIAL_DEFAULTS: List[Tuple[string, string, RelationType, float]] = [
+    ("container", "contents", RelationType.PART_OF, 0.7),
+    ("surface", "object", RelationType.CORRELATES, 0.5),
+    ("up", "down", RelationType.CONTRADICTS, 0.9),
+    ("left", "right", RelationType.CONTRADICTS, 0.9),
+    ("inside", "outside", RelationType.CONTRADICTS, 0.9),
+    ("hot", "cold", RelationType.CONTRADICTS, 0.85),
+    ("light", "dark", RelationType.CONTRADICTS, 0.85),
+    ("alive", "dead", RelationType.CONTRADICTS, 0.95),
+    ("wet", "dry", RelationType.CONTRADICTS, 0.85),
+    ("solid", "liquid", RelationType.CONTRADICTS, 0.7),
+    ("liquid", "gas", RelationType.CONTRADICTS, 0.7)
+]
+
+/// ---------- Types ----------
+
+type BootstrapReport {
+    taxonomy_edges: int,
+    causal_edges: int,
+    property_edges: int,
+    spatial_edges: int,
+    transitive_edges: int,
+    total_edges: int,
+    time_ms: float
+}
+
+/// ---------- Common-Sense Bootstrapper ----------
+
+class CommonSenseBootstrapper {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn bootstrap_all(self) -> BootstrapReport {
+        let t0 = time.time()
+        let report = BootstrapReport {
+            taxonomy_edges: 0, causal_edges: 0, property_edges: 0,
+            spatial_edges: 0, transitive_edges: 0, total_edges: 0, time_ms: 0.0
+        }
+        report.taxonomy_edges = self._inject_taxonomy()
+        report.causal_edges = self._inject_causal()
+        report.property_edges = self._inject_properties()
+        report.spatial_edges = self._inject_spatial()
+        report.transitive_edges = self._run_transitivity(3)
+        report.total_edges = report.taxonomy_edges + report.causal_edges + report.property_edges + report.spatial_edges + report.transitive_edges
+        report.time_ms = (time.time() - t0) * 1000.0
+        return report
+    }
+
+    fn bootstrap_taxonomy(self) -> int {
+        return self._inject_taxonomy()
+    }
+
+    fn bootstrap_causal(self) -> int {
+        return self._inject_causal()
+    }
+
+    fn run_transitivity(self, max_rounds: int) -> int {
+        return self._run_transitivity(max_rounds)
+    }
+
+    fn _inject_taxonomy(self) -> int {
+        let count = 0
+        for parent in _TAXONOMY {
+            let children = _TAXONOMY[parent]
+            for child in children {
+                if not self._graph.has_edge(child, parent, RelationType.IS_A) {
+                    self._graph.add_edge(child, parent, RelationType.IS_A, 0.95, "common_sense", "taxonomy template")
+                    count += 1
+                }
+            }
+        }
+        return count
+    }
+
+    fn _inject_causal(self) -> int {
+        let count = 0
+        for template in _CAUSAL_TEMPLATES {
+            let src = template[0]
+            let tgt = template[1]
+            let rel = template[2]
+            let conf = template[3]
+            if not self._graph.has_edge(src, tgt, rel) {
+                self._graph.add_edge(src, tgt, rel, conf, "common_sense", "causal template")
+                count += 1
+            }
+        }
+        return count
+    }
+
+    fn _inject_properties(self) -> int {
+        let count = 0
+        for category in _PROPERTY_INHERITANCE {
+            let props = _PROPERTY_INHERITANCE[category]
+            let children: List[string] = []
+            if category in _TAXONOMY {
+                children = _TAXONOMY[category]
+            }
+            for prop_name in props {
+                let prop_concept = prop_name.replace("_", " ")
+                if not self._graph.has_edge(category, prop_concept, RelationType.CORRELATES) {
+                    self._graph.add_edge(category, prop_concept, RelationType.CORRELATES, 0.9, "common_sense", "property template")
+                    count += 1
+                }
+                for child in children {
+                    if not self._graph.has_edge(child, prop_concept, RelationType.CORRELATES) {
+                        self._graph.add_edge(child, prop_concept, RelationType.CORRELATES, 0.8, "common_sense", "inherited from " + category)
+                        count += 1
+                    }
+                }
+            }
+        }
+        return count
+    }
+
+    fn _inject_spatial(self) -> int {
+        let count = 0
+        for template in _SPATIAL_DEFAULTS {
+            let src = template[0]
+            let tgt = template[1]
+            let rel = template[2]
+            let conf = template[3]
+            if not self._graph.has_edge(src, tgt, rel) {
+                self._graph.add_edge(src, tgt, rel, conf, "common_sense", "spatial/physical default")
+                count += 1
+            }
+        }
+        return count
+    }
+
+    fn _run_transitivity(self, max_rounds: int) -> int {
+        let total_new = 0
+        for round_num in range(max_rounds) {
+            let new_this_round = self._one_transitivity_pass()
+            total_new += new_this_round
+            if new_this_round == 0 {
+                break
+            }
+        }
+        return total_new
+    }
+
+    fn _one_transitivity_pass(self) -> int {
+        let new_edges = 0
+        let is_a_edges: List[GraphEdge] = []
+        for e in self._graph.all_edges() {
+            if e.relation == RelationType.IS_A {
+                is_a_edges.append(e)
+            }
+        }
+
+        for edge in is_a_edges {
+            let child = edge.source
+            let parent = edge.target
+
+            for parent_edge in self._graph.outgoing(parent) {
+                if parent_edge.relation == RelationType.IS_A {
+                    let grandparent = parent_edge.target
+                    if not self._graph.has_edge(child, grandparent, RelationType.IS_A) {
+                        self._graph.add_edge(
+                            child, grandparent, RelationType.IS_A,
+                            edge.confidence * parent_edge.confidence * 0.9,
+                            "common_sense",
+                            "transitive: " + child + " IS_A " + parent + " IS_A " + grandparent)
+                        new_edges += 1
+                    }
+                }
+            }
+        }
+
+        return new_edges
+    }
+}
+
+/// ---------- Default Reasoner ----------
+
+class DefaultReasoner {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn has_property(self, concept: string, prop: string) -> Tuple[bool, float, string] {
+        let concept_norm = concept.lower().strip()
+        let prop_norm = prop.lower().strip().replace("_", " ")
+
+        for edge in self._graph.outgoing(concept_norm) {
+            if edge.target == prop_norm {
+                return (true, edge.confidence, "direct: " + concept_norm + " → " + prop_norm)
+            }
+        }
+
+        for edge in self._graph.outgoing(concept_norm, RelationType.IS_A) {
+            let parent = edge.target
+            for pe in self._graph.outgoing(parent) {
+                if pe.target == prop_norm {
+                    let conf = edge.confidence * pe.confidence
+                    return (true, conf, "inherited: " + concept_norm + " IS_A " + parent + " → " + prop_norm)
+                }
+            }
+            for pe2 in self._graph.outgoing(parent, RelationType.IS_A) {
+                let grandparent = pe2.target
+                for gpe in self._graph.outgoing(grandparent) {
+                    if gpe.target == prop_norm {
+                        let conf = edge.confidence * pe2.confidence * gpe.confidence
+                        return (true, conf, "inherited: " + concept_norm + " IS_A " + parent + " IS_A " + grandparent + " → " + prop_norm)
+                    }
+                }
+            }
+        }
+
+        return (false, 0.0, "not found")
+    }
+
+    fn what_properties(self, concept: string) -> List[any] {
+        let concept_norm = concept.lower().strip()
+        let props: List[Tuple[string, float, string]] = []
+        let seen: Set[string] = set()
+
+        for edge in self._graph.outgoing(concept_norm, RelationType.CORRELATES) {
+            if edge.target not in seen {
+                seen.add(edge.target)
+                props.append((edge.target, edge.confidence, "direct"))
+            }
+        }
+
+        for edge in self._graph.outgoing(concept_norm, RelationType.IS_A) {
+            let parent = edge.target
+            for pe in self._graph.outgoing(parent, RelationType.CORRELATES) {
+                if pe.target not in seen {
+                    seen.add(pe.target)
+                    props.append((pe.target, edge.confidence * pe.confidence, "via " + parent))
+                }
+            }
+        }
+
+        let sorted_props: List[Tuple[string, float, string]] = []
+        let remaining = list(props)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i][1] > remaining[best_idx][1] {
+                    best_idx = i
+                }
+            }
+            sorted_props.append(remaining.pop(best_idx))
+        }
+        return sorted_props
+    }
+}
+
+/// ---------- Gate ----------
+
+gate commonsense_gate(data: raw[BootstrapReport]) -> validated[BootstrapReport] {
+    require confidence >= 0.5
+    validate taxonomy_check
+    validate consistency_check
+}
+
+/// ---------- Exports ----------
+
+export BootstrapReport
+export CommonSenseBootstrapper, DefaultReasoner
+export commonsense_gate

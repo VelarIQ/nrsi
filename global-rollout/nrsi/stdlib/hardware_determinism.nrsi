@@ -1,0 +1,202 @@
+/// NRSIP hardware determinism controller: enforce reproducible inference.
+///
+/// Full implementation of `nrsip/hardware_determinism.py`.
+/// Patent Claims 4, 12 — Hardware-Constrained Deterministic Inference.
+/// Validates GPU power, frequency, and DVFS state stay within tolerance.
+
+module hardware_determinism
+
+
+import time from "std/time"
+/// ---------- Enumerations ----------
+
+enum ViolationSeverity {
+    WARNING,
+    CRITICAL
+}
+
+/// ---------- Data records ----------
+
+type HardwareProfile {
+    gpu_power_budget_w: float,
+    gpu_power_tolerance_w: float,
+    gpu_frequency_mhz: int,
+    gpu_frequency_tolerance_mhz: int,
+    dvfs_enabled: bool,
+    activation_budget: int,
+    total_neurons: int
+}
+
+fn default_hardware_profile() -> HardwareProfile {
+    return HardwareProfile {
+        gpu_power_budget_w: 200.0,
+        gpu_power_tolerance_w: 10.0,
+        gpu_frequency_mhz: 1600,
+        gpu_frequency_tolerance_mhz: 50,
+        dvfs_enabled: false,
+        activation_budget: 100,
+        total_neurons: 100000
+    }
+}
+
+type HardwareReading {
+    power_w: float,
+    frequency_mhz: int,
+    temperature_c: float,
+    timestamp: float
+}
+
+fn new_hardware_reading(power_w: float, frequency_mhz: int,
+                        temperature_c: float) -> HardwareReading {
+    return HardwareReading {
+        power_w: power_w,
+        frequency_mhz: frequency_mhz,
+        temperature_c: temperature_c,
+        timestamp: time.time()
+    }
+}
+
+type DeterminismViolation {
+    violation_type: string,
+    expected: string,
+    actual: string,
+    severity: ViolationSeverity,
+    timestamp: float
+}
+
+fn violation_to_dict(v: DeterminismViolation) -> Dict[string, Any] {
+    return {
+        "violation_type": v.violation_type,
+        "expected": v.expected,
+        "actual": v.actual,
+        "severity": enum_value(v.severity),
+        "timestamp": v.timestamp
+    }
+}
+
+/// ---------- HardwareDeterminismController ----------
+
+class HardwareDeterminismController {
+    fn new(self, profile: HardwareProfile) {
+        self._profile = profile
+        self._violations = []
+        self._readings = []
+        self._deterministic = true
+    }
+
+    fn validate_reading(self, reading: HardwareReading) -> List[any] {
+        let found = []
+
+        let power_delta = abs(reading.power_w - self._profile.gpu_power_budget_w)
+        if power_delta > self._profile.gpu_power_tolerance_w {
+            let severity = ViolationSeverity.WARNING
+            if power_delta > self._profile.gpu_power_tolerance_w * 2 {
+                severity = ViolationSeverity.CRITICAL
+            }
+            append(found, DeterminismViolation {
+                violation_type: "power_envelope",
+                expected: (str(self._profile.gpu_power_budget_w)
+                    + "±" + str(self._profile.gpu_power_tolerance_w) + " W"),
+                actual: str(reading.power_w) + " W",
+                severity: severity,
+                timestamp: reading.timestamp
+            })
+        }
+
+        let freq_delta = abs(reading.frequency_mhz - self._profile.gpu_frequency_mhz)
+        if freq_delta > self._profile.gpu_frequency_tolerance_mhz {
+            let severity = ViolationSeverity.WARNING
+            if freq_delta > self._profile.gpu_frequency_tolerance_mhz * 2 {
+                severity = ViolationSeverity.CRITICAL
+            }
+            append(found, DeterminismViolation {
+                violation_type: "frequency_envelope",
+                expected: (str(self._profile.gpu_frequency_mhz)
+                    + "±" + str(self._profile.gpu_frequency_tolerance_mhz) + " MHz"),
+                actual: str(reading.frequency_mhz) + " MHz",
+                severity: severity,
+                timestamp: reading.timestamp
+            })
+        }
+
+        if self._profile.dvfs_enabled {
+            append(found, DeterminismViolation {
+                violation_type: "dvfs_active",
+                expected: "DVFS disabled",
+                actual: "DVFS enabled in profile",
+                severity: ViolationSeverity.CRITICAL,
+                timestamp: reading.timestamp
+            })
+        }
+
+        return found
+    }
+
+    fn enforce(self, reading: HardwareReading) -> bool {
+        let violations = self.validate_reading(reading)
+        for v in violations {
+            append(self._violations, v)
+        }
+
+        let has_critical = false
+        for v in violations {
+            if v.severity == ViolationSeverity.CRITICAL {
+                has_critical = true
+                break
+            }
+        }
+        if has_critical {
+            self._deterministic = false
+            log_error((
+                "Determinism VIOLATED — critical hardware deviation "
+                + "detected (reading power=" + str(reading.power_w) + "W, "
+                + "freq=" + str(reading.frequency_mhz) + "MHz)"
+            ))
+        }
+        return !has_critical
+    }
+
+    fn is_deterministic(self) -> bool {
+        return self._deterministic
+    }
+
+    fn record_reading(self, reading: HardwareReading) {
+        append(self._readings, reading)
+    }
+
+    fn violations(self) -> List[any] {
+        return list_copy(self._violations)
+    }
+
+    fn stats(self) -> Dict[string, Any] {
+        let critical_count = 0
+        for v in self._violations {
+            if v.severity == ViolationSeverity.CRITICAL {
+                critical_count += 1
+            }
+        }
+        let warning_count = len(self._violations) - critical_count
+        return {
+            "profile": {
+                "gpu_power_budget_w": self._profile.gpu_power_budget_w,
+                "gpu_power_tolerance_w": self._profile.gpu_power_tolerance_w,
+                "gpu_frequency_mhz": self._profile.gpu_frequency_mhz,
+                "gpu_frequency_tolerance_mhz": self._profile.gpu_frequency_tolerance_mhz,
+                "dvfs_enabled": self._profile.dvfs_enabled,
+                "activation_budget": self._profile.activation_budget,
+                "total_neurons": self._profile.total_neurons
+            },
+            "is_deterministic": self._deterministic,
+            "total_readings": len(self._readings),
+            "total_violations": len(self._violations),
+            "critical_violations": critical_count,
+            "warning_violations": warning_count
+        }
+    }
+}
+
+export ViolationSeverity
+export HardwareProfile, default_hardware_profile
+export HardwareReading, new_hardware_reading
+export DeterminismViolation, violation_to_dict
+export HardwareDeterminismController

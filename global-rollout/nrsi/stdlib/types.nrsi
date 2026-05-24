@@ -1,0 +1,149 @@
+/// NRSI Core Types — Trust-Typed Data Primitives
+///
+/// Every datum in NRSI carries a trust level that must be
+/// elevated through explicit validation gates, never implicitly.
+
+module types
+
+/// ---------- Trust Level Enum ----------
+
+enum TrustLevel {
+    RAW,
+    VALIDATED,
+    TRUSTED,
+    CERTIFIED
+}
+
+/// ---------- Epistemic Types ----------
+
+enum EpistemicType {
+    DEDUCTIVE,
+    INDUCTIVE,
+    ABDUCTIVE,
+    ANALOGICAL,
+    CAUSAL,
+    COMPUTATIONAL,
+    OBSERVATIONAL,
+    TESTIMONIAL,
+    CREATIVE,
+    SPECULATIVE
+}
+
+/// ---------- Temporal Validity ----------
+
+enum TemporalValidity {
+    ETERNAL,
+    STABLE,
+    CURRENT,
+    EPHEMERAL,
+    HISTORICAL,
+    PREDICTED
+}
+
+/// ---------- Confidence ----------
+
+type Confidence {
+    value: float,
+    epistemic: EpistemicType,
+    source: string,
+    timestamp: float
+}
+
+/// ---------- Provenance ----------
+
+type ProvenanceEntry {
+    source_id: string,
+    operation: string,
+    timestamp: float,
+    agent: string,
+    evidence_chain: List[string]
+}
+
+/// ---------- Core Data Wrapper ----------
+
+type NRSIData {
+    value: string,
+    trust: TrustLevel,
+    confidence: Confidence,
+    provenance: List[ProvenanceEntry],
+    epistemic: EpistemicType,
+    temporal: TemporalValidity,
+    domain: string
+}
+
+/// ---------- Constructor Functions ----------
+
+fn raw(value: string, domain: string) -> raw[NRSIData] {
+    return NRSIData {
+        value: value,
+        trust: TrustLevel.RAW,
+        confidence: Confidence { value: 0.0, epistemic: EpistemicType.OBSERVATIONAL, source: "input", timestamp: 0.0 },
+        provenance: [],
+        epistemic: EpistemicType.OBSERVATIONAL,
+        temporal: TemporalValidity.CURRENT,
+        domain: domain
+    }
+}
+
+fn deductive(value: string, confidence: float, proof: string) -> validated[NRSIData] {
+    return NRSIData {
+        value: value,
+        trust: TrustLevel.VALIDATED,
+        confidence: Confidence { value: confidence, epistemic: EpistemicType.DEDUCTIVE, source: proof, timestamp: 0.0 },
+        provenance: [],
+        epistemic: EpistemicType.DEDUCTIVE,
+        temporal: TemporalValidity.ETERNAL,
+        domain: "logic"
+    }
+}
+
+fn computed(value: string, confidence: float, method: string) -> validated[NRSIData] {
+    return NRSIData {
+        value: value,
+        trust: TrustLevel.VALIDATED,
+        confidence: Confidence { value: confidence, epistemic: EpistemicType.COMPUTATIONAL, source: method, timestamp: 0.0 },
+        provenance: [],
+        epistemic: EpistemicType.COMPUTATIONAL,
+        temporal: TemporalValidity.ETERNAL,
+        domain: "mathematics"
+    }
+}
+
+fn causal(value: string, confidence: float, chain: string) -> validated[NRSIData] {
+    return NRSIData {
+        value: value,
+        trust: TrustLevel.VALIDATED,
+        confidence: Confidence { value: confidence, epistemic: EpistemicType.CAUSAL, source: chain, timestamp: 0.0 },
+        provenance: [],
+        epistemic: EpistemicType.CAUSAL,
+        temporal: TemporalValidity.STABLE,
+        domain: "science"
+    }
+}
+
+fn observed(value: string, confidence: float, source: string) -> raw[NRSIData] {
+    return NRSIData {
+        value: value,
+        trust: TrustLevel.RAW,
+        confidence: Confidence { value: confidence, epistemic: EpistemicType.OBSERVATIONAL, source: source, timestamp: 0.0 },
+        provenance: [],
+        epistemic: EpistemicType.OBSERVATIONAL,
+        temporal: TemporalValidity.EPHEMERAL,
+        domain: "general"
+    }
+}
+
+fn speculative(value: string, confidence: float) -> raw[NRSIData] {
+    return NRSIData {
+        value: value,
+        trust: TrustLevel.RAW,
+        confidence: Confidence { value: confidence, epistemic: EpistemicType.SPECULATIVE, source: "speculation", timestamp: 0.0 },
+        provenance: [],
+        epistemic: EpistemicType.SPECULATIVE,
+        temporal: TemporalValidity.PREDICTED,
+        domain: "general"
+    }
+}
+
+export TrustLevel, EpistemicType, TemporalValidity, Confidence, ProvenanceEntry, NRSIData
+export raw, deductive, computed, causal, observed, speculative

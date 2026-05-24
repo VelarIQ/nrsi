@@ -1,0 +1,386 @@
+/// NRS Domain Crease Loader — TF-IDF fuzzy matching on JSON knowledge packs.
+///
+/// Loads JSON fact files from the knowledge/ directory at startup and provides
+/// fast fuzzy query matching using TF-IDF without external ML dependencies.
+///
+/// Patent-covered: NRS Domain Creases, knowledge ingestion, fact retrieval.
+
+module knowledge_loader
+
+import log from "logging"
+import json from "std/json"
+import os from "std/os"
+import re from "std/re"
+import math from "std/math"
+
+let KNOWLEDGE_DIR = os.path.join(os.path.dirname(__file__), "knowledge")
+
+let STOP_WORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "can", "shall", "to", "of", "in", "for",
+    "on", "with", "at", "by", "from", "as", "into", "through", "during",
+    "before", "after", "above", "below", "between", "out", "off", "over",
+    "under", "again", "further", "then", "once", "and", "but", "or",
+    "nor", "not", "so", "yet", "both", "either", "neither", "each",
+    "every", "all", "any", "few", "more", "most", "other", "some",
+    "such", "no", "only", "own", "same", "than", "too", "very",
+    "just", "about", "also", "it", "its", "this", "that", "these",
+    "those", "i", "me", "my", "we", "our", "you", "your", "he", "she",
+    "him", "her", "his", "they", "them", "their", "what", "which",
+    "who", "whom", "when", "where", "why", "how", "if",
+    "explain", "describe", "tell", "define", "compare",
+    "discuss", "show", "give", "list", "name"
+}
+
+fn tokenize(text: string) -> List[any] {
+    let words = re.findall("[a-zA-Z0-9]+(?:'[a-zA-Z]+)?", text.lower())
+    let result = []
+    for w in words {
+        if !STOP_WORDS.contains(w) {
+            if w.len() > 1 {
+                result.append(w)
+            }
+        }
+    }
+    return result
+}
+
+/// ── Data Types ──
+
+type Fact {
+    id: string,
+    text: string,
+    confidence: float,
+    domain: string,
+    tags: List[string],
+    tokens: List[string]
+}
+
+fn make_fact(id: string, text: string, confidence: float,
+             domain: string, tags: List[string]) -> Fact {
+    let tokens = tokenize(text)
+    return Fact {
+        id: id,
+        text: text,
+        confidence: confidence,
+        domain: domain,
+        tags: tags,
+        tokens: tokens
+    }
+}
+
+type MatchResult {
+    fact: Fact,
+    score: float,
+    matched_terms: List[string]
+}
+
+/// ── TF-IDF Index ──
+
+class TFIDFIndex {
+    fn init(self) {
+        self._facts = []
+        self._idf = {}
+        self._tf_cache = {}
+        self._built = false
+    }
+
+    fn add(self, fact: Fact) {
+        self._facts.append(fact)
+        self._built = false
+    }
+
+    fn build(self) {
+        let n = self._facts.len()
+        if n == 0 {
+            self._built = true
+            return
+        }
+
+        let doc_freq = {}
+        for fact in self._facts {
+            let unique_tokens = set()
+            for t in fact.tokens {
+                unique_tokens.add(t)
+            }
+            for token in unique_tokens {
+                let prev = doc_freq.get(token, 0)
+                doc_freq[token] = prev + 1
+            }
+        }
+
+        self._idf = {}
+        for token in doc_freq.keys() {
+            let df = doc_freq[token]
+            self._idf[token] = math.log(to_float(n + 1) / to_float(df + 1)) + 1.0
+        }
+
+        self._tf_cache = {}
+        for idx in range(0, self._facts.len()) {
+            let fact = self._facts[idx]
+            let tf = {}
+            let total = fact.tokens.len()
+            if total == 0 {
+                total = 1
+            }
+            for token in fact.tokens {
+                let prev = tf.get(token, 0.0)
+                tf[token] = prev + 1.0
+            }
+            for token in tf.keys() {
+                tf[token] = tf[token] / to_float(total)
+            }
+            self._tf_cache[idx] = tf
+        }
+
+        self._built = true
+    }
+
+    fn query(self, text: string, top_k: int, min_score: float) -> List[any] {
+        if !self._built {
+            self.build()
+        }
+
+        let query_tokens = tokenize(text)
+        if query_tokens.len() == 0 {
+            return []
+        }
+
+        let query_tf = {}
+        for t in query_tokens {
+            let prev = query_tf.get(t, 0.0)
+            query_tf[t] = prev + 1.0
+        }
+        let q_total = query_tokens.len()
+        for t in query_tf.keys() {
+            query_tf[t] = query_tf[t] / to_float(q_total)
+        }
+
+        let query_vec = {}
+        for t in query_tf.keys() {
+            let idf = self._idf.get(t, 1.0)
+            query_vec[t] = query_tf[t] * idf
+        }
+
+        let results = []
+        for idx in range(0, self._facts.len()) {
+            let fact = self._facts[idx]
+            let doc_tf = self._tf_cache.get(idx, {})
+            let dot = 0.0
+            let matched_terms = []
+            for t in query_vec.keys() {
+                let q_weight = query_vec[t]
+                let d_tf = doc_tf.get(t, -1.0)
+                if d_tf >= 0.0 {
+                    let d_weight = d_tf * self._idf.get(t, 1.0)
+                    dot += q_weight * d_weight
+                    matched_terms.append(t)
+                }
+            }
+
+            if dot < min_score {
+                continue
+            }
+
+            let tag_bonus = 0.0
+            let query_set = set()
+            for t in query_tokens {
+                query_set.add(t)
+            }
+            for tag in fact.tags {
+                let tag_lower = tag.lower().replace("-", "")
+                for qt in query_set {
+                    if qt.contains(tag_lower) {
+                        tag_bonus += 0.15
+                    } else if tag_lower.contains(qt) {
+                        tag_bonus += 0.15
+                    }
+                }
+            }
+
+            let multi_match_boost = 0.0
+            if matched_terms.len() >= 2 {
+                multi_match_boost = to_float(matched_terms.len()) * 0.3
+            } else if matched_terms.len() == 1 {
+                let single_term = matched_terms[0]
+                let generic_words = {
+                    "work", "works", "make", "makes", "run", "runs",
+                    "set", "sets", "use", "used", "uses", "get", "gets",
+                    "take", "time", "part", "like", "just", "know", "good", "give",
+                    "theory", "model", "system", "systems", "data", "machine",
+                    "learning", "process", "network", "based", "provides",
+                    "support", "supports", "control", "structure", "type",
+                    "level", "value", "state", "point", "method"
+                }
+                if single_term.len() < 4 {
+                    dot = dot * 0.3
+                } else if generic_words.contains(single_term) {
+                    dot = dot * 0.3
+                }
+            }
+
+            let score = dot + tag_bonus + multi_match_boost
+            results.append(MatchResult {
+                fact: fact,
+                score: score,
+                matched_terms: matched_terms
+            })
+        }
+
+        results.sort_by(fn(r: MatchResult) -> float { return -r.score })
+        if results.len() > top_k {
+            return results.slice(0, top_k)
+        }
+        return results
+    }
+
+    fn fact_count(self) -> int {
+        return self._facts.len()
+    }
+}
+
+/// ── Crease Loader ──
+
+class CreaseLoader {
+    fn init(self, knowledge_dir: Optional[string]) {
+        if knowledge_dir != nil {
+            self._knowledge_dir = knowledge_dir
+        } else {
+            self._knowledge_dir = KNOWLEDGE_DIR
+        }
+        self._indices = {}
+        self._global_index = TFIDFIndex()
+        self._global_index.init()
+        self._facts_loaded = 0
+        self._domains_loaded = []
+    }
+
+    fn load_all(self) -> int {
+        if !os.path.isdir(self._knowledge_dir) {
+            log.warn("Knowledge directory not found: " + self._knowledge_dir)
+            return 0
+        }
+
+        let total = 0
+        let files = os.listdir(self._knowledge_dir)
+        files.sort()
+        for filename in files {
+            if !filename.ends_with(".json") {
+                continue
+            }
+            let filepath = os.path.join(self._knowledge_dir, filename)
+            let count = self._load_file(filepath)
+            total += count
+        }
+
+        for idx in self._indices.values() {
+            idx.build()
+        }
+        self._global_index.build()
+
+        self._facts_loaded = total
+        log.info("Loaded " + to_string(total) + " facts across " +
+                 to_string(self._domains_loaded.len()) + " domains: " +
+                 to_string(self._domains_loaded))
+        return total
+    }
+
+    fn _load_file(self, filepath: string) -> int {
+        let data = nil
+        try {
+            let raw = open(filepath).read()
+            data = json.loads(raw)
+        } catch(e) {
+            log.warn("Failed to load " + filepath + ": " + to_string(e))
+            return 0
+        }
+
+        let domain = data.get("domain", "unknown")
+        let facts_raw = data.get("facts", [])
+        if self._indices.get(domain, nil) == nil {
+            let idx = TFIDFIndex()
+            idx.init()
+            self._indices[domain] = idx
+            self._domains_loaded.append(domain)
+        }
+
+        let idx = self._indices[domain]
+        let count = 0
+        for entry in facts_raw {
+            let fact = make_fact(
+                entry.get("id", ""),
+                entry.get("text", ""),
+                entry.get("confidence", 0.5),
+                domain,
+                entry.get("tags", [])
+            )
+            if fact.text != "" {
+                idx.add(fact)
+                self._global_index.add(fact)
+                count += 1
+            }
+        }
+
+        return count
+    }
+
+    fn query(self, text: string, domain: Optional[string], top_k: int) -> List[any] {
+        if domain != nil {
+            if domain != "general" {
+                if self._indices.get(domain, nil) != nil {
+                    let domain_results = self._indices[domain].query(text, top_k, 0.01)
+                    if domain_results.len() >= 2 {
+                        if domain_results[0].score > 0.1 {
+                            return domain_results
+                        }
+                    }
+                    let global_results = self._global_index.query(text, top_k, 0.01)
+                    let seen_ids = set()
+                    for r in domain_results {
+                        seen_ids.add(r.fact.id)
+                    }
+                    let merged = []
+                    for r in domain_results {
+                        merged.append(r)
+                    }
+                    for gr in global_results {
+                        if !seen_ids.contains(gr.fact.id) {
+                            merged.append(gr)
+                        }
+                    }
+                    merged.sort_by(fn(r: MatchResult) -> float { return -r.score })
+                    if merged.len() > top_k {
+                        return merged.slice(0, top_k)
+                    }
+                    return merged
+                }
+            }
+        }
+        return self._global_index.query(text, top_k, 0.01)
+    }
+
+    fn get_facts_for_domain(self, domain: string) -> List[any] {
+        let idx = self._indices.get(domain, nil)
+        if idx == nil {
+            return []
+        }
+        return idx._facts.copy()
+    }
+
+    fn stats(self) -> any {
+        let per_domain = {}
+        for d in self._indices.keys() {
+            per_domain[d] = self._indices[d].fact_count()
+        }
+        return {
+            "total_facts": self._facts_loaded,
+            "domains": self._domains_loaded,
+            "per_domain": per_domain
+        }
+    }
+}
+
+export Fact, make_fact, MatchResult
+export TFIDFIndex, CreaseLoader
+export tokenize

@@ -1,0 +1,255 @@
+/// NRSIP Behavioral Attestation — Identity Beyond Cryptography.
+///
+/// Cryptographic keys can be stolen. Activation patterns cannot.
+/// Each NRS instance produces a UNIQUE activation fingerprint based on its
+/// binary neuron weights. A challenge-response protocol verifies identity.
+///
+/// Protocol:
+///   1. Challenger selects N queries with pre-computed activation hashes.
+///   2. Sends challenges to the entity being attested.
+///   3. Entity processes each query through its neuron bank.
+///   4. Returns: activation_hash, h_score, processing_mode per challenge.
+///   5. Challenger compares against known-correct answers.
+///   6. ALL must match for attestation to pass.
+///
+/// Patent-covered: Behavioral attestation, activation fingerprint, challenge-response.
+/// Ported from nrsip/behavioral_attestation.py.
+
+module behavioral_attestation
+
+
+import time from "std/time"
+import hashlib from "std/hashlib"
+import secrets from "std/secrets"
+
+/// ── Enumerations ──
+
+enum AttestationVerdict {
+    PASSED = "PASSED",
+    FAILED = "FAILED",
+    PARTIAL = "PARTIAL",
+    TIMEOUT = "TIMEOUT",
+    ERROR = "ERROR"
+}
+
+/// ── Types ──
+
+type AttestationChallenge {
+    challenge_id: string,
+    query: string,
+    expected_activation_hash: string,
+    expected_h_score_min: float,
+    expected_h_score_max: float,
+    expected_processing_mode: string,
+    domain: string,
+    tier: string
+}
+
+type AttestationResponse {
+    challenge_id: string,
+    activation_hash: string,
+    h_score: float,
+    processing_mode: string,
+    processing_time_ms: float,
+    timestamp_ms: int
+}
+
+fn make_response(challenge_id: string, activation_hash: string,
+                 h_score: float, processing_mode: string,
+                 processing_time_ms: float) -> AttestationResponse {
+    return AttestationResponse {
+        challenge_id: challenge_id,
+        activation_hash: activation_hash,
+        h_score: h_score,
+        processing_mode: processing_mode,
+        processing_time_ms: processing_time_ms,
+        timestamp_ms: to_int(time.time() * 1000.0)
+    }
+}
+
+type AttestationResult {
+    entity_id: string,
+    verdict: AttestationVerdict,
+    challenges_total: int,
+    challenges_passed: int,
+    challenges_failed: int,
+    failed_details: List[Map[string, any]],
+    round_id: string,
+    timestamp_ms: int,
+    processing_time_ms: float
+}
+
+fn attestation_pass_rate(r: AttestationResult) -> float {
+    if r.challenges_total == 0 { return 0.0 }
+    return to_float(r.challenges_passed) / to_float(r.challenges_total)
+}
+
+/// ── Challenge Bank ──
+
+class AttestationChallengeBank {
+    fn init(self) {
+        self._challenges = {}
+    }
+
+    fn characterize_instance(self, instance_id: string,
+                             queries: List[string],
+                             activation_fn: any) -> int {
+        let challenges = []
+        for query in queries {
+            let result = activation_fn(query)
+            let act_hash = result[0]
+            let h_score = to_float(result[1])
+            let mode = to_string(result[2])
+            let challenge = AttestationChallenge {
+                challenge_id: hashlib.sha256(instance_id + ":" + query).hexdigest().slice(0, 16),
+                query: query,
+                expected_activation_hash: act_hash,
+                expected_h_score_min: h_score - 0.01,
+                expected_h_score_max: h_score + 0.01,
+                expected_processing_mode: mode,
+                domain: "general",
+                tier: "T2"
+            }
+            challenges.append(challenge)
+        }
+        self._challenges[instance_id] = challenges
+        return challenges.len()
+    }
+
+    fn select_challenges(self, instance_id: string,
+                         count: int) -> List[any] {
+        let bank = self._challenges.get(instance_id, nil)
+        if bank == nil {
+            raise "No challenge bank for instance " + instance_id
+        }
+        if bank.len() <= count {
+            return bank.copy()
+        }
+        let indices = set()
+        while indices.len() < count {
+            let idx = secrets.randbelow(bank.len())
+            indices.add(idx)
+        }
+        let sorted_indices = indices.to_sorted_list()
+        let selected = []
+        for i in sorted_indices {
+            selected.append(bank[i])
+        }
+        return selected
+    }
+
+    fn instance_count(self) -> int {
+        return self._challenges.len()
+    }
+}
+
+/// ── Attestation Verifier ──
+
+class BehavioralAttestationVerifier {
+    let H_SCORE_TOLERANCE = 0.02
+
+    fn init(self) {}
+
+    fn verify_response(self, challenge: AttestationChallenge,
+                       response: AttestationResponse) -> any {
+        if response.challenge_id != challenge.challenge_id {
+            return { "passed": false, "reason": "challenge_id mismatch" }
+        }
+
+        if response.activation_hash != challenge.expected_activation_hash {
+            return {
+                "passed": false,
+                "reason": "activation_hash mismatch: got " +
+                    response.activation_hash.slice(0, 16) + "..., expected " +
+                    challenge.expected_activation_hash.slice(0, 16) + "..."
+            }
+        }
+
+        let low = challenge.expected_h_score_min - self.H_SCORE_TOLERANCE
+        let high = challenge.expected_h_score_max + self.H_SCORE_TOLERANCE
+        if response.h_score < low || response.h_score > high {
+            return {
+                "passed": false,
+                "reason": "h_score out of range: " + to_string(response.h_score) +
+                    " not in [" + to_string(low) + ", " + to_string(high) + "]"
+            }
+        }
+
+        if response.processing_mode != challenge.expected_processing_mode {
+            return {
+                "passed": false,
+                "reason": "processing_mode mismatch: " + response.processing_mode +
+                    " != " + challenge.expected_processing_mode
+            }
+        }
+
+        return { "passed": true, "reason": "all checks passed" }
+    }
+
+    fn attest(self, entity_id: string,
+              challenges: List[AttestationChallenge],
+              responses: List[AttestationResponse]) -> AttestationResult {
+        let start_ms = time.monotonic() * 1000.0
+        let round_id = hashlib.sha256(
+            "attest:" + entity_id + ":" + to_string(time.time())
+        ).hexdigest().slice(0, 16)
+
+        let resp_map = {}
+        for r in responses {
+            resp_map[r.challenge_id] = r
+        }
+
+        let passed = 0
+        let failed = 0
+        let failed_details = []
+
+        for challenge in challenges {
+            let response = resp_map.get(challenge.challenge_id, nil)
+            if response == nil {
+                failed += 1
+                failed_details.append({
+                    "challenge_id": challenge.challenge_id,
+                    "reason": "no response received"
+                })
+                continue
+            }
+
+            let check = self.verify_response(challenge, response)
+            if check["passed"] == true {
+                passed += 1
+            } else {
+                failed += 1
+                failed_details.append({
+                    "challenge_id": challenge.challenge_id,
+                    "reason": check["reason"]
+                })
+            }
+        }
+
+        let verdict = AttestationVerdict.FAILED
+        if failed == 0 && passed == challenges.len() {
+            verdict = AttestationVerdict.PASSED
+        } else if passed > 0 && failed > 0 {
+            verdict = AttestationVerdict.PARTIAL
+        }
+
+        let elapsed = time.monotonic() * 1000.0 - start_ms
+
+        return AttestationResult {
+            entity_id: entity_id,
+            verdict: verdict,
+            challenges_total: challenges.len(),
+            challenges_passed: passed,
+            challenges_failed: failed,
+            failed_details: failed_details,
+            round_id: round_id,
+            timestamp_ms: to_int(time.time() * 1000.0),
+            processing_time_ms: round(elapsed, 2)
+        }
+    }
+}
+
+export AttestationVerdict
+export AttestationChallenge, AttestationResponse, make_response
+export AttestationResult, attestation_pass_rate
+export AttestationChallengeBank, BehavioralAttestationVerifier

@@ -1,0 +1,1888 @@
+/// NRSI — Unified Cognitive Bridge.
+///
+/// Wires ALL reasoning layers into a single cognitive pipeline:
+///
+/// Perception:   SemanticQueryParser
+/// Attention:    SpreadingActivation
+/// Memory:       CausalGraph + CommonSense + ConversationalLearner
+/// Inference:    InferenceEngine + AbductiveReasoner + CounterfactualReasoner
+///               + DeductionEngine + ConstraintPropagator
+/// Knowledge:    TemporalReasoner + QuantitativeReasoner
+/// Social:       SocialCognition
+/// Planning:     GoalPlanner
+/// Learning:     ConversationalLearner + BayesianUpdater
+/// Governance:   KnowledgeIngestionGate + GraphMaintenance
+/// Confidence:   GraphConfidenceManager
+/// Language:     GroundedGenerator (zero-hallucination)
+/// Epistemic:    EpistemicEngine
+/// Coherence:    CoherenceController
+/// Synthesis:    ReasoningSynthesizer
+/// Adversarial:  AdversarialSelfTester
+/// Provenance:   ProvenanceTracker
+///
+/// All transformer-free.
+
+module reasoning_bridge
+
+
+import time from "std/time"
+import os from "std/os"
+import json from "std/json"
+import log from "logging"
+from "reasoning_graph" import CausalGraph, FactExtractor, RelationType, GraphNode
+from "reasoning_inference" import InferenceEngine, InferenceResult
+from "reasoning_composition" import ConceptComposer, InteractionPredictor, NoveltyDetector, ComposedConcept
+from "reasoning_analogy" import TransferEngine, TransferredHypothesis, extract_structure
+from "reasoning_curiosity" import CuriosityScheduler, CuriosityReport
+from "reasoning_governance" import KnowledgeIngestionGate, GateVerdict
+from "reasoning_advanced" import AbductiveReasoner, CounterfactualReasoner, ConstraintPropagator, DeductionEngine, Hypothesis, CounterfactualResult
+from "reasoning_nlp" import EnhancedFactExtractor
+from "reasoning_maintenance" import GraphMaintenance, CoherenceReport
+from "reasoning_semantic" import SemanticQueryParser, SemanticIndex, SpreadingActivation, QueryUnderstanding, normalize_concept
+from "reasoning_temporal" import TemporalReasoner, QuantitativeReasoner
+from "reasoning_social" import SocialCognition, BeliefState
+from "reasoning_planning" import GoalPlanner, Plan
+from "reasoning_learning" import ConversationalLearner, SessionKnowledge
+from "reasoning_commonsense" import CommonSenseBootstrapper, DefaultReasoner, BootstrapReport
+from "reasoning_bayesian" import GraphConfidenceManager, BayesianUpdater, Evidence, EvidenceType
+from "reasoning_language" import GroundedGenerator, GroundedResponse
+from "reasoning_epistemic" import EpistemicEngine, EpistemicState
+from "reasoning_coherence" import CoherenceController
+from "reasoning_synthesis" import ReasoningSynthesizer, SynthesizedAnswer
+from "reasoning_adversarial" import AdversarialSelfTester, SelfTestResult
+from "reasoning_provenance" import ProvenanceTracker, ClaimAuditTrail
+from "reasoning_web" import WebKnowledgeIntegrator, WebAugmentedReasoner, WebIntegrationResult, SourceCredibilityTracker
+from "web_retrieval" import WebRetrievalEngine
+
+/// ---------- Query intent signal sets (keyword-based, no LLM) ----------
+
+let _CAUSAL_SIGNALS: Set[string] = {
+    "cause", "causes", "caused", "why", "because", "reason", "result",
+    "leads", "lead", "effect", "effects", "consequence", "due",
+    "therefore", "thus", "hence"
+}
+
+let _INFERENCE_SIGNALS: Set[string] = {
+    "if", "then", "implies", "follow", "follows", "conclude",
+    "infer", "deduce", "derive", "predict", "what happens"
+}
+
+let _ANALOGY_SIGNALS: Set[string] = {
+    "like", "similar", "analogy", "analogous", "compare", "parallel",
+    "metaphor", "resemble", "resembles", "how is"
+}
+
+let _COMPOSITION_SIGNALS: Set[string] = {
+    "combine", "combining", "together", "merge", "mix", "integrate",
+    "what if", "what would happen", "fusion", "hybrid", "plus"
+}
+
+let _EXPLANATION_SIGNALS: Set[string] = {
+    "explain", "how does", "how do", "describe", "what is the relationship",
+    "connect", "connection", "between", "link"
+}
+
+let _COUNTERFACTUAL_SIGNALS: Set[string] = {
+    "what if", "without", "remove", "didn't", "wasn't", "weren't",
+    "imagine", "suppose", "hypothetically", "what would happen if"
+}
+
+let _ABDUCTIVE_SIGNALS: Set[string] = {
+    "why", "explain", "best explanation", "most likely", "probable",
+    "what caused", "reason for", "account for"
+}
+
+let _TEMPORAL_SIGNALS: Set[string] = {
+    "when", "before", "after", "during", "timeline", "history",
+    "current", "still", "century", "year", "era", "period"
+}
+
+let _QUANTITATIVE_SIGNALS: Set[string] = {
+    "how much", "how many", "greater", "less", "more", "fewer",
+    "compare", "rank", "largest", "smallest", "total", "sum",
+    "percent", "ratio", "average"
+}
+
+let _PLANNING_SIGNALS: Set[string] = {
+    "how to", "steps", "plan", "achieve", "goal", "need",
+    "require", "what do i need", "blocker", "prerequisite"
+}
+
+let _SOCIAL_SIGNALS: Set[string] = {
+    "think", "believe", "feel", "perspective", "opinion",
+    "agree", "disagree", "understand", "intent", "motive"
+}
+
+/// ---------- Helper: count signal matches ----------
+
+fn _count_token_matches(signals: Set[string], tokens: Set[string]) -> int {
+    let count = 0
+    for w in signals {
+        if w in tokens {
+            count += 1
+        }
+    }
+    return count
+}
+
+fn _count_substring_matches(signals: Set[string], text: string) -> int {
+    let count = 0
+    for w in signals {
+        if w in text {
+            count += 1
+        }
+    }
+    return count
+}
+
+/// ---------- Reasoning Intent ----------
+
+class ReasoningIntent {
+    fn __init__(self, query: string) {
+        self.query = query
+        let ql = query.lower()
+        let words = ql.split()
+        let tokens: Set[string] = set()
+        for w in words {
+            tokens.add(w)
+        }
+
+        self.causal_score = _count_token_matches(_CAUSAL_SIGNALS, tokens) / 5.0
+        self.inference_score = _count_token_matches(_INFERENCE_SIGNALS, tokens) / 5.0
+        self.analogy_score = _count_token_matches(_ANALOGY_SIGNALS, tokens) / 4.0
+        self.composition_score = _count_token_matches(_COMPOSITION_SIGNALS, tokens) / 4.0
+        self.explanation_score = _count_substring_matches(_EXPLANATION_SIGNALS, ql) / 4.0
+        self.counterfactual_score = _count_substring_matches(_COUNTERFACTUAL_SIGNALS, ql) / 4.0
+        self.abductive_score = _count_substring_matches(_ABDUCTIVE_SIGNALS, ql) / 4.0
+        self.temporal_score = _count_token_matches(_TEMPORAL_SIGNALS, tokens) / 4.0
+        self.quantitative_score = _count_substring_matches(_QUANTITATIVE_SIGNALS, ql) / 4.0
+        self.planning_score = _count_substring_matches(_PLANNING_SIGNALS, ql) / 4.0
+        self.social_score = _count_token_matches(_SOCIAL_SIGNALS, tokens) / 4.0
+
+        self.needs_inference = (self.causal_score > 0.2 or
+                                self.inference_score > 0.2 or
+                                self.explanation_score > 0.3)
+        self.needs_analogy = self.analogy_score > 0.2
+        self.needs_composition = self.composition_score > 0.2
+        self.needs_counterfactual = self.counterfactual_score > 0.2
+        self.needs_abduction = self.abductive_score > 0.3
+        self.needs_temporal = self.temporal_score > 0.2
+        self.needs_quantitative = self.quantitative_score > 0.2
+        self.needs_planning = self.planning_score > 0.2
+        self.needs_social = self.social_score > 0.2
+    }
+
+    fn primary_mode(self) -> string {
+        let scores: Dict[string, float] = {
+            "causal_inference": self.causal_score + self.inference_score,
+            "analogy": self.analogy_score,
+            "composition": self.composition_score,
+            "explanation": self.explanation_score,
+            "counterfactual": self.counterfactual_score,
+            "abductive": self.abductive_score,
+            "temporal": self.temporal_score,
+            "quantitative": self.quantitative_score,
+            "planning": self.planning_score,
+            "social": self.social_score
+        }
+        let best_key = "general"
+        let best_val = 0.0
+        for k in scores {
+            if scores[k] > best_val {
+                best_val = scores[k]
+                best_key = k
+            }
+        }
+        if best_val < 0.1 {
+            return "general"
+        }
+        return best_key
+    }
+}
+
+/// ---------- Confidence-Aware Presentation Filter ----------
+
+let _CONFIDENCE_TIERS: List[Tuple[float, string]] = [
+    (0.7, "established"),
+    (0.4, "likely"),
+    (0.2, "tentative"),
+    (0.0, "speculative")
+]
+
+fn _confidence_label(conf: float) -> string {
+    for tier in _CONFIDENCE_TIERS {
+        if conf >= tier[0] {
+            return tier[1]
+        }
+    }
+    return "speculative"
+}
+
+fn _filter_and_label(inferences: List[InferenceResult],
+                     min_confidence: float) -> List[any] {
+    if min_confidence == None {
+        min_confidence = 0.15
+    }
+    let result: List[InferenceResult] = []
+    for r in inferences {
+        if r.confidence >= min_confidence {
+            result.append(r)
+        }
+    }
+    return result
+}
+
+/// ---------- Filler words for fallback concept extraction ----------
+
+let _FILLER: Set[string] = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "has",
+    "have", "had", "do", "does", "did", "will", "can", "may", "in",
+    "of", "to", "for", "on", "with", "at", "by", "from", "as", "or",
+    "and", "but", "not", "it", "its", "this", "that", "so", "if",
+    "what", "how", "why", "when", "where", "which", "who", "whom",
+    "would", "could", "should", "does", "between", "about"
+}
+
+/// ---------- Reasoning Result ----------
+
+class ReasoningResult {
+    fn __init__(self) {
+        self.inferences: List[InferenceResult] = []
+        self.explanations: List[string] = []
+        self.compositions: List[ComposedConcept] = []
+        self.hypotheses: List[TransferredHypothesis] = []
+        self.best_explanation: Optional[Hypothesis] = None
+        self.counterfactual: Optional[CounterfactualResult] = None
+        self.deduction_steps: List[Dict[string, Any]] = []
+        self.reasoning_mode: string = "general"
+        self.concepts_found: List[string] = []
+        self.confidence: float = 0.0
+        self.augmented_text: string = ""
+        self.temporal_facts: List[Dict[string, Any]] = []
+        self.quantity_facts: List[Dict[string, Any]] = []
+        self.plan: Optional[Plan] = None
+        self.social_context: Optional[Dict[string, Any]] = None
+        self.common_sense_used: List[string] = []
+        self.semantic_understanding: Optional[QueryUnderstanding] = None
+    }
+
+    fn has_content(self) -> bool {
+        return (len(self.inferences) > 0 or len(self.explanations) > 0
+                or len(self.compositions) > 0 or len(self.hypotheses) > 0
+                or self.augmented_text != "" or self.best_explanation != None
+                or self.counterfactual != None or len(self.temporal_facts) > 0
+                or len(self.quantity_facts) > 0 or self.plan != None
+                or len(self.common_sense_used) > 0)
+    }
+
+    fn summary(self) -> string {
+        let parts: List[string] = []
+
+        if self.best_explanation != None {
+            let h = self.best_explanation
+            let tier = _confidence_label(h.confidence)
+            parts.append(
+                "Best explanation [" + tier + "]: " + h.explanation +
+                " (confidence " + str(round(h.confidence, 2)) +
+                ", depth " + str(h.explanatory_depth) + ")"
+            )
+        }
+
+        if len(self.explanations) > 0 {
+            for i in range(min(3, len(self.explanations))) {
+                parts.append(self.explanations[i])
+            }
+        }
+
+        if len(self.inferences) > 0 {
+            let filtered = _filter_and_label(self.inferences, None)
+            for i in range(min(5, len(filtered))) {
+                let inf = filtered[i]
+                let tier = _confidence_label(inf.confidence)
+                parts.append("[" + tier + "] " + inf.natural_language())
+            }
+        }
+
+        if len(self.compositions) > 0 {
+            for i in range(min(2, len(self.compositions))) {
+                let comp = self.compositions[i]
+                parts.append("Composition (" + comp.name + "): " + comp.description)
+            }
+        }
+
+        if len(self.hypotheses) > 0 {
+            for i in range(min(3, len(self.hypotheses))) {
+                let hyp = self.hypotheses[i]
+                let tier = _confidence_label(hyp.confidence)
+                parts.append(
+                    "Hypothesis [" + tier + "]: " + hyp.target_hypothesis +
+                    " (transferred from " + hyp.source_domain + ")"
+                )
+            }
+        }
+
+        if self.counterfactual != None {
+            parts.append(self.counterfactual.summary)
+        }
+
+        if len(self.deduction_steps) > 0 {
+            parts.append("Deduction chain:")
+            for i in range(min(6, len(self.deduction_steps))) {
+                let step = self.deduction_steps[i]
+                parts.append(
+                    "  Step " + str(step.get("step", "")) +
+                    ": [" + str(step.get("op", "")) + "] " +
+                    str(step.get("prop", "")) +
+                    " -- " + str(step.get("why", ""))
+                )
+            }
+        }
+
+        if len(self.temporal_facts) > 0 {
+            for i in range(min(3, len(self.temporal_facts))) {
+                let tf = self.temporal_facts[i]
+                parts.append("[temporal] " + str(tf.get("concept", "")) + ": " + str(tf.get("info", "")))
+            }
+        }
+
+        if len(self.quantity_facts) > 0 {
+            for i in range(min(3, len(self.quantity_facts))) {
+                let qf = self.quantity_facts[i]
+                parts.append("[quantity] " + str(qf.get("concept", "")) + ": " + str(qf.get("value", "")))
+            }
+        }
+
+        if self.plan != None and len(self.plan.actions) > 0 {
+            parts.append(
+                "Plan (" + str(self.plan.action_count) + " steps, p=" +
+                str(round(self.plan.success_probability, 2)) + "):"
+            )
+            for i in range(min(5, len(self.plan.actions))) {
+                parts.append("  → " + self.plan.actions[i].description)
+            }
+        }
+
+        if len(self.common_sense_used) > 0 {
+            let items: List[string] = []
+            for i in range(min(3, len(self.common_sense_used))) {
+                items.append(self.common_sense_used[i])
+            }
+            parts.append("Common sense applied: " + ", ".join(items))
+        }
+
+        if len(parts) > 0 {
+            return "\n".join(parts)
+        }
+        return ""
+    }
+}
+
+/// ---------- Cognitive Response (structurally superior output) ----------
+
+class CognitiveResponse {
+    fn __init__(self) {
+        self.grounded: Optional[GroundedResponse] = None
+        self.epistemic: Optional[EpistemicState] = None
+        self.self_test: Optional[SelfTestResult] = None
+        self.provenance: Optional[ClaimAuditTrail] = None
+        self.synthesis: Optional[SynthesizedAnswer] = None
+        self.coherence_check: Optional[Dict[string, Any]] = None
+        self.reasoning: Optional[ReasoningResult] = None
+        self.web_augmentation: Optional[WebIntegrationResult] = None
+        self.processing_time_ms: float = 0.0
+    }
+
+    fn text(self) -> string {
+        if self.grounded != None and self.grounded.text != "" {
+            return self.grounded.text
+        }
+        if self.reasoning != None and self.reasoning.augmented_text != "" {
+            return self.reasoning.augmented_text
+        }
+        return ""
+    }
+
+    fn confidence(self) -> float {
+        if self.self_test != None {
+            return self.self_test.confidence_after_challenge
+        }
+        if self.grounded != None {
+            return self.grounded.overall_confidence
+        }
+        if self.reasoning != None {
+            return self.reasoning.confidence
+        }
+        return 0.0
+    }
+
+    fn quality_grade(self) -> string {
+        if self.self_test != None and self.self_test.quality_rating != None {
+            return self.self_test.quality_rating.grade
+        }
+        return "?"
+    }
+
+    fn is_safe_to_present(self) -> bool {
+        if self.self_test != None {
+            return self.self_test.should_present
+        }
+        return true
+    }
+
+    fn honest_assessment(self) -> string {
+        if self.epistemic != None {
+            return self.epistemic.honest_assessment
+        }
+        return ""
+    }
+
+    fn full_report(self) -> Dict[string, Any] {
+        let report: Dict[string, Any] = {
+            "text": self.text(),
+            "confidence": self.confidence(),
+            "quality_grade": self.quality_grade(),
+            "safe_to_present": self.is_safe_to_present(),
+            "processing_time_ms": self.processing_time_ms
+        }
+
+        if self.epistemic != None {
+            report["epistemic"] = {
+                "know_well": self.epistemic.know_well,
+                "know_partially": self.epistemic.know_partially,
+                "dont_know": self.epistemic.dont_know,
+                "speculating": self.epistemic.speculating_about,
+                "certainty": self.epistemic.overall_certainty,
+                "assessment": self.epistemic.honest_assessment
+            }
+        }
+
+        if self.self_test != None {
+            let strong_count = 0
+            for c in self.self_test.counterarguments {
+                if c.strength >= 0.6 {
+                    strong_count += 1
+                }
+            }
+            let all_valid = true
+            for c in self.self_test.consistency_checks {
+                if not c.is_valid {
+                    all_valid = false
+                    break
+                }
+            }
+            let sm = ""
+            if self.self_test.steel_man != None {
+                sm = self.self_test.steel_man
+                if len(sm) > 200 {
+                    sm = sm[:200]
+                }
+            }
+            report["self_critique"] = {
+                "counterarguments": len(self.self_test.counterarguments),
+                "strong_counterarguments": strong_count,
+                "consistency_valid": all_valid,
+                "steel_man": sm,
+                "reasoning_trace": self.self_test.reasoning_trace
+            }
+        }
+
+        if self.provenance != None {
+            report["provenance"] = {
+                "total_claims": self.provenance.total_claims,
+                "grounded": self.provenance.grounded_claims,
+                "speculative": self.provenance.speculative_claims,
+                "stale": self.provenance.stale_claims,
+                "avg_confidence": str(round(self.provenance.avg_confidence * 100, 0)) + "%"
+            }
+        }
+
+        if self.grounded != None {
+            report["grounding"] = {
+                "grounded_ratio": str(round(self.grounded.grounded_ratio * 100, 0)) + "%",
+                "knowledge_gaps": self.grounded.knowledge_gaps,
+                "claim_count": self.grounded.claim_count
+            }
+        }
+
+        if self.synthesis != None {
+            report["dimensions"] = self.synthesis.dimension_count
+        }
+
+        if self.coherence_check != None {
+            report["coherence"] = self.coherence_check
+        }
+
+        if self.web_augmentation != None {
+            let new_concepts: List[string] = []
+            let seen_concepts: Set[string] = set()
+            for c in self.web_augmentation.new_concepts {
+                if c not in seen_concepts {
+                    seen_concepts.add(c)
+                    new_concepts.append(c)
+                }
+            }
+            let limited_concepts: List[string] = []
+            for i in range(min(10, len(new_concepts))) {
+                limited_concepts.append(new_concepts[i])
+            }
+            let limited_sources: List[string] = []
+            for i in range(min(5, len(self.web_augmentation.sources_used))) {
+                limited_sources.append(self.web_augmentation.sources_used[i])
+            }
+            report["web_augmentation"] = {
+                "queries_executed": self.web_augmentation.queries_executed,
+                "pages_fetched": self.web_augmentation.pages_fetched,
+                "facts_extracted": self.web_augmentation.facts_extracted,
+                "facts_accepted": self.web_augmentation.facts_accepted,
+                "facts_rejected": self.web_augmentation.facts_rejected,
+                "acceptance_rate": str(round(self.web_augmentation.acceptance_rate * 100, 0)) + "%",
+                "sources_used": limited_sources,
+                "new_concepts": limited_concepts,
+                "time_ms": self.web_augmentation.time_ms
+            }
+        }
+
+        return report
+    }
+}
+
+/// ---------- Reasoning Bridge (Unified Cognitive Core) ----------
+
+class ReasoningBridge {
+    fn __init__(self, graph: Optional[CausalGraph] = None) {
+        if graph != None {
+            self._graph = graph
+        } else {
+            self._graph = CausalGraph()
+        }
+
+        self._engine = InferenceEngine(self._graph, None, None)
+        self._composer = ConceptComposer(self._graph)
+        self._predictor = InteractionPredictor(self._graph)
+        self._novelty = NoveltyDetector(self._graph)
+        self._transfer = TransferEngine(self._graph)
+        self._extractor = EnhancedFactExtractor()
+        self._gate = KnowledgeIngestionGate(self._graph)
+        self._abductive = AbductiveReasoner(self._graph)
+        self._counterfactual = CounterfactualReasoner(self._graph)
+        self._deduction = DeductionEngine(self._graph)
+        self._constraint = ConstraintPropagator(self._graph)
+        self._maintenance = GraphMaintenance(self._graph)
+
+        self._semantic: Optional[SemanticQueryParser] = None
+        self._temporal = TemporalReasoner()
+        self._quantitative = QuantitativeReasoner()
+        self._social = SocialCognition()
+        self._planner = GoalPlanner(self._graph)
+        self._learner = ConversationalLearner(self._graph, self._gate)
+        self._commonsense: Optional[DefaultReasoner] = None
+        self._confidence = GraphConfidenceManager(self._graph)
+
+        self._generator = GroundedGenerator(self._graph)
+        self._epistemic = EpistemicEngine(self._graph, self._confidence)
+        self._coherence = CoherenceController(self._graph)
+        self._synthesizer = ReasoningSynthesizer(
+            self._graph, self._temporal, self._quantitative,
+            self._social, self._commonsense, self._confidence
+        )
+        self._adversarial = AdversarialSelfTester(self._graph)
+        self._provenance = ProvenanceTracker(self._graph, self._confidence)
+
+        self._curiosity: Optional[CuriosityScheduler] = None
+
+        self._web_engine = WebRetrievalEngine()
+        self._web_integrator = WebKnowledgeIntegrator(
+            self._graph, self._web_engine, self._gate, self._confidence
+        )
+        self._web_augmenter = WebAugmentedReasoner(self._web_integrator)
+        self._web_enabled = true
+
+        self._initialized = false
+        self._commonsense_bootstrapped = false
+    }
+
+    fn graph(self) -> CausalGraph {
+        return self._graph
+    }
+
+    fn initialized(self) -> bool {
+        return self._initialized
+    }
+
+    fn ingestion_gate(self) -> KnowledgeIngestionGate {
+        return self._gate
+    }
+
+    fn social(self) -> SocialCognition {
+        return self._social
+    }
+
+    fn temporal(self) -> TemporalReasoner {
+        return self._temporal
+    }
+
+    fn quantitative(self) -> QuantitativeReasoner {
+        return self._quantitative
+    }
+
+    fn planner(self) -> GoalPlanner {
+        return self._planner
+    }
+
+    fn learner(self) -> ConversationalLearner {
+        return self._learner
+    }
+
+    fn confidence_manager(self) -> GraphConfidenceManager {
+        return self._confidence
+    }
+
+    fn epistemic(self) -> EpistemicEngine {
+        return self._epistemic
+    }
+
+    fn coherence(self) -> CoherenceController {
+        return self._coherence
+    }
+
+    fn adversarial(self) -> AdversarialSelfTester {
+        return self._adversarial
+    }
+
+    fn provenance(self) -> ProvenanceTracker {
+        return self._provenance
+    }
+
+    fn generator(self) -> GroundedGenerator {
+        return self._generator
+    }
+
+    fn synthesizer(self) -> ReasoningSynthesizer {
+        return self._synthesizer
+    }
+
+    fn web_integrator(self) -> WebKnowledgeIntegrator {
+        return self._web_integrator
+    }
+
+    fn web_enabled(self) -> bool {
+        return self._web_enabled
+    }
+
+    fn set_web_enabled(self, value: bool) {
+        self._web_enabled = value
+    }
+
+    /// -- Initialization --
+
+    fn initialize(self, knowledge_dir: Optional[string] = None,
+                  bootstrap_commonsense: bool = true) -> Dict[string, Any] {
+        if knowledge_dir == None {
+            knowledge_dir = os.path.join(os.path.dirname(__file__), "knowledge")
+        }
+        if bootstrap_commonsense == None {
+            bootstrap_commonsense = true
+        }
+
+        let stats: Dict[string, Any] = {
+            "files": 0, "facts": 0, "triples": 0, "rejected": 0,
+            "commonsense": 0, "confidence_synced": 0
+        }
+
+        let cache_path = os.path.join(os.path.dirname(__file__), ".reasoning_graph_cache.json")
+
+        if os.path.exists(cache_path) {
+            try {
+                let data = json.loads(open(cache_path).read())
+                self._graph = CausalGraph.from_dict(data)
+                self._rebuild_all()
+                stats["triples"] = self._graph.edge_count()
+            } catch exc {
+                log.warn("Graph cache load failed; rebuilding")
+            }
+        }
+
+        if stats["triples"] == 0 and os.path.isdir(knowledge_dir) {
+            let filenames = sorted(os.listdir(knowledge_dir))
+            for filename in filenames {
+                if not filename.endswith(".json") {
+                    continue
+                }
+                let filepath = os.path.join(knowledge_dir, filename)
+                let pack: Dict[string, Any] = {}
+                try {
+                    pack = json.loads(open(filepath).read())
+                } catch exc {
+                    continue
+                }
+
+                let domain = pack.get("domain", filename.replace(".json", ""))
+                let facts = pack.get("facts", [])
+                stats["files"] += 1
+                stats["facts"] += len(facts)
+
+                let triples = self._extractor.extract_from_facts(facts, domain)
+                for t in triples {
+                    let decision = self._gate.gated_add_edge(
+                        t.subject, t.obj, t.relation,
+                        t.confidence, "knowledge_pack",
+                        t.domain, t.evidence, t.fact_id
+                    )
+                    if decision.verdict == GateVerdict.ACCEPT {
+                        stats["triples"] += 1
+                    } else {
+                        stats["rejected"] += 1
+                    }
+                }
+            }
+        }
+
+        if bootstrap_commonsense and not self._commonsense_bootstrapped {
+            let bootstrapper = CommonSenseBootstrapper(self._graph)
+            let report = bootstrapper.bootstrap_all()
+            stats["commonsense"] = report.total_edges
+            self._commonsense_bootstrapped = true
+        }
+
+        self._rebuild_all()
+        stats["confidence_synced"] = self._confidence.sync_from_graph()
+        self._save_cache()
+        self._initialized = true
+        return stats
+    }
+
+    fn _rebuild_all(self) {
+        self._engine = InferenceEngine(self._graph, None, None)
+        self._composer = ConceptComposer(self._graph)
+        self._predictor = InteractionPredictor(self._graph)
+        self._novelty = NoveltyDetector(self._graph)
+        self._transfer = TransferEngine(self._graph)
+        self._gate = KnowledgeIngestionGate(self._graph)
+        self._abductive = AbductiveReasoner(self._graph)
+        self._counterfactual = CounterfactualReasoner(self._graph)
+        self._deduction = DeductionEngine(self._graph)
+        self._constraint = ConstraintPropagator(self._graph)
+        self._maintenance = GraphMaintenance(self._graph)
+        self._planner = GoalPlanner(self._graph)
+        self._commonsense = DefaultReasoner(self._graph)
+        self._learner = ConversationalLearner(self._graph, self._gate)
+        self._confidence = GraphConfidenceManager(self._graph)
+
+        self._semantic = SemanticQueryParser(self._graph)
+        self._generator = GroundedGenerator(self._graph)
+        self._epistemic = EpistemicEngine(self._graph, self._confidence)
+        self._coherence = CoherenceController(self._graph)
+        self._synthesizer = ReasoningSynthesizer(
+            self._graph, self._temporal, self._quantitative,
+            self._social, self._commonsense, self._confidence
+        )
+        self._adversarial = AdversarialSelfTester(self._graph)
+        self._provenance = ProvenanceTracker(self._graph, self._confidence)
+
+        self._web_integrator = WebKnowledgeIntegrator(
+            self._graph, self._web_engine, self._gate, self._confidence
+        )
+        self._web_augmenter = WebAugmentedReasoner(self._web_integrator)
+    }
+
+    fn _save_cache(self) {
+        let cache_path = os.path.join(os.path.dirname(__file__), ".reasoning_graph_cache.json")
+        try {
+            open(cache_path, "w").write(json.dumps(self._graph.to_dict()))
+        } catch exc {
+            log.warn("Failed to save graph cache: " + str(exc))
+        }
+    }
+
+    /// -- Unified cognitive process --
+
+    fn process(self, query: string, session_id: string,
+               user_id: string, domain: string) -> ReasoningResult {
+        if session_id == None {
+            session_id = ""
+        }
+        if user_id == None {
+            user_id = ""
+        }
+        if domain == None {
+            domain = ""
+        }
+
+        let result = ReasoningResult()
+        let intent = ReasoningIntent(query)
+        result.reasoning_mode = intent.primary_mode()
+
+        if self._semantic != None {
+            let understanding = self._semantic.parse(query)
+            result.semantic_understanding = understanding
+            let found: List[string] = []
+            for i in range(min(10, len(understanding.key_concepts))) {
+                found.append(understanding.key_concepts[i][0])
+            }
+            result.concepts_found = found
+        } else {
+            result.concepts_found = self._extract_concepts_fallback(query)
+        }
+
+        let concepts = result.concepts_found
+
+        if user_id != "" {
+            let social_ctx = self._social.process_utterance(user_id, query)
+            result.social_context = social_ctx
+        }
+
+        if intent.needs_abduction and len(concepts) > 0 {
+            let best = self._abductive.best_explanation(concepts[0])
+            if best != None {
+                result.best_explanation = best
+            }
+        }
+
+        if intent.needs_counterfactual and len(concepts) > 0 {
+            let cf = self._counterfactual.remove_concept(concepts[0])
+            if cf.cascading_effects > 0 {
+                result.counterfactual = cf
+            }
+        }
+
+        if intent.needs_inference and len(concepts) >= 2 {
+            let explanation = self._engine.explain(concepts[0], concepts[1])
+            if "No reasoning path" not in explanation {
+                result.explanations.append(explanation)
+            }
+            let paths = self._engine.connect(concepts[0], concepts[1])
+            let filtered = _filter_and_label(paths, None)
+            for f in filtered {
+                result.inferences.append(f)
+            }
+        }
+
+        if intent.needs_inference and len(concepts) > 0 {
+            let fwd = self._engine.forward(concepts[0], 10)
+            let filtered = _filter_and_label(fwd, None)
+            for f in filtered {
+                result.inferences.append(f)
+            }
+            if result.best_explanation == None {
+                let best = self._abductive.best_explanation(concepts[0])
+                if best != None {
+                    result.best_explanation = best
+                }
+            }
+        }
+
+        if intent.needs_analogy and len(concepts) >= 2 {
+            let hyps = self._transfer.transfer_between_concepts(
+                concepts[0], concepts[1], 2, 5
+            )
+            for h in hyps {
+                result.hypotheses.append(h)
+            }
+        }
+
+        if intent.needs_composition and len(concepts) >= 2 {
+            let comp = self._composer.compose(concepts[0], concepts[1])
+            if comp != None {
+                comp = self._novelty.check_novelty(comp)
+                result.compositions.append(comp)
+            }
+            let predictions = self._predictor.predict(concepts[0], concepts[1])
+            for p in predictions {
+                result.explanations.append(
+                    "[" + p.interaction_type + "] " + p.description
+                )
+            }
+        }
+
+        if intent.needs_temporal and len(concepts) > 0 {
+            for i in range(min(3, len(concepts))) {
+                let c = concepts[i]
+                let tf = self._temporal.get_fact(c)
+                if tf != None and tf.has_time {
+                    let start_str = "?"
+                    if tf.year_start != None {
+                        start_str = str(tf.year_start)
+                    }
+                    let end_str = "present"
+                    if tf.year_end != None {
+                        end_str = str(tf.year_end)
+                    }
+                    result.temporal_facts.append({
+                        "concept": c,
+                        "info": start_str + "–" + end_str,
+                        "current": tf.is_current()
+                    })
+                }
+            }
+        }
+
+        if intent.needs_quantitative and len(concepts) > 0 {
+            for i in range(min(3, len(concepts))) {
+                let c = concepts[i]
+                let qs = self._quantitative.get_quantities(c)
+                for j in range(min(2, len(qs))) {
+                    result.quantity_facts.append({
+                        "concept": c,
+                        "value": str(qs[j])
+                    })
+                }
+            }
+        }
+
+        if intent.needs_planning and len(concepts) > 0 {
+            let goal = concepts[0]
+            let current_state: List[string] = []
+            if len(concepts) > 1 {
+                for i in range(1, len(concepts)) {
+                    current_state.append(concepts[i])
+                }
+            }
+            let plan = self._planner.plan(goal, current_state)
+            if len(plan.actions) > 0 {
+                result.plan = plan
+            }
+        }
+
+        if self._commonsense != None and len(concepts) > 0 {
+            for i in range(min(3, len(concepts))) {
+                let c = concepts[i]
+                let props = self._commonsense.what_properties(c)
+                if len(props) > 0 {
+                    let top = props[0]
+                    result.common_sense_used.append(c + " → " + top[0])
+                }
+            }
+        }
+
+        if not result.has_content() and len(concepts) > 0 {
+            let fwd = self._engine.forward(concepts[0], 5)
+            let bwd = self._engine.backward(concepts[0], 5)
+            let combined: List[InferenceResult] = []
+            for r in fwd {
+                combined.append(r)
+            }
+            for r in bwd {
+                combined.append(r)
+            }
+            let filtered = _filter_and_label(combined, None)
+            for f in filtered {
+                result.inferences.append(f)
+            }
+        }
+
+        if len(result.inferences) > 0 {
+            let max_conf = 0.0
+            for r in result.inferences {
+                if r.confidence > max_conf {
+                    max_conf = r.confidence
+                }
+            }
+            result.confidence = max_conf
+        } else if result.best_explanation != None {
+            result.confidence = result.best_explanation.confidence
+        } else if len(result.hypotheses) > 0 {
+            let max_conf = 0.0
+            for h in result.hypotheses {
+                if h.confidence > max_conf {
+                    max_conf = h.confidence
+                }
+            }
+            result.confidence = max_conf
+        }
+
+        result.augmented_text = result.summary()
+        return result
+    }
+
+    fn reason(self, query: string, domain: string) -> ReasoningResult {
+        return self.process(query, "", "", domain)
+    }
+
+    /// -- Full cognitive pipeline (structurally superior) --
+
+    fn think(self, query: string, session_id: string,
+             user_id: string, domain: string) -> CognitiveResponse {
+        let t0 = time.time()
+        let response = CognitiveResponse()
+
+        let reasoning = self.process(query, session_id, user_id, domain)
+        response.reasoning = reasoning
+
+        let concepts = reasoning.concepts_found
+
+        let inferences: Optional[List[InferenceResult]] = None
+        if len(reasoning.inferences) > 0 {
+            inferences = reasoning.inferences
+        }
+        let limited_concepts: List[string] = []
+        for i in range(min(5, len(concepts))) {
+            limited_concepts.append(concepts[i])
+        }
+        // Deduction phase: derive conclusions from known premises
+        if len(limited_concepts) > 0 and self._deduction != nil {
+            try {
+                let premises: List[string] = []
+                for c in limited_concepts {
+                    premises.append(c)
+                }
+                if len(reasoning.inferences) > 0 {
+                    for inf in reasoning.inferences[:3] {
+                        if inf.conclusion != nil {
+                            premises.append(inf.conclusion)
+                        }
+                    }
+                }
+                let deduction_result = self._deduction.deduce(premises, query)
+                if deduction_result != nil and deduction_result.get("success", false) {
+                    response.deduction = deduction_result
+                    let deduced_concepts = deduction_result.get("derived_concepts", [])
+                    for dc in deduced_concepts[:3] {
+                        if dc not in limited_concepts {
+                            limited_concepts.append(dc)
+                        }
+                    }
+                }
+            } catch(e) {
+                logging.debug("Deduction phase skipped: " + str(e))
+            }
+        }
+
+        // Constraint propagation: enforce consistency across the graph
+        if self._constraint != nil {
+            try {
+                let propagation_result = self._constraint.propagate()
+                if propagation_result != nil {
+                    response.constraint_propagation = propagation_result
+                    let violations = propagation_result.get("violations", [])
+                    if len(violations) > 0 {
+                        response.constraint_violations = violations
+                    }
+                }
+            } catch(e) {
+                logging.debug("Constraint propagation skipped: " + str(e))
+            }
+        }
+
+        response.grounded = self._generator.generate(
+            limited_concepts, inferences, reasoning.reasoning_mode)
+
+        response.epistemic = self._epistemic.assess_query(limited_concepts)
+
+        response.synthesis = self._synthesizer.synthesize(limited_concepts, user_id)
+
+        let claims: List[Tuple[string, string, string]] = []
+        if response.grounded != None {
+            for s in response.grounded.sentences {
+                for eid in s.edge_ids {
+                    let parts = eid.split("|")
+                    if len(parts) == 3 {
+                        claims.append((parts[0], parts[1], parts[2]))
+                    }
+                }
+            }
+        }
+
+        let chains: List[List[string]] = []
+        if len(reasoning.inferences) > 0 {
+            for i in range(min(3, len(reasoning.inferences))) {
+                let inf = reasoning.inferences[i]
+                if inf.path != None and len(inf.path) > 1 {
+                    chains.append(inf.path)
+                }
+            }
+        }
+
+        if len(claims) > 0 {
+            let gaps: List[string] = []
+            if response.grounded != None {
+                gaps = response.grounded.knowledge_gaps
+            }
+            response.self_test = self._adversarial.test(
+                claims, chains, reasoning.inferences, gaps)
+        }
+
+        if len(claims) > 0 {
+            response.coherence_check = self._coherence.validate_response(
+                claims, session_id)
+            if response.coherence_check.get("coherent") == true {
+                let confs: List[float] = []
+                if response.grounded != None {
+                    for s in response.grounded.sentences {
+                        if len(s.edge_ids) > 0 {
+                            confs.append(s.confidence)
+                        }
+                    }
+                }
+                self._coherence.commit_response(claims, session_id, confs)
+            }
+        }
+
+        if len(claims) > 0 {
+            response.provenance = self._provenance.audit_response(claims)
+        }
+
+        response.processing_time_ms = (time.time() - t0) * 1000
+        return response
+    }
+
+    /// -- Web-augmented thinking --
+
+    fn web_think(self, query: string, session_id: string,
+                 user_id: string, domain: string,
+                 auto_fill_gaps: bool) -> CognitiveResponse {
+        if auto_fill_gaps == None {
+            auto_fill_gaps = true
+        }
+        let t0 = time.time()
+
+        let initial = self.think(query, session_id, user_id, domain)
+
+        if not self._web_enabled or not auto_fill_gaps {
+            return initial
+        }
+
+        let gaps = self._identify_web_worthy_gaps(initial)
+        if len(gaps) == 0 {
+            return initial
+        }
+
+        let concepts: List[string] = []
+        if initial.reasoning != None {
+            concepts = initial.reasoning.concepts_found
+        }
+        let limited: List[string] = []
+        for i in range(min(3, len(concepts))) {
+            limited.append(concepts[i])
+        }
+        let web_result = self._web_augmenter.augment_for_gaps(
+            limited, gaps, query)
+
+        if web_result.facts_accepted == 0 {
+            initial.web_augmentation = web_result
+            initial.processing_time_ms = (time.time() - t0) * 1000
+            return initial
+        }
+
+        if self._semantic != None {
+            self._semantic = SemanticQueryParser(self._graph)
+        }
+
+        let augmented = self.think(query, session_id, user_id, domain)
+        augmented.web_augmentation = web_result
+        augmented.processing_time_ms = (time.time() - t0) * 1000
+        return augmented
+    }
+
+    fn web_research(self, topic: string, max_queries: int) -> WebIntegrationResult {
+        if max_queries == None {
+            max_queries = 5
+        }
+        return self._web_integrator.research_query(topic, max_queries)
+    }
+
+    fn web_curiosity_cycle(self, max_queries: int) -> WebIntegrationResult {
+        if max_queries == None {
+            max_queries = 5
+        }
+        let weak_domains: List[string] = []
+        let frontier: List[string] = []
+
+        if self._epistemic != None {
+            let domain_profiles = self._epistemic.profile_domains()
+            for domain_name in domain_profiles {
+                let profile = domain_profiles[domain_name]
+                if profile.coverage_score < 0.3 {
+                    weak_domains.append(domain_name)
+                }
+            }
+        }
+
+        let all_concepts = list(self._graph._nodes.keys())
+        let low_conf: List[string] = []
+        let frontier_set: Set[string] = set()
+        let low_conf_set: Set[string] = set()
+
+        for cid in all_concepts {
+            let outgoing = self._graph._outgoing.get(cid, [])
+            if len(outgoing) <= 1 {
+                if cid not in frontier_set {
+                    frontier_set.add(cid)
+                    frontier.append(cid)
+                }
+            }
+            for eid in outgoing {
+                let edge = self._graph._edges.get(eid)
+                if edge != None and edge.confidence < 0.4 {
+                    if cid not in low_conf_set {
+                        low_conf_set.add(cid)
+                        low_conf.append(cid)
+                    }
+                }
+            }
+        }
+
+        let limited_frontier: List[string] = []
+        for i in range(min(10, len(frontier))) {
+            limited_frontier.append(frontier[i])
+        }
+        let limited_low_conf: List[string] = []
+        for i in range(min(5, len(low_conf))) {
+            limited_low_conf.append(low_conf[i])
+        }
+
+        let targets: List[string] = []
+        for t in limited_frontier {
+            targets.append(t)
+        }
+        for t in limited_low_conf {
+            targets.append(t)
+        }
+
+        if len(targets) == 0 and len(weak_domains) == 0 {
+            return WebIntegrationResult()
+        }
+
+        let wd: List[string] = []
+        for i in range(min(3, len(weak_domains))) {
+            wd.append(weak_domains[i])
+        }
+        let tgt: List[string] = []
+        for i in range(min(5, len(targets))) {
+            tgt.append(targets[i])
+        }
+        return self._web_integrator.curiosity_explore(wd, tgt, max_queries)
+    }
+
+    fn _identify_web_worthy_gaps(self, response: CognitiveResponse) -> List[any] {
+        let gaps: List[string] = []
+
+        if response.grounded != None and len(response.grounded.knowledge_gaps) > 0 {
+            for g in response.grounded.knowledge_gaps {
+                gaps.append(g)
+            }
+        }
+
+        if response.epistemic != None {
+            if response.epistemic.overall_certainty < 0.3 {
+                for concept in response.epistemic.dont_know {
+                    gaps.append("Sparse knowledge about " + concept)
+                }
+                for concept in response.epistemic.speculating_about {
+                    gaps.append("Only speculating about " + concept)
+                }
+            }
+        }
+
+        if response.self_test != None and response.self_test.quality_rating != None {
+            let rating = response.self_test.quality_rating
+            if rating.completeness_score < 0.3 {
+                gaps.append("Very low completeness score")
+            }
+        }
+
+        return gaps
+    }
+
+    /// -- Conversational learning --
+
+    fn learn_from_turn(self, text: string, speaker: string,
+                       session_id: string) -> Dict[string, Any] {
+        if speaker == None {
+            speaker = "user"
+        }
+        if session_id == "" or session_id == None {
+            session_id = "default"
+        }
+        if self._learner.get_session(session_id) == None {
+            self._learner.start_session(session_id)
+        }
+
+        let learn_result = self._learner.process_turn(text, speaker, session_id)
+
+        let learned = learn_result.get("learned", [])
+        for fact in learned {
+            let edge_id = str(fact["subject"]) + "|" + str(fact["relation"]) + "|" + str(fact["object"])
+            let session = self._learner.get_session(session_id)
+            let strength = 0.5
+            if speaker != "user" {
+                strength = 0.7
+            }
+            let ev = Evidence {
+                evidence_id: "conv-" + session_id + "-" + str(session.turn_count),
+                evidence_type: EvidenceType.CONVERSATIONAL,
+                supports: true,
+                strength: strength,
+                source: speaker
+            }
+            self._confidence.add_evidence_for_edge(edge_id, ev, true)
+        }
+
+        if self._semantic != None and len(learned) > 0 {
+            self._semantic = SemanticQueryParser(self._graph)
+        }
+
+        return learn_result
+    }
+
+    fn session_summary(self, session_id: Optional[string]) -> Dict[string, Any] {
+        return self._learner.session_summary(session_id)
+    }
+
+    /// -- Social cognition integration --
+
+    fn process_user_intent(self, user_id: string, text: string) -> Dict[string, Any] {
+        return self._social.process_utterance(user_id, text)
+    }
+
+    fn set_user_belief(self, user_id: string, proposition: string,
+                       believes_true: bool, confidence: float) {
+        if confidence == None {
+            confidence = 0.7
+        }
+        let state = BeliefState.BELIEVES_TRUE
+        if not believes_true {
+            state = BeliefState.BELIEVES_FALSE
+        }
+        self._social.beliefs.set_belief(user_id, proposition, state, confidence)
+    }
+
+    fn get_common_ground(self, user_a: string, user_b: string) -> List[any] { return self._social.beliefs.common_ground(user_a, user_b) }
+
+    /// -- Goal planning integration --
+
+    fn plan_goal(self, goal: string, current_state: Optional[List[string]]) -> Dict[string, Any] {
+        let plan = self._planner.plan(goal, current_state)
+        let evaluation = self._planner.evaluate(plan)
+        let actions: List[Dict[string, Any]] = []
+        for a in plan.actions {
+            actions.append({
+                "id": a.action_id,
+                "description": a.description,
+                "confidence": a.confidence,
+                "status": a.status.value
+            })
+        }
+        return {
+            "plan": {
+                "goal": plan.goal,
+                "feasible": plan.is_feasible,
+                "actions": actions,
+                "success_probability": plan.success_probability,
+                "reasoning": plan.reasoning_trace
+            },
+            "evaluation": evaluation
+        }
+    }
+
+    /// -- Multi-step deduction --
+
+    fn deduce(self, premises: List[string], goal: string) -> Dict[string, Any] {
+        let chain = self._deduction.deduce(premises, goal)
+        let steps: List[Dict[string, Any]] = []
+        for s in chain.steps {
+            steps.append({
+                "step": s.step_number,
+                "op": s.operation,
+                "prop": s.proposition,
+                "conf": s.confidence,
+                "why": s.justification
+            })
+        }
+        return {
+            "success": chain.success,
+            "conclusion": chain.conclusion,
+            "confidence": chain.confidence,
+            "steps": steps,
+            "working_memory": chain.working_memory_snapshot
+        }
+    }
+
+    /// -- Counterfactual --
+
+    fn what_if_removed(self, concept: string) -> Dict[string, Any] {
+        let cf = self._counterfactual.remove_concept(concept)
+        let limited: List[string] = []
+        for i in range(min(20, len(cf.affected_conclusions))) {
+            limited.append(cf.affected_conclusions[i])
+        }
+        return {
+            "removed": cf.removed_concept,
+            "cascading_effects": cf.cascading_effects,
+            "affected": limited,
+            "broken_chains": len(cf.broken_chains),
+            "summary": cf.summary
+        }
+    }
+
+    /// -- Abductive --
+
+    fn best_explanation_for(self, observation: string,
+                            additional: Optional[List[string]]) -> Dict[string, Any] {
+        let hyps = self._abductive.explain(observation, additional)
+        if len(hyps) == 0 {
+            return {"found": false, "hypotheses": []}
+        }
+        let result_hyps: List[Dict[string, Any]] = []
+        for i in range(min(5, len(hyps))) {
+            let h = hyps[i]
+            result_hyps.append({
+                "explanation": h.explanation,
+                "confidence": h.confidence,
+                "depth": h.explanatory_depth,
+                "net_evidence": h.net_evidence
+            })
+        }
+        return {
+            "found": true,
+            "best": hyps[0].explanation,
+            "best_confidence": hyps[0].confidence,
+            "hypotheses": result_hyps
+        }
+    }
+
+    /// -- Lobe augmentation --
+
+    fn augment_lobe_result(self, query: string, lobe_text: string,
+                           domain: string) -> string {
+        if domain == None {
+            domain = ""
+        }
+        let reasoning = self.process(query, "", "", domain)
+        if not reasoning.has_content() {
+            return lobe_text
+        }
+
+        let augmented_parts: List[string] = [lobe_text.rstrip(". ")]
+
+        if reasoning.best_explanation != None {
+            let h = reasoning.best_explanation
+            let tier = _confidence_label(h.confidence)
+            augmented_parts.append(
+                "Most likely cause [" + tier + "]: " + h.explanation +
+                " (depth " + str(h.explanatory_depth) + ")"
+            )
+        }
+
+        if len(reasoning.explanations) > 0 {
+            augmented_parts.append(reasoning.explanations[0])
+        }
+
+        if len(reasoning.inferences) > 0 {
+            let high_conf: List[InferenceResult] = []
+            for inf in reasoning.inferences {
+                if inf.confidence >= 0.3 {
+                    high_conf.append(inf)
+                }
+            }
+            if len(high_conf) > 0 {
+                let chains: List[string] = []
+                for i in range(min(3, len(high_conf))) {
+                    chains.append(high_conf[i].natural_language())
+                }
+                augmented_parts.append("Reasoning chains: " + "; ".join(chains))
+            }
+        }
+
+        if len(reasoning.temporal_facts) > 0 {
+            let tf = reasoning.temporal_facts[0]
+            augmented_parts.append("Temporal context: " + str(tf.get("concept", "")) + " (" + str(tf.get("info", "")) + ")")
+        }
+
+        if len(reasoning.common_sense_used) > 0 {
+            let items: List[string] = []
+            for i in range(min(2, len(reasoning.common_sense_used))) {
+                items.append(reasoning.common_sense_used[i])
+            }
+            augmented_parts.append("Background knowledge: " + "; ".join(items))
+        }
+
+        return ". ".join(augmented_parts)
+    }
+
+    /// -- Gated knowledge addition --
+
+    fn add_knowledge(self, source: string, target: string,
+                     relation: RelationType, confidence: float,
+                     source_type: string, domain: string,
+                     evidence: string) -> Dict[string, Any] {
+        if source_type == None {
+            source_type = "user_correction"
+        }
+        if domain == None {
+            domain = ""
+        }
+        if evidence == None {
+            evidence = ""
+        }
+
+        let decision = self._gate.gated_add_edge(
+            source, target, relation,
+            confidence, source_type,
+            domain, evidence, ""
+        )
+
+        if decision.verdict == GateVerdict.ACCEPT {
+            let edge_id = source.lower().strip() + "|" + relation.value + "|" + target.lower().strip()
+            let ev_type = EvidenceType.DEFAULT_KNOWLEDGE
+            if source_type == "user_correction" {
+                ev_type = EvidenceType.EXPERT_TESTIMONY
+            }
+            let ev = Evidence {
+                evidence_id: "manual-" + str(int(time.time())),
+                evidence_type: ev_type,
+                supports: true,
+                strength: confidence,
+                source: source_type
+            }
+            self._confidence.add_evidence_for_edge(edge_id, ev, false)
+        }
+
+        let reason_val: Optional[string] = None
+        if decision.reason != None {
+            reason_val = decision.reason.value
+        }
+        return {
+            "verdict": decision.verdict.value,
+            "reason": reason_val,
+            "details": decision.details,
+            "confidence_adjusted": decision.confidence_adjusted
+        }
+    }
+
+    /// -- Curiosity loop --
+
+    fn setup_curiosity(self, retrieval_fn: Optional[Callable]) {
+        self._curiosity = CuriosityScheduler(
+            self._graph, retrieval_fn, 10, 2
+        )
+    }
+
+    fn run_curiosity_cycle(self, domain_filter: Optional[string],
+                           deep_self_model_weaknesses: Optional[List[Dict[string, Any]]]) -> Optional[CuriosityReport] {
+        if self._curiosity == None {
+            return None
+        }
+        let report = self._curiosity.run_cycle(domain_filter, deep_self_model_weaknesses)
+        if report.triples_added > 0 {
+            self._save_cache()
+        }
+        return report
+    }
+
+    fn get_curiosity_questions(self, n: int) -> List[any] {
+        if n == None {
+            n = 5
+        }
+        if self._curiosity == None {
+            return []
+        }
+        return self._curiosity.get_top_questions(n)
+    }
+
+    /// -- Maintenance --
+
+    fn run_maintenance(self) -> Dict[string, Any] {
+        let result = self._maintenance.run_full_maintenance()
+        self._confidence.recalculate_derived()
+        self._save_cache()
+        return result
+    }
+
+    fn audit(self) -> Dict[string, Any] {
+        let report = self._maintenance.audit()
+        let uncertainty = self._confidence.uncertainty_report()
+        return {
+            "nodes": report.total_nodes,
+            "edges": report.total_edges,
+            "isolated": report.isolated_nodes,
+            "contradictions": report.contradictions,
+            "weak_edges": report.weak_edges,
+            "noise_nodes": report.noise_nodes,
+            "health_score": report.health_score,
+            "domains": report.domain_coverage,
+            "recommendations": report.recommendations,
+            "uncertainty": uncertainty
+        }
+    }
+
+    /// -- Streaming --
+
+    fn think_stream(self, query: string, session_id: string,
+                    user_id: string, domain: string) -> List[any] {
+        let phases: List[Dict[string, Any]] = []
+
+        phases.append({"phase": "semantic_parse", "status": "start"})
+        let concepts = self._extract_concepts_fallback(query)
+        if self._semantic != None {
+            try {
+                let understanding = self._semantic.parse(query)
+                if understanding.concepts != None {
+                    concepts = understanding.concepts
+                }
+            } catch exc {
+                logging.warning("think_stream semantic parse: %s", str(exc))
+            }
+        }
+        let limited_concepts: List[string] = []
+        for i in range(min(8, len(concepts))) {
+            limited_concepts.append(concepts[i])
+        }
+        phases.append({"phase": "semantic_parse", "status": "done", "concepts": limited_concepts})
+
+        phases.append({"phase": "core_reasoning", "status": "start"})
+        let reasoning = self.process(query, session_id, user_id, domain)
+        let text_preview = ""
+        if reasoning.augmented_text != "" {
+            text_preview = reasoning.augmented_text
+            if len(text_preview) > 200 {
+                text_preview = text_preview[:200]
+            }
+        }
+        phases.append({
+            "phase": "core_reasoning", "status": "done",
+            "text": text_preview,
+            "confidence": reasoning.confidence
+        })
+
+        phases.append({"phase": "grounded_language", "status": "start"})
+        let grounded_text = ""
+        let grounded: Optional[GroundedResponse] = None
+        if self._generator != None {
+            try {
+                let gen_concepts: List[string] = []
+                for i in range(min(5, len(concepts))) {
+                    gen_concepts.append(concepts[i])
+                }
+                grounded = self._generator.generate(
+                    gen_concepts, reasoning.inferences,
+                    reasoning.reasoning_mode)
+                if grounded != None {
+                    grounded_text = grounded.text
+                }
+            } catch exc {
+                logging.warning("think_stream grounded language: %s", str(exc))
+            }
+        }
+        let gt_preview = grounded_text
+        if len(gt_preview) > 300 {
+            gt_preview = gt_preview[:300]
+        }
+        phases.append({"phase": "grounded_language", "status": "done", "text": gt_preview})
+
+        phases.append({"phase": "epistemic", "status": "start"})
+        let epistemic: Optional[EpistemicState] = None
+        if self._epistemic != None {
+            try {
+                let ep_concepts: List[string] = []
+                for i in range(min(5, len(concepts))) {
+                    ep_concepts.append(concepts[i])
+                }
+                epistemic = self._epistemic.assess_query(ep_concepts)
+            } catch exc {
+                logging.warning("think_stream epistemic: %s", str(exc))
+            }
+        }
+        let certainty = 0.0
+        if epistemic != None {
+            certainty = epistemic.overall_certainty
+        }
+        phases.append({"phase": "epistemic", "status": "done", "certainty": certainty})
+
+        phases.append({"phase": "synthesis", "status": "start"})
+        let synthesis: Optional[SynthesizedAnswer] = None
+        if self._synthesizer != None {
+            try {
+                let syn_concepts: List[string] = []
+                for i in range(min(5, len(concepts))) {
+                    syn_concepts.append(concepts[i])
+                }
+                synthesis = self._synthesizer.synthesize(syn_concepts, user_id)
+            } catch exc {
+                logging.warning("think_stream synthesis: %s", str(exc))
+            }
+        }
+        phases.append({"phase": "synthesis", "status": "done", "has_synthesis": synthesis != None})
+
+        phases.append({"phase": "adversarial", "status": "start"})
+        let self_test: Optional[SelfTestResult] = None
+        if self._adversarial != None {
+            try {
+                let test_claims: List[Tuple[string, string, string]] = []
+                for i in range(len(concepts) - 1) {
+                    test_claims.append((concepts[i], "related_to", concepts[i + 1]))
+                }
+                let dk: List[string] = []
+                if epistemic != None {
+                    for i in range(min(5, len(epistemic.dont_know))) {
+                        dk.append(epistemic.dont_know[i])
+                    }
+                }
+                self_test = self._adversarial.test(
+                    test_claims, [], reasoning.inferences, dk)
+            } catch exc {
+                logging.warning("think_stream adversarial: %s", str(exc))
+            }
+        }
+        let quality_score = 0.0
+        if self_test != None and self_test.quality_rating != None {
+            quality_score = self_test.quality_rating.overall_score
+        }
+        phases.append({"phase": "adversarial", "status": "done", "quality_score": quality_score})
+
+        phases.append({"phase": "coherence", "status": "start"})
+        let coherence: Optional[Dict[string, Any]] = None
+        if self._coherence != None {
+            try {
+                let coh_claims: List[Tuple[string, string, string]] = []
+                for i in range(len(concepts) - 1) {
+                    coh_claims.append((concepts[i], "related_to", concepts[i + 1]))
+                }
+                coherence = self._coherence.validate_response(coh_claims, session_id)
+            } catch exc {
+                logging.warning("think_stream coherence: %s", str(exc))
+            }
+        }
+        let is_coherent = true
+        if coherence != None {
+            is_coherent = coherence.get("coherent", true)
+        }
+        phases.append({"phase": "coherence", "status": "done", "coherent": is_coherent})
+
+        let final_text = grounded_text
+        if final_text == "" {
+            final_text = reasoning.augmented_text
+        }
+        if final_text == None {
+            final_text = ""
+        }
+        let quality = ""
+        if self_test != None and self_test.quality_rating != None {
+            quality = self_test.quality_rating.grade
+        }
+        phases.append({
+            "phase": "complete", "status": "done",
+            "text": final_text,
+            "confidence": reasoning.confidence,
+            "quality_grade": quality
+        })
+
+        return phases
+    }
+
+    /// -- Stats --
+
+    fn stats(self) -> Dict[string, Any] {
+        return {
+            "nodes": self._graph.node_count(),
+            "edges": self._graph.edge_count(),
+            "initialized": self._initialized,
+            "commonsense_bootstrapped": self._commonsense_bootstrapped,
+            "has_curiosity": self._curiosity != None,
+            "has_semantic_index": self._semantic != None,
+            "has_grounded_generator": self._generator != None,
+            "has_epistemic_engine": self._epistemic != None,
+            "has_coherence_controller": self._coherence != None,
+            "has_adversarial_tester": self._adversarial != None,
+            "has_provenance_tracker": self._provenance != None,
+            "has_synthesizer": self._synthesizer != None,
+            "web_enabled": self._web_enabled,
+            "web_stats": self._web_engine.stats,
+            "web_credibility_sources": len(self._web_integrator.credibility_tracker._sources),
+            "ingestion_gate": self._gate.stats(),
+            "active_sessions": len(self._learner._sessions),
+            "active_commitments": len(self._coherence.commitments.all_active_commitments())
+        }
+    }
+
+    /// -- Fallback concept extraction (before semantic index is built) --
+
+    fn _extract_concepts_fallback(self, query: string) -> List[any] {
+        let ql = query.lower()
+        let query_words: Set[string] = set()
+        for w in ql.split() {
+            if w not in _FILLER and len(w) > 2 {
+                query_words.add(w)
+            }
+        }
+        if len(query_words) == 0 {
+            return []
+        }
+
+        let scored: List[Tuple[float, string]] = []
+        for node in self._graph.all_nodes() {
+            let nid = node.node_id
+            if nid in ql {
+                scored.append((1.0, nid))
+                continue
+            }
+            let node_words: Set[string] = set()
+            for w in nid.split() {
+                if w not in _FILLER and len(w) > 2 {
+                    node_words.add(w)
+                }
+            }
+            if len(node_words) == 0 {
+                continue
+            }
+            let overlap: Set[string] = set()
+            for w in query_words {
+                if w in node_words {
+                    overlap.add(w)
+                }
+            }
+            if len(overlap) == 0 {
+                continue
+            }
+            let qw_count = len(query_words)
+            if qw_count < 1 {
+                qw_count = 1
+            }
+            let nw_count = len(node_words)
+            if nw_count < 1 {
+                nw_count = 1
+            }
+            let relevance = len(overlap) / qw_count
+            let coverage = len(overlap) / nw_count
+            let score = (relevance + coverage) / 2.0
+            if score >= 0.25 or len(overlap) >= 2 {
+                scored.append((score, nid))
+            }
+        }
+
+        let sorted_scored: List[Tuple[float, string]] = []
+        let remaining = list(scored)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i][0] > remaining[best_idx][0] {
+                    best_idx = i
+                }
+            }
+            sorted_scored.append(remaining.pop(best_idx))
+        }
+
+        let result: List[string] = []
+        for i in range(min(10, len(sorted_scored))) {
+            result.append(sorted_scored[i][1])
+        }
+        return result
+    }
+}
+
+/// ---------- Gate ----------
+
+gate bridge_gate(data: raw[CognitiveResponse]) -> validated[CognitiveResponse] {
+    require confidence >= 0.3
+    validate coherence_check
+    validate adversarial_test
+    validate provenance_audit
+}
+
+/// ---------- Exports ----------
+
+export ReasoningIntent
+export ReasoningResult
+export CognitiveResponse
+export ReasoningBridge
+export bridge_gate
+export _confidence_label, _filter_and_label

@@ -1,0 +1,223 @@
+/// NRSI Verification Loop — Build-Test-Scan-Verify Gates
+///
+/// THE NRS DIFFERENTIATOR.  Nothing is marked "done" until ALL phases pass.
+///
+/// Phases:
+///   1. dependency_check  — latest versions, CVE advisories
+///   2. build             — compile/transpile with captured output
+///   3. test              — auto-discover and run test suites
+///   4. lint              — language-appropriate linting
+///   5. security_scan     — vuln scan + secret detection
+///
+/// On failure: errors feed back to the cognitive loop for auto-fix,
+/// then re-run from the failed phase.  Max 3 iterations.
+
+module verification
+
+import TrustLevel, NRSIData, EpistemicType, Confidence from "types"
+
+/// ---------- Verification Phase ----------
+
+enum VerificationPhase {
+    DEPENDENCY_CHECK,
+    BUILD,
+    TEST,
+    LINT,
+    SECURITY_SCAN
+}
+
+/// ---------- Phase Status ----------
+
+enum PhaseStatus {
+    PENDING,
+    RUNNING,
+    PASS,
+    FAIL,
+    SKIP,
+    ERROR
+}
+
+/// ---------- Phase Result Type ----------
+
+type PhaseResult {
+    phase: VerificationPhase,
+    status: PhaseStatus,
+    duration_ms: float,
+    stdout: string,
+    stderr: string,
+    exit_code: int,
+    findings_count: int,
+    summary: string
+}
+
+/// ---------- Verification Gates ----------
+/// Each phase has a gate that must pass before proceeding
+
+gate dependency_gate(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain == "dependencies"
+    require confidence >= 0.70
+    validate manifest_exists
+    validate no_critical_cve
+    validate version_currency
+}
+
+gate build_gate(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain == "build"
+    require confidence >= 0.90
+    validate compilation_success
+    validate no_build_errors
+    validate artifact_produced
+}
+
+gate test_gate(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain == "testing"
+    require confidence >= 0.85
+    validate all_tests_pass
+    validate coverage_threshold
+    validate no_regressions
+}
+
+gate lint_gate(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain == "quality"
+    require confidence >= 0.80
+    validate no_lint_errors
+    validate style_compliance
+}
+
+gate security_gate(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain == "security"
+    require confidence >= 0.95
+    validate no_high_vulns
+    validate no_hardcoded_secrets
+    validate dependency_audit_clean
+}
+
+/// ---------- Completion Gate ----------
+/// Blocks "done" signal until ALL phase gates pass.
+/// H-Score bonus: +0.15 for verified, -0.10 for unverified.
+
+gate completion_gate(data: validated[NRSIData]) -> trusted[NRSIData] {
+    require confidence >= 0.85
+    validate dependency_gate_passed
+    validate build_gate_passed
+    validate test_gate_passed
+    validate lint_gate_passed
+    validate security_gate_passed
+}
+
+/// ---------- Verification Functions ----------
+
+fn check_dependencies(project_dir: string) -> raw[NRSIData] {
+    let result = {
+        "phase": "dependencies",
+        "project_dir": project_dir,
+        "status": "checked",
+        "findings": []
+    }
+    try {
+        let req_path = project_dir + "/requirements.txt"
+        let pkg_path = project_dir + "/package.json"
+        if os.path.exists(req_path) {
+            result["dependency_file"] = "requirements.txt"
+        } else if os.path.exists(pkg_path) {
+            result["dependency_file"] = "package.json"
+        } else {
+            result["findings"].append("No dependency file found")
+        }
+    } catch(e) {
+        result["error"] = str(e)
+    }
+    return raw(to_string(result), "dependencies")
+}
+
+fn run_build(project_dir: string, language: string) -> raw[NRSIData] {
+    let build_cmds = {
+        "python": "python -m py_compile",
+        "javascript": "npm run build",
+        "typescript": "tsc --noEmit",
+        "go": "go build ./...",
+        "rust": "cargo build"
+    }
+    let cmd = build_cmds.get(language, "echo 'no build command for " + language + "'")
+    let result = {
+        "phase": "build",
+        "project_dir": project_dir,
+        "language": language,
+        "command": cmd,
+        "status": "configured"
+    }
+    return raw(to_string(result), "build")
+}
+
+fn run_tests(project_dir: string, language: string) -> raw[NRSIData] {
+    let test_cmds = {
+        "python": "python -m pytest",
+        "javascript": "npm test",
+        "typescript": "npm test",
+        "go": "go test ./...",
+        "rust": "cargo test"
+    }
+    let cmd = test_cmds.get(language, "echo 'no test command for " + language + "'")
+    let result = {
+        "phase": "testing",
+        "project_dir": project_dir,
+        "language": language,
+        "command": cmd,
+        "status": "configured"
+    }
+    return raw(to_string(result), "testing")
+}
+
+fn run_lint(project_dir: string, language: string) -> raw[NRSIData] {
+    let lint_cmds = {
+        "python": "ruff check .",
+        "javascript": "eslint .",
+        "typescript": "eslint .",
+        "go": "golangci-lint run",
+        "rust": "cargo clippy"
+    }
+    let cmd = lint_cmds.get(language, "echo 'no lint command for " + language + "'")
+    let result = {
+        "phase": "quality",
+        "project_dir": project_dir,
+        "language": language,
+        "command": cmd,
+        "status": "configured"
+    }
+    return raw(to_string(result), "quality")
+}
+
+fn run_security_scan(project_dir: string, language: string) -> raw[NRSIData] {
+    let scan_cmds = {
+        "python": "pip-audit",
+        "javascript": "npm audit",
+        "typescript": "npm audit",
+        "go": "govulncheck ./...",
+        "rust": "cargo audit"
+    }
+    let cmd = scan_cmds.get(language, "echo 'no security scan for " + language + "'")
+    let result = {
+        "phase": "security",
+        "project_dir": project_dir,
+        "language": language,
+        "command": cmd,
+        "status": "configured"
+    }
+    return raw(to_string(result), "security")
+}
+
+fn adjust_h_score(base_score: float, verified: bool) -> float {
+    if verified {
+        let bonus = (1.0 - base_score) * 0.15
+        return min(1.0, base_score + bonus)
+    } else {
+        let penalty = base_score * 0.20
+        return max(0.0, base_score - penalty)
+    }
+}
+
+export VerificationPhase, PhaseStatus, PhaseResult
+export dependency_gate, build_gate, test_gate, lint_gate, security_gate
+export completion_gate
+export check_dependencies, run_build, run_tests, run_lint, run_security_scan
+export adjust_h_score

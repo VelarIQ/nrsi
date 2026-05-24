@@ -1,0 +1,191 @@
+/// NRSI Reasoning Strategies — Multi-Strategy Evidence-Based Reasoning
+///
+/// Supports deductive, inductive, abductive, analogical, and causal
+/// reasoning.  Each step carries evidence and confidence.  When strategies
+/// conflict, the metacognitive lobe adjudicates using priority ordering
+/// and evidence strength.
+///
+/// Built on the existing NRSI epistemic primitives.
+
+module reasoning
+
+import TrustLevel, NRSIData, EpistemicType, Confidence from "types"
+import logical_proof, factual_verify, causal_verify from "gates"
+
+/// ---------- Reasoning Strategy ----------
+
+enum ReasoningStrategy {
+    DEDUCTIVE,
+    INDUCTIVE,
+    ABDUCTIVE,
+    ANALOGICAL,
+    CAUSAL
+}
+
+/// ---------- Evidence Type ----------
+
+type Evidence {
+    content: string,
+    source: string,
+    confidence: float,
+    strategy: ReasoningStrategy,
+    timestamp: float
+}
+
+/// ---------- Reasoning Step ----------
+
+type ReasoningStep {
+    strategy: ReasoningStrategy,
+    conclusion: string,
+    evidence: List[Evidence],
+    confidence: float,
+    premises: List[string],
+    step_index: int
+}
+
+/// ---------- Strategy-Specific Gates ----------
+
+gate deductive_reasoning(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.epistemic == EpistemicType.DEDUCTIVE
+    require confidence >= 0.85
+    validate premise_check
+    validate proof_completeness
+    validate contradiction_check
+}
+
+gate inductive_reasoning(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.epistemic == EpistemicType.INDUCTIVE
+    require confidence >= 0.60
+    validate sample_sufficiency
+    validate generalization_check
+}
+
+gate abductive_reasoning(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.epistemic == EpistemicType.ABDUCTIVE
+    require confidence >= 0.50
+    validate explanation_coverage
+    validate parsimony_check
+}
+
+gate analogical_reasoning(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.epistemic == EpistemicType.ANALOGICAL
+    require confidence >= 0.45
+    validate structural_similarity
+    validate mapping_coherence
+}
+
+gate causal_reasoning(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.epistemic == EpistemicType.CAUSAL
+    require confidence >= 0.70
+    validate chain_completeness
+    validate confound_check
+    validate temporal_ordering
+}
+
+/// ---------- Conflict Resolution ----------
+/// Priority: deductive(5) > causal(4) > inductive(3) > abductive(2) > analogical(1)
+
+fn resolve_conflict(step_a: ReasoningStep, step_b: ReasoningStep) -> ReasoningStep {
+    let priority = {
+        ReasoningStrategy.DEDUCTIVE: 5,
+        ReasoningStrategy.CAUSAL: 4,
+        ReasoningStrategy.INDUCTIVE: 3,
+        ReasoningStrategy.ABDUCTIVE: 2,
+        ReasoningStrategy.ANALOGICAL: 1
+    }
+    let p_a = priority.get(step_a.strategy, 0)
+    let p_b = priority.get(step_b.strategy, 0)
+    if p_a > p_b {
+        return step_a
+    }
+    if p_b > p_a {
+        return step_b
+    }
+    if step_a.confidence >= step_b.confidence {
+        return step_a
+    }
+    return step_b
+}
+
+/// ---------- Evidence Accumulation ----------
+
+fn accumulate_evidence(existing: List[Evidence], new_evidence: Evidence) -> List[Evidence] {
+    let combined: List[Evidence] = []
+    let replaced = false
+    for e in existing {
+        if e.source == new_evidence.source and e.strategy == new_evidence.strategy {
+            if new_evidence.confidence > e.confidence {
+                replaced = true
+            } else {
+                combined.append(e)
+                replaced = true
+            }
+        } else {
+            combined.append(e)
+        }
+    }
+    if !replaced {
+        combined.append(new_evidence)
+    } else if new_evidence.confidence > 0.0 {
+        combined.append(new_evidence)
+    }
+    return combined
+}
+
+fn aggregate_confidence(evidence: List[Evidence]) -> float {
+    if evidence.len() == 0 {
+        return 0.0
+    }
+    let strategy_weights = {
+        ReasoningStrategy.DEDUCTIVE: 1.0,
+        ReasoningStrategy.CAUSAL: 0.9,
+        ReasoningStrategy.INDUCTIVE: 0.7,
+        ReasoningStrategy.ABDUCTIVE: 0.5,
+        ReasoningStrategy.ANALOGICAL: 0.4
+    }
+    let total_weight = 0.0
+    let weighted_sum = 0.0
+    for e in evidence {
+        let strategy_w = strategy_weights.get(e.strategy, 0.5)
+        let w = strategy_w * max(e.confidence, 0.01)
+        weighted_sum = weighted_sum + (e.confidence * w)
+        total_weight = total_weight + w
+    }
+    if total_weight == 0.0 {
+        return 0.0
+    }
+    let agg = weighted_sum / total_weight
+    if agg > 1.0 {
+        agg = 1.0
+    }
+    return agg
+}
+
+/// ---------- Reasoning Chain Builder ----------
+
+fn build_chain(query: string, domain: string) -> validated[NRSIData] {
+    let result = raw(query, domain)
+    return factual_verify(result)
+}
+
+/// ---------- Strategy-Aware Processing ----------
+
+fn reason_deductive(premise: string, rules: string) -> validated[NRSIData] {
+    let result = deductive(premise, 0.9, rules)
+    return result
+}
+
+fn reason_causal(question: string, evidence: string) -> validated[NRSIData] {
+    let result = causal(question, 0.75, evidence)
+    return result
+}
+
+fn reason_abductive(observation: string) -> raw[NRSIData] {
+    return raw(observation, "abduction")
+}
+
+export ReasoningStrategy, Evidence, ReasoningStep
+export deductive_reasoning, inductive_reasoning, abductive_reasoning
+export analogical_reasoning, causal_reasoning
+export resolve_conflict, accumulate_evidence, aggregate_confidence
+export build_chain, reason_deductive, reason_causal, reason_abductive

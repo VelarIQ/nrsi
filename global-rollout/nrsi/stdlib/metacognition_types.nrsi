@@ -1,0 +1,831 @@
+/// NRSI Metacognition — Core Data Objects.
+///
+/// Seven record types that replace flat turn logs with structured
+/// metacognitive state.  Every subsystem (memory, planner, critique,
+/// learning, governance) reads and writes these objects.
+///
+/// Objects are deliberately plain types so they serialise to
+/// JSON/Redis/Spanner without an ORM dependency.
+
+module metacognition_types
+
+
+import time from "std/time"
+import json from "std/json"
+import hashlib from "std/hashlib"
+/// ── Shared enums ───────────────────────────────────────────────────
+
+enum ProcessingMode {
+    DETERMINISTIC = "deterministic",
+    PROBABILISTIC = "probabilistic",
+    HYBRID = "hybrid"
+}
+
+enum SafetyClass {
+    AUTO_ADAPTIVE = "auto_adaptive",
+    GATED_ADAPTIVE = "gated_adaptive",
+    REVIEW_REQUIRED = "review_required"
+}
+
+enum CritiqueVerdict {
+    FINALIZE = "finalize",
+    REVISE = "revise",
+    CLARIFY = "clarify",
+    ESCALATE = "escalate",
+    REFUSE = "refuse"
+}
+
+enum PlanAction {
+    ANSWER_DIRECT = "answer_direct",
+    RETRIEVE_EVIDENCE = "retrieve_evidence",
+    ASK_CLARIFICATION = "ask_clarification",
+    DECOMPOSE_TASK = "decompose_task",
+    SWITCH_MODE = "switch_mode",
+    REFUSE = "refuse"
+}
+
+enum EpisodeOutcome {
+    SUCCESS = "success",
+    PARTIAL = "partial",
+    CORRECTED = "corrected",
+    FAILED = "failed",
+    UNKNOWN = "unknown"
+}
+
+/// ── Helpers ────────────────────────────────────────────────────────
+
+fn _uid(prefix: string) -> string {
+    return prefix + uuid4_hex()[:16]
+}
+
+fn _now_ms() -> int {
+    return int(time.time() * 1000)
+}
+
+fn _deterministic_id(payload: Dict[string, Any]) -> string {
+    let canonical = json.dumps(payload, sort_keys=true, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+}
+
+/// ── 1. ConversationEpisode ────────────────────────────────────────
+
+type ConversationTurn {
+    role: string,
+    content: string,
+    timestamp_ms: int,
+    metadata: Dict[string, Any]
+}
+
+fn conversation_turn_new(role: string, content: string) -> ConversationTurn {
+    return ConversationTurn {
+        role: role,
+        content: content,
+        timestamp_ms: _now_ms(),
+        metadata: {}
+    }
+}
+
+fn conversation_turn_to_dict(t: ConversationTurn) -> Dict[string, Any] {
+    return {
+        "role": t.role,
+        "content": t.content,
+        "timestamp_ms": t.timestamp_ms,
+        "metadata": t.metadata
+    }
+}
+
+class ConversationEpisode {
+    fn __init__(self) {
+        self.episode_id = _uid("ep-")
+        self.session_id = ""
+        self.user_id = ""
+        self.turns: List[ConversationTurn] = []
+        self.summary = ""
+        self.entities: List[string] = []
+        self.claims: List[string] = []
+        self.active_references: List[string] = []
+        self.unresolved_items: List[string] = []
+        self.running_themes: List[string] = []
+        self.outcome = EpisodeOutcome.UNKNOWN
+        self.outcome_signals: Dict[string, Any] = {}
+        self.created_at_ms = _now_ms()
+        self.updated_at_ms = _now_ms()
+        self.tags: Set[string] = set()
+    }
+
+    fn turn_count(self) -> int {
+        return len(self.turns)
+    }
+
+    fn append_turn(self, role: string, content: string,
+                   metadata: Optional[Dict[string, Any]]) {
+        let md = metadata
+        if md == None {
+            md = {}
+        }
+        let turn = ConversationTurn {
+            role: role,
+            content: content,
+            timestamp_ms: _now_ms(),
+            metadata: md
+        }
+        self.turns.append(turn)
+        self.updated_at_ms = _now_ms()
+    }
+
+    fn to_dict(self) -> Dict[string, Any] {
+        let turn_dicts: List[Dict[string, Any]] = []
+        for t in self.turns {
+            turn_dicts.append(conversation_turn_to_dict(t))
+        }
+        return {
+            "episode_id": self.episode_id,
+            "session_id": self.session_id,
+            "user_id": self.user_id,
+            "turns": turn_dicts,
+            "summary": self.summary,
+            "entities": self.entities,
+            "claims": self.claims,
+            "active_references": self.active_references,
+            "unresolved_items": self.unresolved_items,
+            "running_themes": self.running_themes,
+            "outcome": self.outcome.value,
+            "outcome_signals": self.outcome_signals,
+            "created_at_ms": self.created_at_ms,
+            "updated_at_ms": self.updated_at_ms,
+            "tags": sorted(self.tags)
+        }
+    }
+
+    fn from_dict(d: Dict[string, Any]) -> ConversationEpisode {
+        let ep = ConversationEpisode()
+        ep.episode_id = d.get("episode_id", _uid("ep-"))
+        ep.session_id = d.get("session_id", "")
+        ep.user_id = d.get("user_id", "")
+        ep.summary = d.get("summary", "")
+        ep.entities = d.get("entities", [])
+        ep.claims = d.get("claims", [])
+        ep.active_references = d.get("active_references", [])
+        ep.unresolved_items = d.get("unresolved_items", [])
+        ep.running_themes = d.get("running_themes", [])
+        ep.outcome = EpisodeOutcome(d.get("outcome", "unknown"))
+        ep.outcome_signals = d.get("outcome_signals", {})
+        ep.created_at_ms = d.get("created_at_ms", 0)
+        ep.updated_at_ms = d.get("updated_at_ms", 0)
+        ep.tags = set(d.get("tags", []))
+        for td in d.get("turns", []) {
+            let turn = ConversationTurn {
+                role: td["role"],
+                content: td["content"],
+                timestamp_ms: td.get("timestamp_ms", 0),
+                metadata: td.get("metadata", {})
+            }
+            ep.turns.append(turn)
+        }
+        return ep
+    }
+}
+
+/// ── 2. UserModel ──────────────────────────────────────────────────
+
+type CorrectionRecord {
+    original_claim: string,
+    corrected_claim: string,
+    domain: string,
+    timestamp_ms: int
+}
+
+fn correction_record_to_dict(c: CorrectionRecord) -> Dict[string, Any] {
+    return {
+        "original_claim": c.original_claim,
+        "corrected_claim": c.corrected_claim,
+        "domain": c.domain,
+        "timestamp_ms": c.timestamp_ms
+    }
+}
+
+class UserModel {
+    let MAX_CORRECTIONS = 200
+    let MAX_STYLE_NOTES = 50
+
+    fn __init__(self, user_id: string) {
+        self.user_id = user_id
+        self.preferred_length = "moderate"
+        self.preferred_tone = "neutral"
+        self.expertise_estimates: Dict[string, float] = {}
+        self.domain_affinities: Dict[string, float] = {}
+        self.correction_history: List[CorrectionRecord] = []
+        self.trust_boundaries: Dict[string, string] = {}
+        self.recurring_topics: List[string] = []
+        self.answer_style_notes: List[string] = []
+        self.interaction_count = 0
+        self.last_seen_ms = _now_ms()
+        self.created_at_ms = _now_ms()
+        self.version = 0
+    }
+
+    fn record_correction(self, original: string, corrected: string,
+                         domain: string) {
+        let cr = CorrectionRecord {
+            original_claim: original,
+            corrected_claim: corrected,
+            domain: domain,
+            timestamp_ms: _now_ms()
+        }
+        self.correction_history.append(cr)
+        if len(self.correction_history) > self.MAX_CORRECTIONS {
+            let start = len(self.correction_history) - self.MAX_CORRECTIONS
+            let trimmed: List[CorrectionRecord] = []
+            for i in range(start, len(self.correction_history)) {
+                trimmed.append(self.correction_history[i])
+            }
+            self.correction_history = trimmed
+        }
+        self.version += 1
+    }
+
+    fn update_expertise(self, domain: string, delta: float) {
+        let current = self.expertise_estimates.get(domain, 0.5)
+        self.expertise_estimates[domain] = max(0.0, min(1.0, current + delta))
+        self.version += 1
+    }
+
+    fn touch(self) {
+        self.last_seen_ms = _now_ms()
+        self.interaction_count += 1
+    }
+
+    fn to_dict(self) -> Dict[string, Any] {
+        let correction_dicts: List[Dict[string, Any]] = []
+        for c in self.correction_history {
+            correction_dicts.append(correction_record_to_dict(c))
+        }
+        return {
+            "user_id": self.user_id,
+            "preferred_length": self.preferred_length,
+            "preferred_tone": self.preferred_tone,
+            "expertise_estimates": self.expertise_estimates,
+            "domain_affinities": self.domain_affinities,
+            "correction_history": correction_dicts,
+            "trust_boundaries": self.trust_boundaries,
+            "recurring_topics": self.recurring_topics,
+            "answer_style_notes": self.answer_style_notes,
+            "interaction_count": self.interaction_count,
+            "last_seen_ms": self.last_seen_ms,
+            "created_at_ms": self.created_at_ms,
+            "version": self.version
+        }
+    }
+
+    fn from_dict(d: Dict[string, Any]) -> UserModel {
+        let m = UserModel(d["user_id"])
+        m.preferred_length = d.get("preferred_length", "moderate")
+        m.preferred_tone = d.get("preferred_tone", "neutral")
+        m.expertise_estimates = d.get("expertise_estimates", {})
+        m.domain_affinities = d.get("domain_affinities", {})
+        m.trust_boundaries = d.get("trust_boundaries", {})
+        m.recurring_topics = d.get("recurring_topics", [])
+        m.answer_style_notes = d.get("answer_style_notes", [])
+        m.interaction_count = d.get("interaction_count", 0)
+        m.last_seen_ms = d.get("last_seen_ms", 0)
+        m.created_at_ms = d.get("created_at_ms", 0)
+        m.version = d.get("version", 0)
+        for cd in d.get("correction_history", []) {
+            let cr = CorrectionRecord {
+                original_claim: cd["original_claim"],
+                corrected_claim: cd["corrected_claim"],
+                domain: cd.get("domain", ""),
+                timestamp_ms: cd.get("timestamp_ms", 0)
+            }
+            m.correction_history.append(cr)
+        }
+        return m
+    }
+}
+
+/// ── 3. GoalState ──────────────────────────────────────────────────
+
+type SubGoal {
+    description: string,
+    status: string,
+    blockers: List[string]
+}
+
+fn subgoal_to_dict(sg: SubGoal) -> Dict[string, Any] {
+    return {
+        "description": sg.description,
+        "status": sg.status,
+        "blockers": sg.blockers
+    }
+}
+
+class GoalState {
+    fn __init__(self) {
+        self.goal_id = _uid("goal-")
+        self.session_id = ""
+        self.primary_objective = ""
+        self.subgoals: List[SubGoal] = []
+        self.assumptions: List[string] = []
+        self.blockers: List[string] = []
+        self.completion_criteria: List[string] = []
+        self.confidence_to_complete = 0.5
+        self.status = "active"
+        self.created_at_ms = _now_ms()
+        self.updated_at_ms = _now_ms()
+    }
+
+    fn mark_subgoal(self, index: int, status: string) {
+        if index >= 0 and index < len(self.subgoals) {
+            self.subgoals[index].status = status
+            self.updated_at_ms = _now_ms()
+        }
+    }
+
+    fn open_subgoals(self) -> List[any] {
+        let result: List[SubGoal] = []
+        for sg in self.subgoals {
+            if sg.status == "open" {
+                result.append(sg)
+            }
+        }
+        return result
+    }
+
+    fn progress_pct(self) -> float {
+        if len(self.subgoals) == 0 {
+            return 0.0
+        }
+        let done = 0
+        for sg in self.subgoals {
+            if sg.status == "complete" {
+                done += 1
+            }
+        }
+        return done / len(self.subgoals)
+    }
+
+    fn to_dict(self) -> Dict[string, Any] {
+        let sg_dicts: List[Dict[string, Any]] = []
+        for sg in self.subgoals {
+            sg_dicts.append(subgoal_to_dict(sg))
+        }
+        return {
+            "goal_id": self.goal_id,
+            "session_id": self.session_id,
+            "primary_objective": self.primary_objective,
+            "subgoals": sg_dicts,
+            "assumptions": self.assumptions,
+            "blockers": self.blockers,
+            "completion_criteria": self.completion_criteria,
+            "confidence_to_complete": self.confidence_to_complete,
+            "status": self.status,
+            "created_at_ms": self.created_at_ms,
+            "updated_at_ms": self.updated_at_ms
+        }
+    }
+
+    fn from_dict(d: Dict[string, Any]) -> GoalState {
+        let gs = GoalState()
+        gs.goal_id = d.get("goal_id", _uid("goal-"))
+        gs.session_id = d.get("session_id", "")
+        gs.primary_objective = d.get("primary_objective", "")
+        gs.assumptions = d.get("assumptions", [])
+        gs.blockers = d.get("blockers", [])
+        gs.completion_criteria = d.get("completion_criteria", [])
+        gs.confidence_to_complete = d.get("confidence_to_complete", 0.5)
+        gs.status = d.get("status", "active")
+        gs.created_at_ms = d.get("created_at_ms", 0)
+        gs.updated_at_ms = d.get("updated_at_ms", 0)
+        for sgd in d.get("subgoals", []) {
+            let sg = SubGoal {
+                description: sgd["description"],
+                status: sgd.get("status", "open"),
+                blockers: sgd.get("blockers", [])
+            }
+            gs.subgoals.append(sg)
+        }
+        return gs
+    }
+}
+
+/// ── 4. ReasoningPlan ──────────────────────────────────────────────
+
+type ReasoningStep {
+    action: PlanAction,
+    description: string,
+    target_mode: Optional[ProcessingMode],
+    retrieval_hints: List[string],
+    estimated_confidence: float
+}
+
+fn reasoning_step_to_dict(s: ReasoningStep) -> Dict[string, Any] {
+    let tm = None
+    if s.target_mode != None {
+        tm = s.target_mode.value
+    }
+    return {
+        "action": s.action.value,
+        "description": s.description,
+        "target_mode": tm,
+        "retrieval_hints": s.retrieval_hints,
+        "estimated_confidence": s.estimated_confidence
+    }
+}
+
+class ReasoningPlan {
+    fn __init__(self) {
+        self.plan_id = _uid("plan-")
+        self.session_id = ""
+        self.query = ""
+        self.steps: List[ReasoningStep] = []
+        self.chosen_mode = ProcessingMode.DETERMINISTIC
+        self.decomposition_strategy = ""
+        self.stopping_condition = "single_pass"
+        self.max_revision_rounds = 2
+        self.planner_confidence = 0.5
+        self.evidence_needed = false
+        self.clarification_needed = false
+        self.created_at_ms = _now_ms()
+    }
+
+    fn to_dict(self) -> Dict[string, Any] {
+        let step_dicts: List[Dict[string, Any]] = []
+        for s in self.steps {
+            step_dicts.append(reasoning_step_to_dict(s))
+        }
+        return {
+            "plan_id": self.plan_id,
+            "session_id": self.session_id,
+            "query": self.query,
+            "steps": step_dicts,
+            "chosen_mode": self.chosen_mode.value,
+            "decomposition_strategy": self.decomposition_strategy,
+            "stopping_condition": self.stopping_condition,
+            "max_revision_rounds": self.max_revision_rounds,
+            "planner_confidence": self.planner_confidence,
+            "evidence_needed": self.evidence_needed,
+            "clarification_needed": self.clarification_needed,
+            "created_at_ms": self.created_at_ms
+        }
+    }
+
+    fn from_dict(d: Dict[string, Any]) -> ReasoningPlan {
+        let rp = ReasoningPlan()
+        rp.plan_id = d.get("plan_id", _uid("plan-"))
+        rp.session_id = d.get("session_id", "")
+        rp.query = d.get("query", "")
+        rp.chosen_mode = ProcessingMode(d.get("chosen_mode", "deterministic"))
+        rp.decomposition_strategy = d.get("decomposition_strategy", "")
+        rp.stopping_condition = d.get("stopping_condition", "single_pass")
+        rp.max_revision_rounds = d.get("max_revision_rounds", 2)
+        rp.planner_confidence = d.get("planner_confidence", 0.5)
+        rp.evidence_needed = d.get("evidence_needed", false)
+        rp.clarification_needed = d.get("clarification_needed", false)
+        rp.created_at_ms = d.get("created_at_ms", 0)
+        for sd in d.get("steps", []) {
+            let tm = None
+            if sd.get("target_mode") != None {
+                tm = ProcessingMode(sd["target_mode"])
+            }
+            let step = ReasoningStep {
+                action: PlanAction(sd["action"]),
+                description: sd["description"],
+                target_mode: tm,
+                retrieval_hints: sd.get("retrieval_hints", []),
+                estimated_confidence: sd.get("estimated_confidence", 0.5)
+            }
+            rp.steps.append(step)
+        }
+        return rp
+    }
+}
+
+/// ── 5. SelfAssessment ─────────────────────────────────────────────
+
+type ClaimConfidence {
+    claim_text: string,
+    confidence: float,
+    source: string,
+    uncertainty_reason: string
+}
+
+fn claim_confidence_to_dict(c: ClaimConfidence) -> Dict[string, Any] {
+    return {
+        "claim_text": c.claim_text,
+        "confidence": c.confidence,
+        "source": c.source,
+        "uncertainty_reason": c.uncertainty_reason
+    }
+}
+
+type CritiqueFinding {
+    category: string,
+    severity: string,
+    description: string,
+    suggested_action: CritiqueVerdict
+}
+
+fn critique_finding_to_dict(f: CritiqueFinding) -> Dict[string, Any] {
+    return {
+        "category": f.category,
+        "severity": f.severity,
+        "description": f.description,
+        "suggested_action": f.suggested_action.value
+    }
+}
+
+class SelfAssessment {
+    fn __init__(self) {
+        self.assessment_id = _uid("sa-")
+        self.plan_id = ""
+        self.overall_confidence = 0.5
+        self.claim_confidences: List[ClaimConfidence] = []
+        self.uncertainty_sources: List[string] = []
+        self.critique_findings: List[CritiqueFinding] = []
+        self.memory_sufficiency = 1.0
+        self.strategy_appropriate = true
+        self.escalation_triggers: List[string] = []
+        self.verdict = CritiqueVerdict.FINALIZE
+        self.revision_round = 0
+        self.created_at_ms = _now_ms()
+    }
+
+    fn has_critical_findings(self) -> bool {
+        for f in self.critique_findings {
+            if f.severity == "critical" {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn min_claim_confidence(self) -> float {
+        if len(self.claim_confidences) == 0 {
+            return self.overall_confidence
+        }
+        let min_val = self.claim_confidences[0].confidence
+        for cc in self.claim_confidences {
+            if cc.confidence < min_val {
+                min_val = cc.confidence
+            }
+        }
+        return min_val
+    }
+
+    fn to_dict(self) -> Dict[string, Any] {
+        let cc_dicts: List[Dict[string, Any]] = []
+        for c in self.claim_confidences {
+            cc_dicts.append(claim_confidence_to_dict(c))
+        }
+        let cf_dicts: List[Dict[string, Any]] = []
+        for f in self.critique_findings {
+            cf_dicts.append(critique_finding_to_dict(f))
+        }
+        return {
+            "assessment_id": self.assessment_id,
+            "plan_id": self.plan_id,
+            "overall_confidence": self.overall_confidence,
+            "claim_confidences": cc_dicts,
+            "uncertainty_sources": self.uncertainty_sources,
+            "critique_findings": cf_dicts,
+            "memory_sufficiency": self.memory_sufficiency,
+            "strategy_appropriate": self.strategy_appropriate,
+            "escalation_triggers": self.escalation_triggers,
+            "verdict": self.verdict.value,
+            "revision_round": self.revision_round,
+            "created_at_ms": self.created_at_ms
+        }
+    }
+}
+
+/// ── 6. LessonRecord ───────────────────────────────────────────────
+
+class LessonRecord {
+    fn __init__(self) {
+        self.lesson_id = _uid("les-")
+        self.episode_id = ""
+        self.user_id = ""
+        self.lesson_type = ""
+        self.description = ""
+        self.domain = ""
+        self.scope = "user"
+        self.reuse_conditions: List[string] = []
+        self.safety_class = SafetyClass.AUTO_ADAPTIVE
+        self.confidence = 0.5
+        self.applied_count = 0
+        self.last_applied_ms = 0
+        self.invalidated = false
+        self.invalidation_reason = ""
+        self.evidence_ids: List[string] = []
+        self.created_at_ms = _now_ms()
+    }
+
+    fn mark_applied(self) {
+        self.applied_count += 1
+        self.last_applied_ms = _now_ms()
+    }
+
+    fn invalidate(self, reason: string) {
+        self.invalidated = true
+        self.invalidation_reason = reason
+    }
+
+    fn to_dict(self) -> Dict[string, Any] {
+        return {
+            "lesson_id": self.lesson_id,
+            "episode_id": self.episode_id,
+            "user_id": self.user_id,
+            "lesson_type": self.lesson_type,
+            "description": self.description,
+            "domain": self.domain,
+            "scope": self.scope,
+            "reuse_conditions": self.reuse_conditions,
+            "safety_class": self.safety_class.value,
+            "confidence": self.confidence,
+            "applied_count": self.applied_count,
+            "last_applied_ms": self.last_applied_ms,
+            "invalidated": self.invalidated,
+            "invalidation_reason": self.invalidation_reason,
+            "evidence_ids": self.evidence_ids,
+            "created_at_ms": self.created_at_ms
+        }
+    }
+
+    fn from_dict(d: Dict[string, Any]) -> LessonRecord {
+        let lr = LessonRecord()
+        lr.lesson_id = d.get("lesson_id", _uid("les-"))
+        lr.episode_id = d.get("episode_id", "")
+        lr.user_id = d.get("user_id", "")
+        lr.lesson_type = d.get("lesson_type", "")
+        lr.description = d.get("description", "")
+        lr.domain = d.get("domain", "")
+        lr.scope = d.get("scope", "user")
+        lr.reuse_conditions = d.get("reuse_conditions", [])
+        lr.safety_class = SafetyClass(d.get("safety_class", "auto_adaptive"))
+        lr.confidence = d.get("confidence", 0.5)
+        lr.applied_count = d.get("applied_count", 0)
+        lr.last_applied_ms = d.get("last_applied_ms", 0)
+        lr.invalidated = d.get("invalidated", false)
+        lr.invalidation_reason = d.get("invalidation_reason", "")
+        lr.evidence_ids = d.get("evidence_ids", [])
+        lr.created_at_ms = d.get("created_at_ms", 0)
+        return lr
+    }
+}
+
+/// ── 7. StrategyPolicySnapshot ─────────────────────────────────────
+
+type PolicyDelta {
+    field_changed: string,
+    old_value: Any,
+    new_value: Any,
+    lesson_id: string,
+    reason: string,
+    safety_class: SafetyClass,
+    timestamp_ms: int
+}
+
+fn policy_delta_new(field_changed: string, old_value: Any, new_value: Any,
+                    lesson_id: string, reason: string,
+                    safety_class: SafetyClass) -> PolicyDelta {
+    return PolicyDelta {
+        field_changed: field_changed,
+        old_value: old_value,
+        new_value: new_value,
+        lesson_id: lesson_id,
+        reason: reason,
+        safety_class: safety_class,
+        timestamp_ms: _now_ms()
+    }
+}
+
+fn policy_delta_to_dict(d: PolicyDelta) -> Dict[string, Any] {
+    return {
+        "field_changed": d.field_changed,
+        "old_value": d.old_value,
+        "new_value": d.new_value,
+        "lesson_id": d.lesson_id,
+        "reason": d.reason,
+        "safety_class": d.safety_class.value,
+        "timestamp_ms": d.timestamp_ms
+    }
+}
+
+class StrategyPolicySnapshot {
+    let MAX_DELTAS = 500
+
+    fn __init__(self) {
+        self.snapshot_id = _uid("snap-")
+        self.version = 0
+        self.user_id = ""
+        self.default_mode = ProcessingMode.DETERMINISTIC
+        self.clarification_threshold = 0.40
+        self.evidence_retrieval_threshold = 0.55
+        self.critique_strictness = 0.60
+        self.revision_budget = 2
+        self.verbosity_preference = 0.50
+        self.decomposition_preference = 0.50
+        self.proactive_clarification = true
+        self.routing_overrides: Dict[string, string] = {}
+        self.domain_mode_hints: Dict[string, string] = {}
+        self.deltas: List[PolicyDelta] = []
+        self.created_at_ms = _now_ms()
+        self.updated_at_ms = _now_ms()
+    }
+
+    fn apply_delta(self, delta: PolicyDelta) {
+        self.deltas.append(delta)
+        if len(self.deltas) > self.MAX_DELTAS {
+            let start = len(self.deltas) - self.MAX_DELTAS
+            let trimmed: List[PolicyDelta] = []
+            for i in range(start, len(self.deltas)) {
+                trimmed.append(self.deltas[i])
+            }
+            self.deltas = trimmed
+        }
+        self.version += 1
+        self.updated_at_ms = _now_ms()
+    }
+
+    fn rollback_to(self, target_version: int) -> List[any] {
+        let result: List[PolicyDelta] = []
+        let i = len(self.deltas) - 1
+        while i >= 0 {
+            let d = self.deltas[i]
+            if d.timestamp_ms > 0 and self.version > target_version {
+                result.append(d)
+            }
+            i -= 1
+        }
+        return result
+    }
+
+    fn to_dict(self) -> Dict[string, Any] {
+        let delta_dicts: List[Dict[string, Any]] = []
+        for d in self.deltas {
+            delta_dicts.append(policy_delta_to_dict(d))
+        }
+        return {
+            "snapshot_id": self.snapshot_id,
+            "version": self.version,
+            "user_id": self.user_id,
+            "default_mode": self.default_mode.value,
+            "clarification_threshold": self.clarification_threshold,
+            "evidence_retrieval_threshold": self.evidence_retrieval_threshold,
+            "critique_strictness": self.critique_strictness,
+            "revision_budget": self.revision_budget,
+            "verbosity_preference": self.verbosity_preference,
+            "decomposition_preference": self.decomposition_preference,
+            "proactive_clarification": self.proactive_clarification,
+            "routing_overrides": self.routing_overrides,
+            "domain_mode_hints": self.domain_mode_hints,
+            "deltas": delta_dicts,
+            "created_at_ms": self.created_at_ms,
+            "updated_at_ms": self.updated_at_ms
+        }
+    }
+
+    fn from_dict(d: Dict[string, Any]) -> StrategyPolicySnapshot {
+        let snap = StrategyPolicySnapshot()
+        snap.snapshot_id = d.get("snapshot_id", _uid("snap-"))
+        snap.version = d.get("version", 0)
+        snap.user_id = d.get("user_id", "")
+        snap.default_mode = ProcessingMode(d.get("default_mode", "deterministic"))
+        snap.clarification_threshold = d.get("clarification_threshold", 0.40)
+        snap.evidence_retrieval_threshold = d.get("evidence_retrieval_threshold", 0.55)
+        snap.critique_strictness = d.get("critique_strictness", 0.60)
+        snap.revision_budget = d.get("revision_budget", 2)
+        snap.verbosity_preference = d.get("verbosity_preference", 0.50)
+        snap.decomposition_preference = d.get("decomposition_preference", 0.50)
+        snap.proactive_clarification = d.get("proactive_clarification", true)
+        snap.routing_overrides = d.get("routing_overrides", {})
+        snap.domain_mode_hints = d.get("domain_mode_hints", {})
+        snap.created_at_ms = d.get("created_at_ms", 0)
+        snap.updated_at_ms = d.get("updated_at_ms", 0)
+        for dd in d.get("deltas", []) {
+            let delta = PolicyDelta {
+                field_changed: dd["field_changed"],
+                old_value: dd["old_value"],
+                new_value: dd["new_value"],
+                lesson_id: dd.get("lesson_id", ""),
+                reason: dd.get("reason", ""),
+                safety_class: SafetyClass(dd.get("safety_class", "auto_adaptive")),
+                timestamp_ms: dd.get("timestamp_ms", 0)
+            }
+            snap.deltas.append(delta)
+        }
+        return snap
+    }
+}
+
+/// ── Exports ───────────────────────────────────────────────────────
+
+export ProcessingMode, SafetyClass, CritiqueVerdict, PlanAction, EpisodeOutcome
+export _uid, _now_ms, _deterministic_id
+export ConversationTurn, ConversationEpisode
+export CorrectionRecord, UserModel
+export SubGoal, GoalState
+export ReasoningStep, ReasoningPlan
+export ClaimConfidence, CritiqueFinding, SelfAssessment
+export LessonRecord
+export PolicyDelta, StrategyPolicySnapshot

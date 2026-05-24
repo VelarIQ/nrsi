@@ -1,0 +1,349 @@
+/// NRS Parallel Processing with Merge Strategies.
+///
+/// Named processing pathways with concurrent execution, lateral inhibition,
+/// and configurable merge strategies (winner, consensus, weighted, all).
+///
+/// Ported from nrsip/nrs_parallel.py.
+
+module nrs_parallel
+
+
+import time from "std/time"
+/// ── Merge Strategies ──
+
+enum MergeStrategy {
+    WINNER = "WINNER",
+    CONSENSUS = "CONSENSUS",
+    WEIGHTED = "WEIGHTED",
+    ALL = "ALL"
+}
+
+/// ── Pathway Result ──
+
+type PathwayResult {
+    pathway_name: string,
+    output: any,
+    confidence: float,
+    elapsed_ms: float,
+    success: bool,
+    error: Optional[string],
+    inhibited: bool,
+    inhibited_by: Optional[string],
+    timestamp: float
+}
+
+/// ── Parallel Result ──
+
+type ParallelResult {
+    merged_output: any,
+    merged_confidence: float,
+    strategy_used: MergeStrategy,
+    winner: Optional[string],
+    pathway_results: List[PathwayResult],
+    total_elapsed_ms: float
+}
+
+fn parallel_result_pathways_run(r: ParallelResult) -> int {
+    let count = 0
+    for pr in r.pathway_results {
+        if !pr.inhibited { count += 1 }
+    }
+    return count
+}
+
+fn parallel_result_pathways_inhibited(r: ParallelResult) -> int {
+    let count = 0
+    for pr in r.pathway_results {
+        if pr.inhibited { count += 1 }
+    }
+    return count
+}
+
+fn parallel_result_summary(r: ParallelResult) -> string {
+    let succeeded = 0
+    for pr in r.pathway_results {
+        if pr.success && !pr.inhibited { succeeded += 1 }
+    }
+    let total = r.pathway_results.len()
+    let inhibited = parallel_result_pathways_inhibited(r)
+    let winner_str = ""
+    if r.winner != nil { winner_str = r.winner }
+    return "ParallelResult[" + r.strategy_used.value + "]: " +
+        to_string(succeeded) + "/" + to_string(total) + " succeeded, " +
+        to_string(inhibited) + " inhibited, winner=" + winner_str +
+        ", confidence=" + to_string(r.merged_confidence) +
+        ", elapsed=" + to_string(r.total_elapsed_ms) + "ms"
+}
+
+/// ── Pathway ──
+
+class Pathway {
+    fn init(self, name: string, processor: any,
+            weight: float, description: Optional[string]) {
+        self.name = name
+        self.processor = processor
+        self.weight = weight
+        self.description = description
+    }
+
+    fn execute(self, data: any) -> PathwayResult {
+        let start = time.monotonic()
+        try {
+            let result = self.processor(data)
+            let elapsed_ms = (time.monotonic() - start) * 1000.0
+            let output = result
+            let confidence = 0.5
+            if is_tuple(result) && tuple_len(result) == 2 {
+                output = tuple_get(result, 0)
+                confidence = to_float(tuple_get(result, 1))
+            }
+            return PathwayResult {
+                pathway_name: self.name,
+                output: output,
+                confidence: confidence,
+                elapsed_ms: elapsed_ms,
+                success: true,
+                error: nil,
+                inhibited: false,
+                inhibited_by: nil,
+                timestamp: time.time()
+            }
+        } catch(exc) {
+            let elapsed_ms = (time.monotonic() - start) * 1000.0
+            return PathwayResult {
+                pathway_name: self.name,
+                output: nil,
+                confidence: 0.0,
+                elapsed_ms: elapsed_ms,
+                success: false,
+                error: to_string(exc),
+                inhibited: false,
+                inhibited_by: nil,
+                timestamp: time.time()
+            }
+        }
+    }
+}
+
+/// ── Parallel Layer ──
+
+class ParallelLayer {
+    fn init(self, name: string, pathways: Optional[List[Pathway]],
+            merge: MergeStrategy, consensus_threshold: float,
+            lateral_inhibition: bool, inhibition_threshold: float,
+            max_workers: Optional[int], description: Optional[string]) {
+        self._name = name
+        self._pathways = []
+        if pathways != nil {
+            for pw in pathways {
+                self._pathways.append(pw)
+            }
+        }
+        self._merge = merge
+        self._consensus_threshold = consensus_threshold
+        self._lateral_inhibition = lateral_inhibition
+        self._inhibition_threshold = inhibition_threshold
+        self._max_workers = max_workers
+        self._description = description
+        self._inhibition_events = []
+        self._total_processed = 0
+    }
+
+    fn add_pathway(self, pathway: Pathway) -> ParallelLayer {
+        self._pathways.append(pathway)
+        return self
+    }
+
+    fn process(self, data: any) -> ParallelResult {
+        let start = time.monotonic()
+        self._total_processed += 1
+
+        let completed_results = []
+        let inhibitor = nil
+
+        for pw in self._pathways {
+            let result = pw.execute(data)
+            completed_results.append(result)
+            if self._lateral_inhibition && inhibitor == nil {
+                if result.success && result.confidence >= self._inhibition_threshold {
+                    inhibitor = result
+                }
+            }
+        }
+
+        if self._lateral_inhibition && inhibitor != nil {
+            for r in completed_results {
+                if r.pathway_name != inhibitor.pathway_name {
+                    if r.confidence < inhibitor.confidence {
+                        r.inhibited = true
+                        r.inhibited_by = inhibitor.pathway_name
+                        self._inhibition_events.append({
+                            "inhibitor": inhibitor.pathway_name,
+                            "inhibited": r.pathway_name,
+                            "inhibitor_confidence": inhibitor.confidence,
+                            "inhibited_confidence": r.confidence,
+                            "timestamp": time.time()
+                        })
+                    }
+                }
+            }
+        }
+
+        let active = []
+        for r in completed_results {
+            if r.success && !r.inhibited {
+                active.append(r)
+            }
+        }
+
+        let merge_result = self._apply_merge(active)
+        let total_elapsed_ms = (time.monotonic() - start) * 1000.0
+
+        return ParallelResult {
+            merged_output: merge_result["output"],
+            merged_confidence: to_float(merge_result["confidence"]),
+            strategy_used: self._merge,
+            winner: merge_result["winner"],
+            pathway_results: completed_results,
+            total_elapsed_ms: total_elapsed_ms
+        }
+    }
+
+    fn _apply_merge(self, active: List[PathwayResult]) -> any {
+        if active.len() == 0 {
+            return { "output": nil, "confidence": 0.0, "winner": nil }
+        }
+
+        if self._merge == MergeStrategy.WINNER {
+            let best = active[0]
+            for r in active {
+                if r.confidence > best.confidence { best = r }
+            }
+            return {
+                "output": best.output, "confidence": best.confidence,
+                "winner": best.pathway_name
+            }
+        }
+
+        if self._merge == MergeStrategy.CONSENSUS {
+            let groups = {}
+            for r in active {
+                let key = to_string(r.output)
+                if groups.get(key, nil) == nil {
+                    groups[key] = []
+                }
+                groups[key].append(r)
+            }
+            let best_group = nil
+            let best_group_len = 0
+            for k in groups.keys() {
+                if groups[k].len() > best_group_len {
+                    best_group = groups[k]
+                    best_group_len = groups[k].len()
+                }
+            }
+            let agreement = to_float(best_group_len) / to_float(active.len())
+            if agreement >= self._consensus_threshold {
+                let avg_conf = 0.0
+                for r in best_group {
+                    avg_conf += r.confidence
+                }
+                avg_conf = avg_conf / to_float(best_group_len)
+                return {
+                    "output": best_group[0].output, "confidence": avg_conf,
+                    "winner": best_group[0].pathway_name
+                }
+            }
+            let best = active[0]
+            for r in active {
+                if r.confidence > best.confidence { best = r }
+            }
+            return {
+                "output": best.output, "confidence": best.confidence * 0.8,
+                "winner": best.pathway_name
+            }
+        }
+
+        if self._merge == MergeStrategy.WEIGHTED {
+            let pathway_lookup = {}
+            for p in self._pathways {
+                pathway_lookup[p.name] = p
+            }
+            let total_weight = 0.0
+            let weighted_confidence = 0.0
+            let best_weighted = nil
+            let best_score = -1.0
+            for r in active {
+                let w = 1.0
+                let pw = pathway_lookup.get(r.pathway_name, nil)
+                if pw != nil { w = pw.weight }
+                let score = r.confidence * w
+                total_weight += w
+                weighted_confidence += r.confidence * w
+                if score > best_score {
+                    best_score = score
+                    best_weighted = r
+                }
+            }
+            let avg_confidence = 0.0
+            if total_weight > 0.0 {
+                avg_confidence = weighted_confidence / total_weight
+            }
+            let winner = nil
+            let output = nil
+            if best_weighted != nil {
+                winner = best_weighted.pathway_name
+                output = best_weighted.output
+            }
+            return {
+                "output": output, "confidence": avg_confidence, "winner": winner
+            }
+        }
+
+        if self._merge == MergeStrategy.ALL {
+            let outputs = []
+            let total_conf = 0.0
+            for r in active {
+                outputs.append(r.output)
+                total_conf += r.confidence
+            }
+            let avg_confidence = total_conf / to_float(active.len())
+            return {
+                "output": outputs, "confidence": avg_confidence, "winner": nil
+            }
+        }
+
+        let best = active[0]
+        for r in active {
+            if r.confidence > best.confidence { best = r }
+        }
+        return {
+            "output": best.output, "confidence": best.confidence,
+            "winner": best.pathway_name
+        }
+    }
+
+    fn pathways(self) -> List[any] {
+        return self._pathways.copy()
+    }
+
+    fn inhibition_events(self) -> List[any] {
+        return self._inhibition_events.copy()
+    }
+
+    fn stats(self) -> any {
+        return {
+            "name": self._name,
+            "pathway_count": self._pathways.len(),
+            "merge_strategy": self._merge.value,
+            "lateral_inhibition": self._lateral_inhibition,
+            "total_processed": self._total_processed,
+            "total_inhibition_events": self._inhibition_events.len()
+        }
+    }
+}
+
+export MergeStrategy, PathwayResult, ParallelResult
+export parallel_result_pathways_run, parallel_result_pathways_inhibited
+export parallel_result_summary
+export Pathway, ParallelLayer

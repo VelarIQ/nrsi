@@ -1,0 +1,299 @@
+/// NRSIP Federated Registry Hierarchy — DNS-Modeled Discovery.
+///
+/// Three-level hierarchy: Root → Provider → Local Cache.
+/// Query resolution: local cache → provider registry → root registry.
+///
+/// Patent-covered: Federated registry, DNS-modeled discovery, provider registries.
+///
+/// Ported from nrsip/registry_hierarchy.py.
+
+module registry_hierarchy
+
+
+import time from "std/time"
+/// ── Data Types ──
+
+type RegistryEntry {
+    entity_id: string,
+    entity_type: string,
+    provider: string,
+    region: string,
+    nrsip_address: string,
+    capabilities: List[string],
+    load_pct: float,
+    trust_score: float,
+    alive: bool,
+    last_heartbeat_ms: int,
+    metadata: Map[string, any]
+}
+
+type ProviderBlock {
+    provider_id: string,
+    provider_name: string,
+    address_prefix: string,
+    regions: List[string],
+    registry_url: string,
+    registered_at_ms: int
+}
+
+/// ── Local Cache (Level 3) ──
+
+class LocalRegistryCache {
+    fn init(self, capacity: int, default_ttl_ms: int) {
+        self._cache = {}
+        self._order = []
+        self._capacity = capacity
+        self._default_ttl_ms = default_ttl_ms
+        self._hits = 0
+        self._misses = 0
+    }
+
+    fn get(self, key: string) -> Optional[List[RegistryEntry]] {
+        let cached = self._cache.get(key, nil)
+        if cached == nil {
+            self._misses += 1
+            return nil
+        }
+        let now_ms = to_int(time.time() * 1000.0)
+        if now_ms - cached["stored_at_ms"] > cached["ttl_ms"] {
+            self._cache.remove(key)
+            let new_order = []
+            for k in self._order {
+                if k != key {
+                    new_order.append(k)
+                }
+            }
+            self._order = new_order
+            self._misses += 1
+            return nil
+        }
+        let new_order = []
+        for k in self._order {
+            if k != key {
+                new_order.append(k)
+            }
+        }
+        new_order.append(key)
+        self._order = new_order
+        self._hits += 1
+        return cached["entries"]
+    }
+
+    fn put(self, key: string, entries: List[RegistryEntry], ttl_ms: Optional[int]) {
+        if self._cache.len() >= self._capacity {
+            if self._order.len() > 0 {
+                let oldest = self._order[0]
+                self._cache.remove(oldest)
+                self._order = self._order.slice(1, self._order.len())
+            }
+        }
+        let ttl = self._default_ttl_ms
+        if ttl_ms != nil {
+            ttl = ttl_ms
+        }
+        self._cache[key] = {
+            "entries": entries,
+            "stored_at_ms": to_int(time.time() * 1000.0),
+            "ttl_ms": ttl
+        }
+        self._order.append(key)
+    }
+
+    fn invalidate(self, key: string) {
+        self._cache.remove(key)
+        let new_order = []
+        for k in self._order {
+            if k != key {
+                new_order.append(k)
+            }
+        }
+        self._order = new_order
+    }
+
+    fn clear(self) {
+        self._cache = {}
+        self._order = []
+    }
+
+    fn hit_rate(self) -> float {
+        let total = self._hits + self._misses
+        if total == 0 {
+            return 0.0
+        }
+        return to_float(self._hits) / to_float(total)
+    }
+
+    fn size(self) -> int {
+        return self._cache.len()
+    }
+}
+
+/// ── Provider Registry (Level 2) ──
+
+class ProviderRegistry {
+    fn init(self, provider_id: string, provider_name: string, address_prefix: string) {
+        self.provider_id = provider_id
+        self.provider_name = provider_name
+        self.address_prefix = address_prefix
+        self._entries = {}
+    }
+
+    fn register(self, entry: RegistryEntry) {
+        self._entries[entry.entity_id] = entry
+    }
+
+    fn deregister(self, entity_id: string) {
+        self._entries.remove(entity_id)
+    }
+
+    fn heartbeat(self, entity_id: string, load_pct: float,
+                 trust_score: Optional[float]) {
+        let entry = self._entries.get(entity_id, nil)
+        if entry != nil {
+            entry.last_heartbeat_ms = to_int(time.time() * 1000.0)
+            entry.load_pct = load_pct
+            entry.alive = true
+            if trust_score != nil {
+                entry.trust_score = trust_score
+            }
+        }
+    }
+
+    fn discover(self, capability: Optional[string], region: Optional[string],
+                min_trust_score: float, max_load_pct: float,
+                alive_only: bool) -> List[any] {
+        let results = []
+        for entry in self._entries.values() {
+            if alive_only {
+                if !entry.alive {
+                    continue
+                }
+            }
+            if capability != nil {
+                let found = false
+                for cap in entry.capabilities {
+                    if cap == capability {
+                        found = true
+                        break
+                    }
+                }
+                if !found {
+                    continue
+                }
+            }
+            if region != nil {
+                if entry.region != region {
+                    continue
+                }
+            }
+            if entry.trust_score < min_trust_score {
+                continue
+            }
+            if entry.load_pct > max_load_pct {
+                continue
+            }
+            results.append(entry)
+        }
+        results.sort_by(fn(e: RegistryEntry) -> float {
+            return -(e.trust_score * 1000.0 - e.load_pct)
+        })
+        return results
+    }
+
+    fn count(self) -> int {
+        return self._entries.len()
+    }
+}
+
+/// ── Root Registry (Level 1) ──
+
+class RootRegistry {
+    fn init(self, root_id: string) {
+        self.root_id = root_id
+        let servers = {
+            "americas": "ns1.neuralinternet.org",
+            "emea": "ns2.neuralinternet.org",
+            "apac": "ns3.neuralinternet.org"
+        }
+        self.root_hostname = servers.get(root_id, "ns1.neuralinternet.org")
+        self._providers = {}
+        self._provider_registries = {}
+    }
+
+    fn register_provider(self, block: ProviderBlock,
+                         registry: ProviderRegistry) {
+        self._providers[block.provider_id] = block
+        self._provider_registries[block.provider_id] = registry
+    }
+
+    fn get_provider_registry(self, provider_id: string) -> Optional[ProviderRegistry] {
+        return self._provider_registries.get(provider_id, nil)
+    }
+
+    fn resolve(self, capability: Optional[string], region: Optional[string],
+               min_trust_score: float) -> List[any] {
+        let results = []
+        for registry in self._provider_registries.values() {
+            let found = registry.discover(capability, region, min_trust_score, 100.0, true)
+            for entry in found {
+                results.append(entry)
+            }
+        }
+        results.sort_by(fn(e: RegistryEntry) -> float {
+            return -(e.trust_score * 1000.0 - e.load_pct)
+        })
+        return results
+    }
+
+    fn list_providers(self) -> List[any] { return self._providers.values() }
+
+    fn provider_count(self) -> int {
+        return self._providers.len()
+    }
+}
+
+/// ── Federated Resolver ──
+
+class FederatedResolver {
+    fn init(self, root: RootRegistry, local_cache: Optional[LocalRegistryCache]) {
+        self._root = root
+        if local_cache != nil {
+            self._cache = local_cache
+        } else {
+            self._cache = LocalRegistryCache()
+            self._cache.init(10000, 300000)
+        }
+    }
+
+    fn resolve(self, capability: Optional[string], region: Optional[string],
+               min_trust_score: float) -> List[any] {
+        let cap_str = "*"
+        if capability != nil {
+            cap_str = capability
+        }
+        let reg_str = "*"
+        if region != nil {
+            reg_str = region
+        }
+        let cache_key = cap_str + ":" + reg_str + ":" + to_string(min_trust_score)
+
+        let cached = self._cache.get(cache_key)
+        if cached != nil {
+            return cached
+        }
+
+        let results = self._root.resolve(capability, region, min_trust_score)
+        self._cache.put(cache_key, results, nil)
+        return results
+    }
+
+    fn cache_hit_rate(self) -> float {
+        return self._cache.hit_rate()
+    }
+}
+
+export RegistryEntry, ProviderBlock
+export LocalRegistryCache
+export ProviderRegistry
+export RootRegistry
+export FederatedResolver

@@ -1,0 +1,1329 @@
+/// NRSI Working Memory — Active Cognitive Workspace.
+///
+/// Models the brain's working memory:
+///   1. Limited capacity active buffer (like human ~7+-2 items)
+///   2. Attention focus (what are we thinking about right now?)
+///   3. Open question tracking (what haven't we resolved?)
+///   4. Context maintenance (what's the conversation about?)
+///   5. Salience scoring (what's important right now?)
+///   6. Decay (old items fade unless refreshed)
+///
+/// Complete conversion of `nrsip/working_memory.py`.
+
+module working_memory
+
+import time from "std/time"
+import re from "std/re"
+import math from "std/math"
+import uuid from "std/uuid"
+import json from "std/json"
+import logging from "std/logging"
+
+/// ── Identifiers ────────────────────────────────────────────────────────
+
+fn _uid(prefix: string) -> string {
+    return prefix + uuid.uuid4().hex[0:12]
+}
+
+fn _now() -> float {
+    return time.time()
+}
+
+/// ── Enums ──────────────────────────────────────────────────────────────
+
+enum ItemType {
+    FACT,
+    QUESTION,
+    CLAIM,
+    ENTITY,
+    GOAL,
+    EMOTION,
+    TOPIC,
+    REFERENCE
+}
+
+enum ConversationPhase {
+    OPENING,
+    EXPLORING,
+    DEEPENING,
+    CONCLUDING,
+    FOLLOWING_UP
+}
+
+/// ── Stop Words ─────────────────────────────────────────────────────────
+
+let STOP_WORDS = [
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "this", "that", "these",
+    "those", "it", "its", "but", "and", "or", "nor", "not", "so", "yet",
+    "for", "with", "about", "into", "through", "during", "before", "after",
+    "above", "below", "from", "then", "than", "too", "very", "just",
+    "because", "also", "here", "there", "when", "where", "why", "how",
+    "all", "each", "every", "both", "few", "more", "most", "other",
+    "some", "such", "only", "same", "what", "which", "who", "whom",
+    "however", "therefore", "yes", "no", "okay", "well", "now"
+]
+
+fn _is_stop_word(w: string) -> bool {
+    for sw in STOP_WORDS {
+        if w == sw { return true }
+    }
+    return false
+}
+
+/// ── Emotion Patterns ───────────────────────────────────────────────────
+
+let EMOTION_PATTERNS = [
+    ["frustrated|angry|annoyed|irritated", "frustrated"],
+    ["confused|lost|don't understand|unclear", "confused"],
+    ["thanks|thank you|grateful|appreciate", "grateful"],
+    ["excited|amazing|awesome|great", "excited"],
+    ["worried|concerned|anxious|nervous", "worried"],
+    ["sorry|apologize|my mistake", "apologetic"],
+    ["urgent|asap|immediately|critical", "urgent"]
+]
+
+/// ── Data Types ─────────────────────────────────────────────────────────
+
+type MemoryItemData {
+    item_id: string,
+    content: any,
+    item_type: string,
+    salience: float,
+    created_at: float,
+    last_accessed: float,
+    access_count: int,
+    source: string,
+    associations: List[string],
+    decay_rate: float
+}
+
+class MemoryItem {
+    fn new(content: any, item_type: string, salience: float, source: string, decay_rate: float) -> MemoryItem {
+        let m = MemoryItem {}
+        m.item_id = _uid("mi-")
+        m.content = content
+        m.item_type = item_type
+        m.salience = salience
+        m.created_at = _now()
+        m.last_accessed = _now()
+        m.access_count = 0
+        m.source = source
+        m.associations = []
+        m.decay_rate = decay_rate
+        return m
+    }
+
+    fn age_seconds(self) -> float {
+        return _now() - self.created_at
+    }
+
+    fn refresh(self, salience_boost: float) -> void {
+        self.last_accessed = _now()
+        self.access_count += 1
+        self.salience = self.salience + salience_boost
+        if self.salience > 1.0 {
+            self.salience = 1.0
+        }
+    }
+
+    fn apply_decay(self, turns_elapsed: int) -> void {
+        let factor = 1.0
+        let i = 0
+        while i < turns_elapsed {
+            factor = factor * (1.0 - self.decay_rate)
+            i += 1
+        }
+        self.salience = self.salience * factor
+        if self.salience < 0.0 {
+            self.salience = 0.0
+        }
+    }
+
+    fn to_dict(self) -> Dict[string, any] {
+        let sorted_assoc = []
+        for a in self.associations {
+            sorted_assoc.append(a)
+        }
+        sorted_assoc.sort()
+        return {
+            "item_id": self.item_id,
+            "content": self.content,
+            "item_type": self.item_type,
+            "salience": self.salience,
+            "created_at": self.created_at,
+            "last_accessed": self.last_accessed,
+            "access_count": self.access_count,
+            "source": self.source,
+            "associations": sorted_assoc,
+            "decay_rate": self.decay_rate
+        }
+    }
+}
+
+fn memory_item_from_dict(d: Dict[string, any]) -> MemoryItem {
+    let m = MemoryItem {}
+    m.item_id = d.get("item_id", _uid("mi-"))
+    m.content = d["content"]
+    m.item_type = d["item_type"]
+    m.salience = d.get("salience", 0.5)
+    m.created_at = d.get("created_at", _now())
+    m.last_accessed = d.get("last_accessed", _now())
+    m.access_count = d.get("access_count", 0)
+    m.source = d.get("source", "")
+    m.associations = d.get("associations", [])
+    m.decay_rate = d.get("decay_rate", 0.05)
+    return m
+}
+
+/// ── Attention Focus ────────────────────────────────────────────────────
+
+class AttentionFocus {
+    fn new() -> AttentionFocus {
+        let af = AttentionFocus {}
+        af.primary_topic = ""
+        af.secondary_topics = []
+        af.open_questions = []
+        af.established_facts = []
+        af.emotional_state = "neutral"
+        af.conversation_phase = "opening"
+        af.turn_count = 0
+        return af
+    }
+
+    fn to_dict(self) -> Dict[string, any] {
+        return {
+            "primary_topic": self.primary_topic,
+            "secondary_topics": self.secondary_topics,
+            "open_questions": self.open_questions,
+            "established_facts": self.established_facts,
+            "emotional_state": self.emotional_state,
+            "conversation_phase": self.conversation_phase,
+            "turn_count": self.turn_count
+        }
+    }
+}
+
+fn attention_focus_from_dict(d: Dict[string, any]) -> AttentionFocus {
+    let af = AttentionFocus.new()
+    af.primary_topic = d.get("primary_topic", "")
+    af.secondary_topics = d.get("secondary_topics", [])
+    af.open_questions = d.get("open_questions", [])
+    af.established_facts = d.get("established_facts", [])
+    af.emotional_state = d.get("emotional_state", "neutral")
+    af.conversation_phase = d.get("conversation_phase", "opening")
+    af.turn_count = d.get("turn_count", 0)
+    return af
+}
+
+/// ── Text Analysis Helpers ──────────────────────────────────────────────
+
+fn extract_questions(text: string) -> List[any] {
+    let questions = []
+
+    let q_matches = re.finditer("([^.!?\\n]*\\?)", text)
+    for match in q_matches {
+        let q = match.group(1).strip()
+        if len(q) > 5 {
+            questions.append(q)
+        }
+    }
+
+    let implicit_patterns = [
+        "\\bi(?:'m| am) (?:wondering|curious|unsure|not sure)\\b",
+        "\\bi wonder\\b",
+        "\\bcan you (?:tell|explain|clarify|help)\\b",
+        "\\bwhat about\\b",
+        "\\bhow come\\b",
+        "\\bi(?:'d| would) (?:like|love|want) to (?:know|understand)\\b",
+        "\\bcould you\\b",
+        "\\bis it (?:possible|true|correct)\\b",
+        "\\bdo you (?:know|think)\\b",
+        "\\bany idea\\b",
+        "\\bnot clear (?:to me|whether|if)\\b"
+    ]
+
+    for pattern in implicit_patterns {
+        let matches = re.finditer(pattern, text, re.IGNORECASE)
+        for match in matches {
+            let start = match.start() - 40
+            if start < 0 { start = 0 }
+            let end = match.end() + 60
+            if end > len(text) { end = len(text) }
+            let context = text[start:end].strip()
+            let sentence_end = context.find(".")
+            if sentence_end > 0 {
+                context = context[0:sentence_end]
+            }
+            if context != "" {
+                let already_in = false
+                for q in questions {
+                    if q == context { already_in = true; break }
+                }
+                if not already_in {
+                    questions.append(context)
+                }
+            }
+        }
+    }
+
+    return questions
+}
+
+fn extract_entities(text: string) -> List[any] {
+    let entities = {}
+
+    let cap_matches = re.finditer("\\b([A-Z][a-z]+(?:\\s+[A-Z][a-z]+)*)\\b", text)
+    for match in cap_matches {
+        let candidate = match.group(1)
+        if len(candidate) > 2 and not _is_stop_word(candidate.lower()) {
+            entities[candidate] = true
+        }
+    }
+
+    let acronym_matches = re.finditer("\\b[A-Z]{2,}(?:\\s+[A-Z]{2,})*\\b", text)
+    for match in acronym_matches {
+        let candidate = match.group(0)
+        if len(candidate) > 1 and candidate != "I" and candidate != "A" {
+            entities[candidate] = true
+        }
+    }
+
+    let sorted_entities = []
+    for e in entities {
+        sorted_entities.append(e)
+    }
+    sorted_entities.sort()
+    return sorted_entities
+}
+
+fn detect_emotion(text: string) -> string {
+    for pair in EMOTION_PATTERNS {
+        let pattern = pair[0]
+        let emotion = pair[1]
+        if re.search(pattern, text, re.IGNORECASE) != None {
+            return emotion
+        }
+    }
+    return "neutral"
+}
+
+fn extract_topics(text: string) -> List[any] {
+    let words = re.findall("\\b[a-zA-Z]{3,}\\b", text.lower())
+    let freq = {}
+    for w in words {
+        if not _is_stop_word(w) {
+            if w in freq {
+                freq[w] += 1
+            } else {
+                freq[w] = 1
+            }
+        }
+    }
+    let pairs = []
+    for w in freq {
+        pairs.append([freq[w], w])
+    }
+    pairs.sort(reverse: true)
+    let ranked = []
+    let idx = 0
+    for pair in pairs {
+        if idx >= 8 { break }
+        ranked.append(pair[1])
+        idx += 1
+    }
+    return ranked
+}
+
+/// ── Working Memory ─────────────────────────────────────────────────────
+
+class WorkingMemory {
+    fn new(capacity: Optional[int]) -> WorkingMemory {
+        let wm = WorkingMemory {}
+        wm.CAPACITY = 15
+        if capacity != None {
+            wm.CAPACITY = capacity
+        }
+        wm._buffer = {}
+        wm._buffer_order = []
+        wm._attention = AttentionFocus.new()
+        wm._history = []
+        wm._turn_count = 0
+        wm._max_history = 500
+        return wm
+    }
+
+    fn attend(self, item: MemoryItem) -> void {
+        if item.item_id in self._buffer {
+            self._buffer[item.item_id].refresh(0.15)
+            let new_order = []
+            for id in self._buffer_order {
+                if id != item.item_id {
+                    new_order.append(id)
+                }
+            }
+            new_order.append(item.item_id)
+            self._buffer_order = new_order
+            return
+        }
+
+        while len(self._buffer) >= self.CAPACITY {
+            self._evict_lowest()
+        }
+
+        item.last_accessed = _now()
+        self._buffer[item.item_id] = item
+        self._buffer_order.append(item.item_id)
+    }
+
+    fn recall(self, query: string, top_k: int) -> List[any] {
+        let query_tokens = {}
+        for w in query.lower().split() {
+            query_tokens[w] = true
+        }
+
+        let scored = []
+        let all_items = []
+        for id in self._buffer {
+            all_items.append(self._buffer[id])
+        }
+        let hist_start = len(self._history) - 50
+        if hist_start < 0 { hist_start = 0 }
+        let hi = hist_start
+        while hi < len(self._history) {
+            all_items.append(self._history[hi])
+            hi += 1
+        }
+
+        for item in all_items {
+            let score = self._relevance_score(item, query_tokens)
+            if score > 0.01 {
+                scored.append([score, item])
+            }
+        }
+
+        scored.sort(key_idx: 0, reverse: true)
+        let results = []
+        let idx = 0
+        for pair in scored {
+            if idx >= top_k { break }
+            results.append(pair[1])
+            idx += 1
+        }
+
+        for item in results {
+            if item.item_id in self._buffer {
+                item.refresh(0.05)
+            }
+        }
+
+        return results
+    }
+
+    fn update_attention(self, query: string, response: string) -> void {
+        let topics = extract_topics(query + " " + response)
+        let questions = extract_questions(query)
+        let entities = extract_entities(query + " " + response)
+        let emotion = detect_emotion(query)
+
+        if len(topics) > 0 {
+            self._attention.primary_topic = topics[0]
+            self._attention.secondary_topics = topics[1:5]
+        }
+
+        for q in questions {
+            let already_in = false
+            for oq in self._attention.open_questions {
+                if oq == q { already_in = true; break }
+            }
+            if not already_in {
+                self._attention.open_questions.append(q)
+            }
+        }
+
+        let answered = []
+        for oq in self._attention.open_questions {
+            let oq_tokens = {}
+            for w in oq.lower().split() {
+                oq_tokens[w] = true
+            }
+            let resp_tokens = {}
+            for w in response.lower().split() {
+                resp_tokens[w] = true
+            }
+            let overlap_count = 0
+            for w in oq_tokens {
+                if w in resp_tokens {
+                    overlap_count += 1
+                }
+            }
+            let oq_count = len(oq_tokens)
+            if oq_count == 0 { oq_count = 1 }
+            let overlap_ratio = overlap_count / oq_count
+            if overlap_ratio > 0.4 and len(response) > 30 {
+                answered.append(oq)
+            }
+        }
+
+        for a in answered {
+            let new_open = []
+            for oq in self._attention.open_questions {
+                if oq != a {
+                    new_open.append(oq)
+                }
+            }
+            self._attention.open_questions = new_open
+
+            let already_established = false
+            let fact_text = "Answered: " + a[0:80]
+            for ef in self._attention.established_facts {
+                if ef == fact_text { already_established = true; break }
+            }
+            if not already_established {
+                self._attention.established_facts.append(fact_text)
+            }
+        }
+
+        if len(self._attention.established_facts) > 30 {
+            let start = len(self._attention.established_facts) - 30
+            self._attention.established_facts = self._attention.established_facts[start:]
+        }
+
+        if emotion != "neutral" {
+            self._attention.emotional_state = emotion
+        }
+
+        self._attention.conversation_phase = self._detect_phase()
+        self._attention.turn_count = self._turn_count
+
+        for entity in entities {
+            self.attend(MemoryItem.new(entity, "entity", 0.6, "extraction", 0.08))
+        }
+    }
+
+    fn get_context_for_response(self) -> Dict[string, any] {
+        let active_items = []
+        for id in self._buffer {
+            active_items.append(self._buffer[id])
+        }
+        active_items.sort(key_fn: "salience", reverse: true)
+
+        let facts = []
+        let questions = []
+        let entities = []
+        let needs_attention = []
+
+        for m in active_items {
+            if m.item_type == "fact" and m.salience > 0.2 {
+                facts.append(m.content)
+            }
+            if m.item_type == "question" and m.salience > 0.15 {
+                questions.append(m.content)
+            }
+            if m.item_type == "entity" and m.salience > 0.15 {
+                entities.append(m.content)
+            }
+            if m.item_type == "question" and m.salience > 0.5 {
+                needs_attention.append(m.content)
+            }
+        }
+
+        let established_slice = self._attention.established_facts
+        let est_start = len(established_slice) - 10
+        if est_start < 0 { est_start = 0 }
+        established_slice = established_slice[est_start:]
+
+        return {
+            "primary_topic": self._attention.primary_topic,
+            "secondary_topics": self._attention.secondary_topics,
+            "active_facts": facts,
+            "active_questions": questions,
+            "active_entities": entities,
+            "open_questions": self._attention.open_questions,
+            "established_facts": established_slice,
+            "emotional_state": self._attention.emotional_state,
+            "conversation_phase": self._attention.conversation_phase,
+            "needs_attention": needs_attention,
+            "buffer_usage": str(len(self._buffer)) + "/" + str(self.CAPACITY),
+            "turn_count": self._turn_count
+        }
+    }
+
+    fn decay_tick(self) -> void {
+        let to_evict = []
+        for item_id in self._buffer {
+            let item = self._buffer[item_id]
+            item.apply_decay(1)
+            if item.salience < 0.01 {
+                to_evict.append(item_id)
+            }
+        }
+
+        for item_id in to_evict {
+            let evicted = self._buffer[item_id]
+            del self._buffer[item_id]
+            let new_order = []
+            for id in self._buffer_order {
+                if id != item_id {
+                    new_order.append(id)
+                }
+            }
+            self._buffer_order = new_order
+            self._history.append(evicted)
+        }
+
+        if len(self._history) > self._max_history {
+            let start = len(self._history) - self._max_history
+            self._history = self._history[start:]
+        }
+    }
+
+    fn _evict_lowest(self) -> void {
+        if len(self._buffer) == 0 {
+            return
+        }
+        let lowest_id = ""
+        let lowest_sal = 999.0
+        for k in self._buffer {
+            if self._buffer[k].salience < lowest_sal {
+                lowest_sal = self._buffer[k].salience
+                lowest_id = k
+            }
+        }
+        let evicted = self._buffer[lowest_id]
+        del self._buffer[lowest_id]
+        let new_order = []
+        for id in self._buffer_order {
+            if id != lowest_id {
+                new_order.append(id)
+            }
+        }
+        self._buffer_order = new_order
+        self._history.append(evicted)
+        logging.debug("Evicted item " + lowest_id + " (salience " + str(lowest_sal) + ")")
+    }
+
+    fn process_turn(self, query: string, response: string, extracted_claims: Optional[List[string]], detected_entities: Optional[List[string]]) -> void {
+        self._turn_count += 1
+
+        let questions = extract_questions(query)
+        for q in questions {
+            self.attend(MemoryItem.new(q, "question", 0.8, "user_query", 0.03))
+        }
+
+        let entities = extract_entities(query)
+        if detected_entities != None {
+            for de in detected_entities {
+                let found = false
+                for e in entities {
+                    if e == de { found = true; break }
+                }
+                if not found {
+                    entities.append(de)
+                }
+            }
+        }
+        for ent in entities {
+            self.attend(MemoryItem.new(ent, "entity", 0.6, "extraction", 0.08))
+        }
+
+        if extracted_claims != None {
+            for claim in extracted_claims {
+                self.attend(MemoryItem.new(claim, "claim", 0.7, "response", 0.04))
+            }
+        }
+
+        let topics = extract_topics(query)
+        let ti = 0
+        for t in topics {
+            if ti >= 3 { break }
+            self.attend(MemoryItem.new(t, "topic", 0.5, "topic_extraction", 0.10))
+            ti += 1
+        }
+
+        let relevant = self.recall(query, 5)
+        for item in relevant {
+            if item.item_id in self._buffer {
+                item.refresh(0.1)
+            }
+        }
+
+        self.update_attention(query, response)
+        self.decay_tick()
+    }
+
+    fn get_open_questions(self) -> List[any] {
+        let buffer_questions = []
+        for id in self._buffer {
+            let m = self._buffer[id]
+            if m.item_type == "question" and m.salience > 0.1 {
+                buffer_questions.append(str(m.content))
+            }
+        }
+        let attention_questions = []
+        for q in self._attention.open_questions {
+            attention_questions.append(q)
+        }
+        let seen = {}
+        let merged = []
+        for q in buffer_questions {
+            if q not in seen {
+                seen[q] = true
+                merged.append(q)
+            }
+        }
+        for q in attention_questions {
+            if q not in seen {
+                seen[q] = true
+                merged.append(q)
+            }
+        }
+        return merged
+    }
+
+    fn get_conversation_summary(self) -> string {
+        let ctx = self.get_context_for_response()
+        let lines = []
+
+        lines.append("Turn " + str(self._turn_count) + ", phase: " + ctx["conversation_phase"])
+
+        if ctx["primary_topic"] != "" {
+            lines.append("Discussing: " + ctx["primary_topic"])
+            if len(ctx["secondary_topics"]) > 0 {
+                let sec = ctx["secondary_topics"][0:3]
+                lines.append("  Also touching on: " + ", ".join(sec))
+            }
+        }
+
+        if len(ctx["active_entities"]) > 0 {
+            let ent_strs = []
+            let ei = 0
+            for e in ctx["active_entities"] {
+                if ei >= 5 { break }
+                ent_strs.append(str(e))
+                ei += 1
+            }
+            lines.append("Key entities: " + ", ".join(ent_strs))
+        }
+
+        if len(ctx["open_questions"]) > 0 {
+            lines.append("Open questions (" + str(len(ctx["open_questions"])) + "):")
+            let qi = 0
+            for q in ctx["open_questions"] {
+                if qi >= 3 { break }
+                lines.append("  - " + q)
+                qi += 1
+            }
+        }
+
+        if len(ctx["established_facts"]) > 0 {
+            lines.append("Established (" + str(len(ctx["established_facts"])) + "):")
+            let start = len(ctx["established_facts"]) - 3
+            if start < 0 { start = 0 }
+            let fi = start
+            while fi < len(ctx["established_facts"]) {
+                lines.append("  - " + ctx["established_facts"][fi])
+                fi += 1
+            }
+        }
+
+        if ctx["emotional_state"] != "neutral" {
+            lines.append("Emotional tone: " + ctx["emotional_state"])
+        }
+
+        lines.append("Buffer: " + ctx["buffer_usage"])
+        return "\n".join(lines)
+    }
+
+    fn save_state(self) -> Dict[string, any] {
+        let buffer_list = []
+        for id in self._buffer {
+            buffer_list.append(self._buffer[id].to_dict())
+        }
+        let history_list = []
+        let hist_start = len(self._history) - 100
+        if hist_start < 0 { hist_start = 0 }
+        let hi = hist_start
+        while hi < len(self._history) {
+            history_list.append(self._history[hi].to_dict())
+            hi += 1
+        }
+        return {
+            "buffer": buffer_list,
+            "attention": self._attention.to_dict(),
+            "history": history_list,
+            "turn_count": self._turn_count
+        }
+    }
+
+    fn load_state(self, state: Dict[string, any]) -> void {
+        self._buffer = {}
+        self._buffer_order = []
+        for d in state.get("buffer", []) {
+            let item = memory_item_from_dict(d)
+            self._buffer[item.item_id] = item
+            self._buffer_order.append(item.item_id)
+        }
+
+        let att = state.get("attention", None)
+        if att != None {
+            self._attention = attention_focus_from_dict(att)
+        }
+
+        self._history = []
+        for d in state.get("history", []) {
+            self._history.append(memory_item_from_dict(d))
+        }
+        self._turn_count = state.get("turn_count", 0)
+    }
+
+    fn _relevance_score(self, item: MemoryItem, query_tokens: Dict[string, bool]) -> float {
+        let content_str = str(item.content).lower()
+        let content_tokens = {}
+        for w in content_str.split() {
+            content_tokens[w] = true
+        }
+
+        if len(query_tokens) == 0 or len(content_tokens) == 0 {
+            return item.salience * 0.1
+        }
+
+        let overlap = 0
+        let union_count = 0
+        let all_tokens = {}
+        for w in query_tokens { all_tokens[w] = true }
+        for w in content_tokens { all_tokens[w] = true }
+        union_count = len(all_tokens)
+        for w in query_tokens {
+            if w in content_tokens {
+                overlap += 1
+            }
+        }
+
+        if union_count == 0 { union_count = 1 }
+        let jaccard = overlap / union_count
+
+        let access_factor = item.access_count
+        if access_factor > 10 { access_factor = 10 }
+        let score = (jaccard * 0.5) + (item.salience * 0.3) + (access_factor / 10.0 * 0.2)
+        return score
+    }
+
+    fn _detect_phase(self) -> string {
+        if self._turn_count <= 1 {
+            return "opening"
+        }
+
+        let n_questions = len(self._attention.open_questions)
+        let n_facts = len(self._attention.established_facts)
+
+        if n_facts > 5 and n_questions <= 1 {
+            return "concluding"
+        }
+        if n_facts > 3 {
+            return "deepening"
+        }
+        if self._turn_count > 8 and n_questions > 2 {
+            return "following_up"
+        }
+        return "exploring"
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        let saliences = []
+        let type_counts = {}
+        for id in self._buffer {
+            let m = self._buffer[id]
+            saliences.append(m.salience)
+            if m.item_type in type_counts {
+                type_counts[m.item_type] += 1
+            } else {
+                type_counts[m.item_type] = 1
+            }
+        }
+
+        let mean_sal = 0.0
+        let max_sal = 0.0
+        let min_sal = 0.0
+        if len(saliences) > 0 {
+            let total = 0.0
+            max_sal = saliences[0]
+            min_sal = saliences[0]
+            for s in saliences {
+                total += s
+                if s > max_sal { max_sal = s }
+                if s < min_sal { min_sal = s }
+            }
+            mean_sal = total / len(saliences)
+        }
+
+        let cap = self.CAPACITY
+        if cap == 0 { cap = 1 }
+
+        return {
+            "buffer_size": len(self._buffer),
+            "capacity": self.CAPACITY,
+            "utilization": len(self._buffer) / cap,
+            "history_size": len(self._history),
+            "turn_count": self._turn_count,
+            "mean_salience": mean_sal,
+            "max_salience": max_sal,
+            "min_salience": min_sal,
+            "type_distribution": type_counts,
+            "open_questions": len(self._attention.open_questions),
+            "established_facts": len(self._attention.established_facts),
+            "conversation_phase": self._attention.conversation_phase,
+            "emotional_state": self._attention.emotional_state
+        }
+    }
+}
+
+/// ── Domain Accumulator ─────────────────────────────────────────────────
+
+class DomainAccumulator {
+    fn new() -> DomainAccumulator {
+        let da = DomainAccumulator {}
+        da.count = 0
+        da._conf_sum = 0.0
+        da._conf_sq_sum = 0.0
+        da._lat_sum = 0.0
+        da._lat_sq_sum = 0.0
+        da.no_fact_count = 0
+        return da
+    }
+
+    fn record(self, confidence: float, latency_ms: float, had_facts: bool) -> void {
+        self.count += 1
+        self._conf_sum += confidence
+        self._conf_sq_sum += confidence * confidence
+        self._lat_sum += latency_ms
+        self._lat_sq_sum += latency_ms * latency_ms
+        if not had_facts {
+            self.no_fact_count += 1
+        }
+    }
+
+    fn mean_confidence(self) -> float {
+        let denom = self.count
+        if denom == 0 { denom = 1 }
+        return self._conf_sum / denom
+    }
+
+    fn mean_latency(self) -> float {
+        let denom = self.count
+        if denom == 0 { denom = 1 }
+        return self._lat_sum / denom
+    }
+
+    fn confidence_stddev(self) -> float {
+        if self.count < 2 {
+            return 0.0
+        }
+        let mc = self.mean_confidence()
+        let variance = (self._conf_sq_sum / self.count) - (mc * mc)
+        if variance < 0.0 { variance = 0.0 }
+        return math.sqrt(variance)
+    }
+}
+
+/// ── Self Monitor ───────────────────────────────────────────────────────
+
+fn _alternative_mode(current: string) -> string {
+    if current == "deterministic" { return "probabilistic" }
+    if current == "probabilistic" { return "deterministic" }
+    if current == "hybrid" { return "deterministic" }
+    return "hybrid"
+}
+
+class SelfMonitor {
+    fn new(max_log: int) -> SelfMonitor {
+        let sm = SelfMonitor {}
+        sm._query_log = []
+        sm._max_log = max_log
+        sm._failure_patterns = {}
+        sm._success_patterns = {}
+        sm._hypotheses = []
+        sm._domain_stats = {}
+        sm._mode_stats = {}
+        sm._latency_buckets = {"fast": [], "normal": [], "slow": []}
+        sm._confidence_thresholds = {"low": 0.3, "mid": 0.6, "high": 0.85}
+        return sm
+    }
+
+    fn _get_domain_acc(self, domain: string) -> DomainAccumulator {
+        if domain not in self._domain_stats {
+            self._domain_stats[domain] = DomainAccumulator.new()
+        }
+        return self._domain_stats[domain]
+    }
+
+    fn _get_mode_acc(self, mode: string) -> DomainAccumulator {
+        if mode not in self._mode_stats {
+            self._mode_stats[mode] = DomainAccumulator.new()
+        }
+        return self._mode_stats[mode]
+    }
+
+    fn _bucket_confidence(self, confidence: float) -> string {
+        if confidence >= self._confidence_thresholds["high"] { return "high" }
+        if confidence >= self._confidence_thresholds["mid"] { return "mid" }
+        if confidence >= self._confidence_thresholds["low"] { return "low" }
+        return "very_low"
+    }
+
+    fn log_interaction(self, query: string, response: string, confidence: float, domain: string, mode: string, had_facts: bool, latency_ms: float) -> void {
+        let entry = {
+            "timestamp": _now(),
+            "query_length": len(query),
+            "response_length": len(response),
+            "confidence": confidence,
+            "domain": domain,
+            "mode": mode,
+            "had_facts": had_facts,
+            "latency_ms": latency_ms,
+            "quality_bucket": self._bucket_confidence(confidence)
+        }
+        self._query_log.append(entry)
+        if len(self._query_log) > self._max_log {
+            let start = len(self._query_log) - self._max_log
+            self._query_log = self._query_log[start:]
+        }
+
+        let key = domain + ":" + mode
+        if confidence < self._confidence_thresholds["low"] {
+            if key in self._failure_patterns {
+                self._failure_patterns[key] += 1
+            } else {
+                self._failure_patterns[key] = 1
+            }
+        } else if confidence >= self._confidence_thresholds["high"] {
+            if key in self._success_patterns {
+                self._success_patterns[key] += 1
+            } else {
+                self._success_patterns[key] = 1
+            }
+        }
+
+        self._get_domain_acc(domain).record(confidence, latency_ms, had_facts)
+        self._get_mode_acc(mode).record(confidence, latency_ms, had_facts)
+
+        let bucket = "normal"
+        if latency_ms < 200 { bucket = "fast" }
+        if latency_ms >= 1000 { bucket = "slow" }
+        self._latency_buckets[bucket].append(latency_ms)
+    }
+
+    fn identify_weaknesses(self) -> List[any] {
+        let weaknesses = []
+
+        let sorted_failures = []
+        for key in self._failure_patterns {
+            sorted_failures.append([self._failure_patterns[key], key])
+        }
+        sorted_failures.sort(reverse: true)
+
+        for pair in sorted_failures {
+            let count = pair[0]
+            let key = pair[1]
+            let success = self._success_patterns.get(key, 0)
+            let total = count + success
+            if total < 3 { continue }
+            let fail_rate = count / total
+            if fail_rate > 0.3 {
+                let parts = key.split(":")
+                let domain = key
+                let mode = "unknown"
+                if len(parts) >= 2 {
+                    domain = parts[0]
+                    mode = parts[1]
+                }
+                let severity = "medium"
+                if fail_rate > 0.6 { severity = "high" }
+                weaknesses.append({
+                    "domain": domain, "mode": mode,
+                    "failure_rate": fail_rate,
+                    "total_interactions": total,
+                    "failures": count, "severity": severity
+                })
+            }
+        }
+
+        for domain in self._domain_stats {
+            let acc = self._domain_stats[domain]
+            if acc.count < 5 { continue }
+            let no_fact_rate = acc.no_fact_count / acc.count
+            if no_fact_rate > 0.5 {
+                let severity = "medium"
+                if no_fact_rate > 0.7 { severity = "high" }
+                weaknesses.append({
+                    "domain": domain, "mode": "any",
+                    "issue": "knowledge_gap",
+                    "no_fact_rate": no_fact_rate,
+                    "mean_confidence": acc.mean_confidence(),
+                    "severity": severity
+                })
+            }
+        }
+
+        let slow = self._latency_buckets.get("slow", [])
+        if len(slow) > 5 {
+            let slow_sum = 0.0
+            for s in slow { slow_sum += s }
+            let sorted_slow = []
+            for s in slow { sorted_slow.append(s) }
+            sorted_slow.sort()
+            let p95_idx = int(len(sorted_slow) * 0.95)
+            weaknesses.append({
+                "domain": "system", "issue": "latency",
+                "slow_count": len(slow),
+                "mean_slow_ms": slow_sum / len(slow),
+                "p95_ms": sorted_slow[p95_idx],
+                "severity": "medium"
+            })
+        }
+
+        return weaknesses
+    }
+
+    fn hypothesize_improvement(self, weakness: Dict[string, any]) -> Optional[Dict[string, any]] {
+        let issue = weakness.get("issue", "failure_rate")
+        let domain = weakness.get("domain", "unknown")
+
+        let hypothesis = None
+
+        if issue == "knowledge_gap" {
+            let nfr = weakness.get("no_fact_rate", 0.5)
+            let target = nfr - 0.2
+            if target < 0.1 { target = 0.1 }
+            hypothesis = {
+                "id": _uid("hyp-"),
+                "weakness": weakness,
+                "hypothesis": "Add curated knowledge sources for domain '" + domain + "'",
+                "action": "expand_knowledge",
+                "expected_improvement": "no_fact_rate decreases by >20%",
+                "metric": "no_fact_rate",
+                "baseline": nfr,
+                "target": target,
+                "created_at": _now(),
+                "status": "proposed"
+            }
+        } else if issue == "latency" {
+            let p95 = weakness.get("p95_ms", 1000)
+            hypothesis = {
+                "id": _uid("hyp-"),
+                "weakness": weakness,
+                "hypothesis": "Enable caching for frequent query patterns",
+                "action": "add_caching",
+                "expected_improvement": "p95 latency drops by >30%",
+                "metric": "p95_ms",
+                "baseline": p95,
+                "target": p95 * 0.7,
+                "created_at": _now(),
+                "status": "proposed"
+            }
+        } else if weakness.get("failure_rate", 0) > 0.3 {
+            let fr = weakness.get("failure_rate", 0.5)
+            let target = fr - 0.15
+            if target < 0.05 { target = 0.05 }
+            let alt_mode = _alternative_mode(weakness.get("mode", ""))
+            hypothesis = {
+                "id": _uid("hyp-"),
+                "weakness": weakness,
+                "hypothesis": "Switch to " + alt_mode + " mode for domain '" + domain + "' to reduce failure rate",
+                "action": "mode_switch",
+                "expected_improvement": "failure_rate decreases by >15%",
+                "metric": "failure_rate",
+                "baseline": fr,
+                "target": target,
+                "created_at": _now(),
+                "status": "proposed"
+            }
+        }
+
+        if hypothesis != None {
+            self._hypotheses.append(hypothesis)
+        }
+
+        return hypothesis
+    }
+
+    fn evaluate_hypothesis(self, hypothesis: Dict[string, any], recent_results: List[Dict[string, any]]) -> Dict[string, any] {
+        let metric = hypothesis.get("metric", "failure_rate")
+        let baseline = hypothesis.get("baseline", 0)
+        let target = hypothesis.get("target", 0)
+
+        if len(recent_results) == 0 {
+            return {
+                "hypothesis_id": hypothesis.get("id", ""),
+                "verdict": "insufficient_data", "samples": 0
+            }
+        }
+
+        let current_rate = 0.0
+        let improved = false
+
+        if metric == "failure_rate" {
+            let domain = hypothesis.get("weakness", {}).get("domain", "")
+            let mode = hypothesis.get("weakness", {}).get("mode", "")
+            let matching = []
+            for r in recent_results {
+                if r.get("domain") == domain {
+                    if mode == "" or mode == "any" or r.get("mode") == mode {
+                        matching.append(r)
+                    }
+                }
+            }
+            if len(matching) < 3 {
+                return {"hypothesis_id": hypothesis.get("id", ""), "verdict": "insufficient_data", "samples": len(matching)}
+            }
+            let low_conf = 0
+            for r in matching {
+                if r.get("confidence", 0) < self._confidence_thresholds["low"] {
+                    low_conf += 1
+                }
+            }
+            current_rate = low_conf / len(matching)
+            improved = current_rate < baseline * 0.85
+        } else if metric == "no_fact_rate" {
+            let domain = hypothesis.get("weakness", {}).get("domain", "")
+            let matching = []
+            for r in recent_results {
+                if r.get("domain") == domain {
+                    matching.append(r)
+                }
+            }
+            if len(matching) < 3 {
+                return {"hypothesis_id": hypothesis.get("id", ""), "verdict": "insufficient_data", "samples": len(matching)}
+            }
+            let no_facts = 0
+            for r in matching {
+                if not r.get("had_facts", true) {
+                    no_facts += 1
+                }
+            }
+            current_rate = no_facts / len(matching)
+            improved = current_rate <= target
+        } else if metric == "p95_ms" {
+            let latencies = []
+            for r in recent_results {
+                let lat = r.get("latency_ms", 0)
+                if lat > 0 {
+                    latencies.append(lat)
+                }
+            }
+            if len(latencies) < 5 {
+                return {"hypothesis_id": hypothesis.get("id", ""), "verdict": "insufficient_data", "samples": len(latencies)}
+            }
+            latencies.sort()
+            current_rate = latencies[int(len(latencies) * 0.95)]
+            improved = current_rate <= target
+        } else {
+            return {"hypothesis_id": hypothesis.get("id", ""), "verdict": "unknown_metric", "metric": metric}
+        }
+
+        let verdict = "not_confirmed"
+        if improved { verdict = "confirmed" }
+
+        let result = {
+            "hypothesis_id": hypothesis.get("id", ""),
+            "verdict": verdict, "metric": metric,
+            "baseline": baseline, "target": target,
+            "current": current_rate,
+            "samples": len(recent_results), "improved": improved
+        }
+
+        for h in self._hypotheses {
+            if h.get("id") == hypothesis.get("id") {
+                h["status"] = verdict
+                h["evaluation"] = result
+                break
+            }
+        }
+
+        return result
+    }
+
+    fn performance_report(self) -> Dict[string, any] {
+        if len(self._query_log) == 0 {
+            return {"total_interactions": 0, "status": "no data"}
+        }
+
+        let confs = []
+        let latencies = []
+        for e in self._query_log {
+            confs.append(e["confidence"])
+            latencies.append(e["latency_ms"])
+        }
+        let n = len(self._query_log)
+
+        let low = 0
+        let high = 0
+        let conf_sum = 0.0
+        for c in confs {
+            conf_sum += c
+            if c < self._confidence_thresholds["low"] { low += 1 }
+            if c >= self._confidence_thresholds["high"] { high += 1 }
+        }
+
+        let domain_summary = {}
+        for domain in self._domain_stats {
+            let acc = self._domain_stats[domain]
+            let denom = acc.count
+            if denom == 0 { denom = 1 }
+            domain_summary[domain] = {
+                "count": acc.count,
+                "mean_confidence": acc.mean_confidence(),
+                "mean_latency_ms": acc.mean_latency(),
+                "knowledge_coverage": 1.0 - acc.no_fact_count / denom
+            }
+        }
+
+        let sorted_lat = []
+        for l in latencies { sorted_lat.append(l) }
+        sorted_lat.sort()
+        let sorted_conf = []
+        for c in confs { sorted_conf.append(c) }
+        sorted_conf.sort()
+
+        let p50 = 0.0
+        let p95 = 0.0
+        let p99 = 0.0
+        if n > 0 {
+            p50 = sorted_lat[n / 2]
+            p95 = sorted_lat[int(n * 0.95)]
+            p99 = sorted_lat[int(n * 0.99)]
+        }
+
+        let proposed = 0
+        let confirmed = 0
+        for h in self._hypotheses {
+            if h.get("status") == "proposed" { proposed += 1 }
+            if h.get("status") == "confirmed" { confirmed += 1 }
+        }
+
+        return {
+            "total_interactions": n,
+            "mean_confidence": conf_sum / n,
+            "median_confidence": sorted_conf[n / 2],
+            "low_confidence_rate": low / n,
+            "high_confidence_rate": high / n,
+            "latency_p50_ms": p50,
+            "latency_p95_ms": p95,
+            "latency_p99_ms": p99,
+            "domains": domain_summary,
+            "active_hypotheses": proposed,
+            "confirmed_hypotheses": confirmed,
+            "weaknesses": len(self.identify_weaknesses())
+        }
+    }
+}
+
+/// ── Exports ─────────────────────────────────────────────────────────────
+
+export ItemType, ConversationPhase
+export MemoryItem, memory_item_from_dict
+export AttentionFocus, attention_focus_from_dict
+export extract_questions, extract_entities, detect_emotion, extract_topics
+export WorkingMemory
+export DomainAccumulator, SelfMonitor

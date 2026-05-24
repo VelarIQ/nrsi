@@ -1,0 +1,950 @@
+/// Domain Creases, Crease Registry, and Integration Core.
+///
+/// Ported from nrsip/domain_creases.py for the global-rollout runtime.
+///
+/// Patent-covered:
+///   - Domain Creases (modular knowledge modules, cortical fold analogy)
+///   - Axiom Tier hierarchy (T0-T3)
+///   - Crease lifecycle (TRAINING -> VALIDATING -> LOCKED -> GROWING -> RETIRED)
+///   - Integration Core (cross-lobe coordination, white-matter analogy)
+
+module domain_creases
+
+
+import time from "std/time"
+/// ── Axiom Tiers ──
+
+enum CreaseAxiomTier {
+    T0_AXIOM = 0,
+    T1_FACT = 1,
+    T2_DOMAIN = 2,
+    T3_DYNAMIC = 3
+}
+
+type CreaseAxiom {
+    key: string,
+    value: any,
+    tier: CreaseAxiomTier,
+    domain: Optional[string],
+    source: string,
+    immutable: bool,
+    validated_at: float
+}
+
+fn make_crease_axiom(key: string, value: any, tier: CreaseAxiomTier,
+                     domain: Optional[string], source: string) -> CreaseAxiom {
+    let immutable = false
+    if tier == CreaseAxiomTier.T0_AXIOM {
+        immutable = true
+    }
+    return CreaseAxiom {
+        key: key,
+        value: value,
+        tier: tier,
+        domain: domain,
+        source: source,
+        immutable: immutable,
+        validated_at: time.time()
+    }
+}
+
+class AxiomBase {
+    fn init(self) {
+        self._axioms = {}
+        self._by_tier = {
+            CreaseAxiomTier.T0_AXIOM: {},
+            CreaseAxiomTier.T1_FACT: {},
+            CreaseAxiomTier.T2_DOMAIN: {},
+            CreaseAxiomTier.T3_DYNAMIC: {}
+        }
+        self._by_domain = {}
+    }
+
+    fn add_axiom(self, key: string, value: any, tier: CreaseAxiomTier,
+                 domain: Optional[string], source: string) -> CreaseAxiom {
+        let existing = self._axioms.get(key, nil)
+        if existing != nil {
+            if existing.immutable {
+                raise "Cannot overwrite immutable axiom '" + key + "' (tier=" + to_string(existing.tier) + ")"
+            }
+        }
+
+        let axiom = make_crease_axiom(key, value, tier, domain, source)
+        self._axioms[key] = axiom
+        self._by_tier[tier][key] = axiom
+
+        if domain != nil {
+            if self._by_domain.get(domain, nil) == nil {
+                self._by_domain[domain] = {}
+            }
+            self._by_domain[domain][key] = axiom
+        }
+        return axiom
+    }
+
+    fn get(self, key: string) -> Optional[CreaseAxiom] {
+        return self._axioms.get(key, nil)
+    }
+
+    fn get_tier(self, tier: CreaseAxiomTier) -> any {
+        return self._by_tier[tier].copy()
+    }
+
+    fn get_domain(self, domain: string) -> any {
+        let d = self._by_domain.get(domain, nil)
+        if d == nil {
+            return {}
+        }
+        return d.copy()
+    }
+
+    fn is_consistent(self, key: string, proposed_value: any) -> bool {
+        let existing = self._axioms.get(key, nil)
+        if existing == nil {
+            return true
+        }
+        return existing.value == proposed_value
+    }
+
+    fn validate_against_axioms(self, key: string, value: any,
+                               tier: CreaseAxiomTier) -> any {
+        let result = {
+            "key": key,
+            "proposed_tier": to_string(tier),
+            "consistent": true,
+            "conflicts": []
+        }
+        let existing = self._axioms.get(key, nil)
+        if existing != nil {
+            if existing.tier.value < tier.value {
+                if existing.value != value {
+                    result["consistent"] = false
+                    let conflict = {
+                        "existing_tier": to_string(existing.tier),
+                        "existing_value": existing.value,
+                        "proposed_value": value
+                    }
+                    result["conflicts"].append(conflict)
+                }
+            } else if existing.immutable {
+                if existing.value != value {
+                    result["consistent"] = false
+                    let conflict = {
+                        "existing_tier": to_string(existing.tier),
+                        "reason": "immutable axiom cannot be overwritten"
+                    }
+                    result["conflicts"].append(conflict)
+                }
+            }
+        }
+        return result
+    }
+
+    fn stats(self) -> any {
+        let by_tier = {}
+        for t in self._by_tier.keys() {
+            by_tier[to_string(t)] = self._by_tier[t].len()
+        }
+        let immutable_count = 0
+        for a in self._axioms.values() {
+            if a.immutable {
+                immutable_count += 1
+            }
+        }
+        return {
+            "total": self._axioms.len(),
+            "by_tier": by_tier,
+            "domains": self._by_domain.keys(),
+            "immutable": immutable_count
+        }
+    }
+}
+
+/// ── Crease Lifecycle ──
+
+enum CreaseState {
+    TRAINING = "training",
+    VALIDATING = "validating",
+    LOCKED = "locked",
+    GROWING = "growing",
+    RETIRED = "retired"
+}
+
+type CreaseLayer {
+    layer_id: int,
+    name: string,
+    facts: Map[string, any],
+    fact_count: int
+}
+
+fn make_crease_layer(layer_id: int, name: string) -> CreaseLayer {
+    return CreaseLayer {
+        layer_id: layer_id,
+        name: name,
+        facts: {},
+        fact_count: 0
+    }
+}
+
+fn crease_layer_add(layer: CreaseLayer, key: string, value: any) {
+    layer.facts[key] = value
+    layer.fact_count = layer.facts.len()
+}
+
+fn crease_layer_get(layer: CreaseLayer, key: string) -> Optional[any] {
+    return layer.facts.get(key, nil)
+}
+
+/// ── Domain Crease ──
+
+class DomainCrease {
+    fn init(self, domain: string, version: string) {
+        self.domain = domain
+        self.version = version
+        self.state = CreaseState.TRAINING
+        self.created_at = time.time()
+        self.locked_at = nil
+        self.training_accuracy = nil
+
+        self.layers = {
+            1: make_crease_layer(1, "Core Facts"),
+            2: make_crease_layer(2, "Inference Patterns"),
+            3: make_crease_layer(3, "Validation Criteria"),
+            4: make_crease_layer(4, "Terminology")
+        }
+        self._validators = {}
+        self._growth_log = []
+        self._total_facts = 0
+        self._queries_served = 0
+    }
+
+    fn add_fact(self, key: string, value: any, layer: int) {
+        if self.state == CreaseState.LOCKED {
+            raise "Crease '" + self.domain + "' is locked. Use grow()."
+        }
+        if self.state == CreaseState.GROWING {
+            raise "Crease '" + self.domain + "' is locked. Use grow()."
+        }
+        crease_layer_add(self.layers[layer], key, value)
+        self._total_facts += 1
+    }
+
+    fn add_inference(self, key: string, conclusion: string, premises: Optional[List[string]]) {
+        let p = premises
+        if p == nil {
+            p = []
+        }
+        let val = {
+            "conclusion": conclusion,
+            "premises": p
+        }
+        crease_layer_add(self.layers[2], key, val)
+        self._total_facts += 1
+    }
+
+    fn add_validation_rule(self, key: string, rule: any) {
+        self._validators[key] = rule
+        crease_layer_add(self.layers[3], key, "validator:" + key)
+    }
+
+    fn add_terminology(self, abbreviation: string, full_term: string) {
+        crease_layer_add(self.layers[4], abbreviation, full_term)
+    }
+
+    fn lock(self, training_accuracy: float) {
+        if training_accuracy < 0.999 {
+            raise "Training accuracy " + to_string(training_accuracy) + " below 99.9% threshold."
+        }
+        self.state = CreaseState.LOCKED
+        self.locked_at = time.time()
+        self.training_accuracy = training_accuracy
+    }
+
+    fn unlock_for_growth(self) {
+        if self.state != CreaseState.LOCKED {
+            raise "Can only unlock a LOCKED crease, current state=" + self.state.value
+        }
+        self.state = CreaseState.GROWING
+    }
+
+    fn grow(self, key: string, value: any, source: string,
+            mesh_validated: bool, layer: int) {
+        if self.state != CreaseState.GROWING {
+            if self.state != CreaseState.LOCKED {
+                raise "Crease '" + self.domain + "' state=" + self.state.value + ", cannot grow."
+            }
+        }
+        if !mesh_validated {
+            raise "All post-lock additions MUST be Mesh-validated."
+        }
+        crease_layer_add(self.layers[layer], key, value)
+        self._total_facts += 1
+        self._growth_log.append({
+            "key": key,
+            "source": source,
+            "layer": layer,
+            "added_at": time.time()
+        })
+    }
+
+    fn query(self, key: string) -> Optional[any] {
+        self._queries_served += 1
+        for layer in self.layers.values() {
+            let result = crease_layer_get(layer, key)
+            if result != nil {
+                return result
+            }
+        }
+        return nil
+    }
+
+    fn search(self, query: string, min_relevance: float) -> List[any] {
+        self._queries_served += 1
+        let results = []
+        let q_words = set()
+        for w in query.split(" ") {
+            if w.len() > 3 {
+                q_words.add(w.lower())
+            }
+        }
+        if q_words.len() == 0 {
+            return results
+        }
+
+        for layer in self.layers.values() {
+            for key in layer.facts.keys() {
+                let value = layer.facts[key]
+                let key_words = set()
+                for w in key.replace("_", " ").split(" ") {
+                    if w.len() > 2 {
+                        key_words.add(w.lower())
+                    }
+                }
+                let val_text = ""
+                if value != nil {
+                    val_text = to_string(value).lower()
+                }
+                let val_words = set()
+                for w in val_text.split(" ") {
+                    if w.len() > 3 {
+                        val_words.add(w)
+                    }
+                }
+
+                let combined = key_words.union(val_words)
+                let overlap = q_words.intersection(combined).len()
+                if overlap > 0 {
+                    let denom = q_words.len()
+                    if denom < 1 {
+                        denom = 1
+                    }
+                    let relevance = min(1.0, to_float(overlap) / to_float(denom))
+                    if relevance >= min_relevance {
+                        results.append(Tuple(key, value, relevance))
+                    }
+                }
+            }
+        }
+
+        results.sort_by(fn(x: Tuple[string, any, float]) -> float { return -x.2 })
+        if results.len() > 10 {
+            return results.slice(0, 10)
+        }
+        return results
+    }
+
+    fn validate_domain(self, data: Map[string, any]) -> any {
+        let results = {}
+        for name in self._validators.keys() {
+            let validator = self._validators[name]
+            try {
+                results[name] = validator(data)
+            } catch(e) {
+                results[name] = false
+            }
+        }
+        return results
+    }
+
+    fn resolve_terminology(self, term: string) -> Optional[string] {
+        return crease_layer_get(self.layers[4], term)
+    }
+
+    fn total_facts(self) -> int {
+        let total = 0
+        for l in self.layers.values() {
+            total += l.fact_count
+        }
+        return total
+    }
+
+    fn stats(self) -> any {
+        let layer_stats = {}
+        for l in self.layers.values() {
+            layer_stats[l.name] = l.fact_count
+        }
+        return {
+            "domain": self.domain,
+            "version": self.version,
+            "state": self.state.value,
+            "training_accuracy": self.training_accuracy,
+            "layers": layer_stats,
+            "total_facts": self.total_facts(),
+            "growth_additions": self._growth_log.len(),
+            "queries_served": self._queries_served,
+            "validators": self._validators.len()
+        }
+    }
+}
+
+/// ── Crease Registry ──
+
+class CreaseRegistry {
+    fn init(self) {
+        self._creases = {}
+        self.axiom_base = AxiomBase()
+        self.axiom_base.init()
+    }
+
+    fn create(self, domain: string, version: string) -> DomainCrease {
+        let crease = DomainCrease()
+        crease.init(domain, version)
+        self._creases[domain] = crease
+        return crease
+    }
+
+    fn get(self, domain: string) -> Optional[DomainCrease] {
+        return self._creases.get(domain, nil)
+    }
+
+    fn query_across_domains(self, key: string) -> any {
+        let results = {}
+        for domain in self._creases.keys() {
+            let crease = self._creases[domain]
+            let result = crease.query(key)
+            if result != nil {
+                results[domain] = result
+            }
+        }
+        return results
+    }
+
+    fn domains(self) -> List[any] {
+        return self._creases.keys()
+    }
+
+    fn stats(self) -> any {
+        let crease_stats = {}
+        for d in self._creases.keys() {
+            crease_stats[d] = self._creases[d].stats()
+        }
+        return {
+            "total_creases": self._creases.len(),
+            "domains": self.domains(),
+            "creases": crease_stats,
+            "axiom_base": self.axiom_base.stats()
+        }
+    }
+}
+
+/// ── Integration Core ──
+
+enum LobeType {
+    LINGUISTIC = "linguistic",
+    LOGICAL = "logical",
+    MATHEMATICAL = "mathematical",
+    SPATIAL = "spatial",
+    TEMPORAL = "temporal",
+    CREATIVE = "creative"
+}
+
+type LobeResult {
+    lobe: LobeType,
+    value: any,
+    confidence: float,
+    processing_time_ms: float,
+    needs_escalation: bool,
+    escalation_reason: Optional[string],
+    metadata: Map[string, any]
+}
+
+type IntegrationMessage {
+    source_lobe: LobeType,
+    target_lobe: LobeType,
+    content: any,
+    message_type: string,
+    priority: int,
+    created_at: float
+}
+
+fn make_integration_message(source: LobeType, target: LobeType,
+                            content: any) -> IntegrationMessage {
+    return IntegrationMessage {
+        source_lobe: source,
+        target_lobe: target,
+        content: content,
+        message_type: "data",
+        priority: 0,
+        created_at: time.time()
+    }
+}
+
+class ProcessingLobe {
+    fn init(self, lobe_type: LobeType, params_b: float) {
+        self.lobe_type = lobe_type
+        self.params_b = params_b
+        self._creases = {}
+        self._processors = []
+        self._queries = 0
+        self._escalations = 0
+        self._total_time_ms = 0.0
+    }
+
+    fn attach_crease(self, crease: DomainCrease) {
+        self._creases[crease.domain] = crease
+    }
+
+    fn register_processor(self, processor: any) {
+        self._processors.append(processor)
+    }
+
+    fn process(self, query: string, domain: Optional[string],
+               context: Optional[Map[string, any]]) -> LobeResult {
+        let t0 = time.time()
+        self._queries += 1
+
+        let result_value = nil
+        let confidence = 0.0
+        let needs_escalation = false
+        let escalation_reason = nil
+        let metadata = { "domain": domain }
+
+        if domain != nil {
+            if self._creases.get(domain, nil) != nil {
+                let crease = self._creases[domain]
+                let crease_result = crease.query(query)
+                if crease_result != nil {
+                    result_value = crease_result
+                    confidence = 0.85
+                    metadata["source"] = "domain_crease"
+                } else {
+                    let search_results = crease.search(query, 0.3)
+                    if search_results.len() > 0 {
+                        result_value = search_results[0].1
+                        confidence = search_results[0].2 * 0.85
+                        metadata["source"] = "domain_crease_fuzzy"
+                        metadata["match_key"] = search_results[0].0
+                    }
+                }
+            }
+        }
+
+        let ctx = context
+        if ctx == nil {
+            ctx = {}
+        }
+        for processor in self._processors {
+            try {
+                let proc_result = processor(query, domain, ctx)
+                if proc_result != nil {
+                    if is_map(proc_result) {
+                        let pv = proc_result.get("value", nil)
+                        if pv != nil {
+                            result_value = pv
+                        }
+                        let pc = proc_result.get("confidence", 0.0)
+                        if pc > confidence {
+                            confidence = pc
+                        }
+                        let pm = proc_result.get("metadata", nil)
+                        if pm != nil {
+                            for mk in pm.keys() {
+                                metadata[mk] = pm[mk]
+                            }
+                        }
+                    } else {
+                        result_value = proc_result
+                        if confidence < 0.7 {
+                            confidence = 0.7
+                        }
+                    }
+                }
+            } catch(e) {
+                metadata["processor_error"] = to_string(e)
+            }
+        }
+
+        if confidence < 0.5 {
+            needs_escalation = true
+            escalation_reason = "Low confidence (" + to_string(confidence) + ") in " + self.lobe_type.value
+            self._escalations += 1
+        }
+
+        let elapsed_ms = (time.time() - t0) * 1000.0
+        self._total_time_ms += elapsed_ms
+
+        if result_value == nil {
+            if confidence > 0.1 {
+                confidence = 0.1
+            }
+        } else if is_string(result_value) {
+            if result_value.strip().len() < 20 {
+                if confidence > 0.1 {
+                    confidence = 0.1
+                }
+            } else if result_value.strip().len() < 50 {
+                if confidence > 0.3 {
+                    confidence = 0.3
+                }
+            }
+        }
+
+        if confidence < 0.5 {
+            if !needs_escalation {
+                needs_escalation = true
+                escalation_reason = "Low confidence (" + to_string(confidence) + ") in " + self.lobe_type.value
+                self._escalations += 1
+            }
+        }
+
+        return LobeResult {
+            lobe: self.lobe_type,
+            value: result_value,
+            confidence: confidence,
+            processing_time_ms: elapsed_ms,
+            needs_escalation: needs_escalation,
+            escalation_reason: escalation_reason,
+            metadata: metadata
+        }
+    }
+
+    fn stats(self) -> any {
+        let avg_ms = 0.0
+        if self._queries > 0 {
+            avg_ms = self._total_time_ms / to_float(self._queries)
+        }
+        return {
+            "lobe": self.lobe_type.value,
+            "params_b": self.params_b,
+            "creases": self._creases.keys(),
+            "processors": self._processors.len(),
+            "queries": self._queries,
+            "escalations": self._escalations,
+            "avg_time_ms": round(avg_ms, 2)
+        }
+    }
+}
+
+class IntegrationCore {
+    fn init(self) {
+        self._lobes = {}
+        self._message_bus = []
+        self._single_lobe_queries = 0
+        self._multi_lobe_queries = 0
+        self._messages_sent = 0
+    }
+
+    fn register_lobe(self, lobe: ProcessingLobe) {
+        self._lobes[lobe.lobe_type] = lobe
+    }
+
+    fn get_lobe(self, lobe_type: LobeType) -> Optional[ProcessingLobe] {
+        return self._lobes.get(lobe_type, nil)
+    }
+
+    fn send_message(self, msg: IntegrationMessage) {
+        self._message_bus.append(msg)
+        self._messages_sent += 1
+    }
+
+    fn process_single(self, query: string, lobe_type: LobeType,
+                      domain: Optional[string], context: Optional[Map[string, any]]) -> LobeResult {
+        self._single_lobe_queries += 1
+        let lobe = self._lobes.get(lobe_type, nil)
+        if lobe == nil {
+            return LobeResult {
+                lobe: lobe_type,
+                value: nil,
+                confidence: 0.0,
+                processing_time_ms: 0.0,
+                needs_escalation: true,
+                escalation_reason: "Lobe " + lobe_type.value + " not registered",
+                metadata: {}
+            }
+        }
+        return lobe.process(query, domain, context)
+    }
+
+    fn process_multi(self, query: string, lobe_types: List[LobeType],
+                     domain: Optional[string], context: Optional[Map[string, any]],
+                     merge: string) -> any {
+        self._multi_lobe_queries += 1
+        let results = []
+
+        for lt in lobe_types {
+            let lobe = self._lobes.get(lt, nil)
+            if lobe != nil {
+                let r = lobe.process(query, domain, context)
+                results.append(r)
+                for other_lt in lobe_types {
+                    if other_lt != lt {
+                        self.send_message(make_integration_message(
+                            lt, other_lt,
+                            { "confidence": r.confidence, "value": r.value }
+                        ))
+                    }
+                }
+            }
+        }
+
+        if results.len() == 0 {
+            return {
+                "value": nil,
+                "confidence": 0.0,
+                "lobes_activated": [],
+                "merge_strategy": merge
+            }
+        }
+
+        let activated = []
+        for r in results {
+            activated.append(r.lobe.value)
+        }
+
+        if merge == "highest_confidence" {
+            let best = results[0]
+            for r in results {
+                if r.confidence > best.confidence {
+                    best = r
+                }
+            }
+            return {
+                "value": best.value,
+                "confidence": best.confidence,
+                "primary_lobe": best.lobe.value,
+                "lobes_activated": activated,
+                "merge_strategy": merge,
+                "all_results": results
+            }
+        } else if merge == "unanimous" {
+            let passing = []
+            for r in results {
+                if r.confidence >= 0.5 {
+                    passing.append(r)
+                }
+            }
+            let unanimous = passing.len() == results.len()
+            let best = results[0]
+            for r in results {
+                if r.confidence > best.confidence {
+                    best = r
+                }
+            }
+            let final_conf = 0.0
+            if unanimous {
+                final_conf = results[0].confidence
+                for r in results {
+                    if r.confidence < final_conf {
+                        final_conf = r.confidence
+                    }
+                }
+            }
+            return {
+                "value": best.value,
+                "confidence": final_conf,
+                "unanimous": unanimous,
+                "lobes_activated": activated,
+                "merge_strategy": merge
+            }
+        } else if merge == "all" {
+            return {
+                "results": results,
+                "lobes_activated": activated,
+                "merge_strategy": merge
+            }
+        } else {
+            let total_conf = 0.0
+            for r in results {
+                total_conf += r.confidence
+            }
+            if total_conf == 0.0 {
+                return {
+                    "value": nil,
+                    "confidence": 0.0,
+                    "merge_strategy": merge
+                }
+            }
+            let best = results[0]
+            for r in results {
+                if r.confidence > best.confidence {
+                    best = r
+                }
+            }
+            let avg_conf = total_conf / to_float(results.len())
+            return {
+                "value": best.value,
+                "confidence": avg_conf,
+                "lobes_activated": activated,
+                "merge_strategy": merge
+            }
+        }
+    }
+
+    fn process_weighted(self, query: string, lobe_weights: List[Tuple[string, float]],
+                        domain: Optional[string], context: Optional[Map[string, any]]) -> any {
+        self._multi_lobe_queries += 1
+        let results = []
+        let creative_first = false
+        let creative_weight = 0.0
+        let creative_result = nil
+
+        for entry in lobe_weights {
+            let lobe_name = entry.0
+            let weight = entry.1
+            if lobe_name == "creative" {
+                if weight > 0.6 {
+                    creative_first = true
+                    creative_weight = weight
+                    break
+                }
+            }
+        }
+
+        if creative_first {
+            let creative_lt = LobeType.CREATIVE
+            let lobe = self._lobes.get(creative_lt, nil)
+            if lobe != nil {
+                let ctx = context
+                if ctx == nil {
+                    ctx = {}
+                }
+                creative_result = lobe.process(query, domain, ctx)
+                results.append(creative_result)
+            }
+        }
+
+        let ctx = {}
+        if context != nil {
+            for k in context.keys() {
+                ctx[k] = context[k]
+            }
+        }
+        if creative_result != nil {
+            if creative_result.value != nil {
+                ctx["creative_seed"] = to_string(creative_result.value).slice(0, 500)
+                ctx["lobe_results"] = [ creative_result ]
+            }
+        }
+
+        for entry in lobe_weights {
+            let lobe_name = entry.0
+            let weight = entry.1
+            if creative_first {
+                if lobe_name == "creative" {
+                    continue
+                }
+            }
+            let lt = lobe_type_from_string(lobe_name)
+            if lt == nil {
+                continue
+            }
+            let lobe = self._lobes.get(lt, nil)
+            if lobe != nil {
+                let r = lobe.process(query, domain, ctx)
+                results.append(r)
+            }
+        }
+
+        if results.len() == 0 {
+            return {
+                "value": nil,
+                "confidence": 0.0,
+                "lobes_activated": [],
+                "merge_strategy": "weighted"
+            }
+        }
+
+        let weight_map = {}
+        for entry in lobe_weights {
+            weight_map[entry[0]] = entry[1]
+        }
+
+        let total_weighted_conf = 0.0
+        let total_weight = 0.0
+        let best_value = nil
+        let best_score = -1.0
+
+        for r in results {
+            let w = weight_map.get(r.lobe.value, 0.5)
+            let scored = r.confidence * w
+            total_weighted_conf += scored
+            total_weight += w
+            if scored > best_score {
+                best_score = scored
+                best_value = r.value
+            }
+        }
+
+        let avg_conf = 0.0
+        if total_weight > 0.0 {
+            avg_conf = total_weighted_conf / total_weight
+        }
+
+        let activated = []
+        for r in results {
+            activated.append(r.lobe.value)
+        }
+
+        return {
+            "value": best_value,
+            "confidence": avg_conf,
+            "primary_lobe": results[0].lobe.value,
+            "lobes_activated": activated,
+            "merge_strategy": "weighted",
+            "creative_first": creative_first,
+            "all_results": results
+        }
+    }
+
+    fn registered_lobes(self) -> List[any] {
+        let result = []
+        for lt in self._lobes.keys() {
+            result.append(lt.value)
+        }
+        return result
+    }
+
+    fn stats(self) -> any {
+        let lobe_stats = {}
+        for lt in self._lobes.keys() {
+            lobe_stats[lt.value] = self._lobes[lt].stats()
+        }
+        return {
+            "registered_lobes": self.registered_lobes(),
+            "single_lobe_queries": self._single_lobe_queries,
+            "multi_lobe_queries": self._multi_lobe_queries,
+            "messages_sent": self._messages_sent,
+            "lobe_stats": lobe_stats
+        }
+    }
+}
+
+fn lobe_type_from_string(name: string) -> Optional[LobeType] {
+    if name == "linguistic" { return LobeType.LINGUISTIC }
+    if name == "logical" { return LobeType.LOGICAL }
+    if name == "mathematical" { return LobeType.MATHEMATICAL }
+    if name == "spatial" { return LobeType.SPATIAL }
+    if name == "temporal" { return LobeType.TEMPORAL }
+    if name == "creative" { return LobeType.CREATIVE }
+    return nil
+}
+
+export CreaseAxiomTier, CreaseAxiom, make_crease_axiom
+export AxiomBase
+export CreaseState, CreaseLayer, make_crease_layer
+export crease_layer_add, crease_layer_get
+export DomainCrease
+export CreaseRegistry
+export LobeType, LobeResult, IntegrationMessage, make_integration_message
+export ProcessingLobe, IntegrationCore
+export lobe_type_from_string

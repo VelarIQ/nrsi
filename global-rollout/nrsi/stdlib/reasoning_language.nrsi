@@ -1,0 +1,576 @@
+/// NRSI — Grounded Language Generator.
+///
+/// Zero-hallucination text generation where every sentence traces to
+/// a graph edge with provenance. Discourse planning, fact collection,
+/// sentence composition, fluency optimization, provenance tagging.
+/// All transformer-free.
+
+module reasoning_language
+
+from "reasoning_graph" import CausalGraph, GraphEdge, RelationType
+from "reasoning_inference" import InferenceEngine, InferenceResult
+
+/// ---------- Enums ----------
+
+enum DiscourseRole {
+    CLAIM = "claim",
+    EVIDENCE = "evidence",
+    QUALIFIER = "qualifier",
+    ALTERNATIVE = "alternative",
+    CONCESSION = "concession",
+    CONCLUSION = "conclusion",
+    CONTEXT = "context",
+    UNKNOWN_BOUNDARY = "unknown_boundary"
+}
+
+/// ---------- Types ----------
+
+type GroundedSentence {
+    text: string,
+    role: DiscourseRole,
+    edge_ids: List[string],
+    confidence: float,
+    source_type: string,
+    is_speculative: bool,
+    alternatives: List[string]
+}
+
+type GroundedResponse {
+    sentences: List[GroundedSentence],
+    overall_confidence: float,
+    knowledge_gaps: List[string],
+    reasoning_mode: string,
+    concepts_used: List[string]
+}
+
+fn response_text(r: GroundedResponse) -> string {
+    let parts: List[string] = []
+    for s in r.sentences {
+        if s.text != "" {
+            parts.append(s.text)
+        }
+    }
+    return " ".join(parts)
+}
+
+fn response_claim_count(r: GroundedResponse) -> int {
+    let count = 0
+    for s in r.sentences {
+        if s.role == DiscourseRole.CLAIM {
+            count += 1
+        }
+    }
+    return count
+}
+
+fn response_grounded_ratio(r: GroundedResponse) -> float {
+    if len(r.sentences) == 0 {
+        return 0.0
+    }
+    let grounded = 0
+    for s in r.sentences {
+        if len(s.edge_ids) > 0 {
+            grounded += 1
+        }
+    }
+    return grounded / len(r.sentences)
+}
+
+/// ---------- Relation-to-Language Templates ----------
+
+let _RELATION_TEMPLATES: Dict[string, List[string]] = {
+    "causes": ["{subject} causes {object}", "{subject} leads to {object}", "{subject} results in {object}"],
+    "enables": ["{subject} enables {object}", "{subject} makes {object} possible"],
+    "prevents": ["{subject} prevents {object}", "{subject} blocks {object}"],
+    "inhibits": ["{subject} reduces {object}", "{subject} inhibits {object}"],
+    "requires": ["{subject} requires {object}", "{subject} depends on {object}"],
+    "produces": ["{subject} produces {object}", "{subject} generates {object}"],
+    "is_a": ["{subject} is a type of {object}"],
+    "part_of": ["{subject} is part of {object}"],
+    "correlates": ["{subject} is associated with {object}"],
+    "contradicts": ["{subject} contradicts {object}"],
+    "precedes": ["{subject} precedes {object}"]
+}
+
+let _CONFIDENCE_HEDGES: Dict[string, string] = {
+    "established": "",
+    "likely": "Evidence suggests that ",
+    "tentative": "It appears that ",
+    "speculative": "It is possible that "
+}
+
+fn _confidence_tier(conf: float) -> string {
+    if conf >= 0.7 {
+        return "established"
+    }
+    if conf >= 0.4 {
+        return "likely"
+    }
+    if conf >= 0.2 {
+        return "tentative"
+    }
+    return "speculative"
+}
+
+fn _edge_to_sentence(edge: GraphEdge, variation: int) -> string {
+    let rel_key = edge.relation.value
+    let templates: List[string] = ["{subject} relates to {object}"]
+    if rel_key in _RELATION_TEMPLATES {
+        templates = _RELATION_TEMPLATES[rel_key]
+    }
+    let idx = variation % len(templates)
+    let tmpl = templates[idx]
+    return tmpl.replace("{subject}", edge.source).replace("{object}", edge.target)
+}
+
+/// ---------- Discourse Planner ----------
+
+class DiscoursePlanner {
+    fn plan(self, concepts: List[string], edges: List[GraphEdge],
+            inferences: List[InferenceResult],
+            query_type: string) -> List[any] {
+        let plan: List[Tuple[DiscourseRole, Any]] = []
+
+        let direct: List[GraphEdge] = []
+        let weaker: List[GraphEdge] = []
+        for e in edges {
+            if e.confidence >= 0.5 {
+                direct.append(e)
+            } else {
+                weaker.append(e)
+            }
+        }
+
+        let sorted_direct: List[GraphEdge] = []
+        let remaining_d = list(direct)
+        while len(remaining_d) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining_d)) {
+                if remaining_d[i].confidence > remaining_d[best_idx].confidence {
+                    best_idx = i
+                }
+            }
+            sorted_direct.append(remaining_d.pop(best_idx))
+        }
+
+        if len(sorted_direct) > 0 {
+            plan.append((DiscourseRole.CLAIM, sorted_direct[0]))
+        }
+        for i in range(1, min(4, len(sorted_direct))) {
+            plan.append((DiscourseRole.EVIDENCE, sorted_direct[i]))
+        }
+        for i in range(min(3, len(inferences))) {
+            if inferences[i].depth > 1 {
+                plan.append((DiscourseRole.EVIDENCE, inferences[i]))
+            }
+        }
+        for i in range(min(2, len(weaker))) {
+            plan.append((DiscourseRole.QUALIFIER, weaker[i]))
+        }
+
+        return plan
+    }
+}
+
+/// ---------- Fact Collector ----------
+
+class FactCollector {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn collect(self, concepts: List[string], max_depth: int,
+               max_facts: int) -> List[any] {
+        let collected: List[GraphEdge] = []
+        let seen: Set[string] = set()
+
+        for concept in concepts {
+            for edge in self._graph.outgoing(concept) {
+                if edge.edge_id not in seen {
+                    seen.add(edge.edge_id)
+                    collected.append(edge)
+                }
+            }
+            for edge in self._graph.incoming(concept) {
+                if edge.edge_id not in seen {
+                    seen.add(edge.edge_id)
+                    collected.append(edge)
+                }
+            }
+        }
+
+        if max_depth >= 2 {
+            let second_hop: List[GraphEdge] = []
+            let limit = min(10, len(collected))
+            for i in range(limit) {
+                let edge = collected[i]
+                for e2 in self._graph.outgoing(edge.target) {
+                    if e2.edge_id not in seen {
+                        seen.add(e2.edge_id)
+                        second_hop.append(e2)
+                    }
+                }
+                for e2 in self._graph.outgoing(edge.source) {
+                    if e2.edge_id not in seen {
+                        seen.add(e2.edge_id)
+                        second_hop.append(e2)
+                    }
+                }
+            }
+            for e in second_hop {
+                collected.append(e)
+            }
+        }
+
+        let sorted_collected: List[GraphEdge] = []
+        let remaining = list(collected)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            for i in range(1, len(remaining)) {
+                if remaining[i].confidence > remaining[best_idx].confidence {
+                    best_idx = i
+                }
+            }
+            sorted_collected.append(remaining.pop(best_idx))
+        }
+
+        let limited: List[GraphEdge] = []
+        for i in range(min(max_facts, len(sorted_collected))) {
+            limited.append(sorted_collected[i])
+        }
+        return limited
+    }
+}
+
+/// ---------- Sentence Composer ----------
+
+class SentenceComposer {
+    fn compose_from_edge(self, edge: GraphEdge, role: DiscourseRole,
+                          variation: int) -> GroundedSentence {
+        let base = _edge_to_sentence(edge, variation)
+        let tier = _confidence_tier(edge.confidence)
+        let hedge = ""
+        if tier in _CONFIDENCE_HEDGES {
+            hedge = _CONFIDENCE_HEDGES[tier]
+        }
+
+        let text = ""
+        if role == DiscourseRole.CLAIM {
+            text = hedge + base + "."
+        } else if role == DiscourseRole.EVIDENCE {
+            text = "This is supported by the fact that " + base.lower() + "."
+        } else if role == DiscourseRole.QUALIFIER {
+            text = "However, it should be noted that " + base.lower() + "."
+        } else if role == DiscourseRole.ALTERNATIVE {
+            text = "An alternative perspective is that " + base.lower() + "."
+        } else if role == DiscourseRole.CONCESSION {
+            text = "While " + base.lower() + ", the evidence is limited."
+        } else {
+            text = hedge + base + "."
+        }
+
+        if len(text) > 0 {
+            text = text[0].upper() + text[1:]
+        }
+
+        return GroundedSentence {
+            text: text,
+            role: role,
+            edge_ids: [edge.edge_id],
+            confidence: edge.confidence,
+            source_type: edge.domain,
+            is_speculative: tier == "speculative",
+            alternatives: []
+        }
+    }
+
+    fn compose_from_inference(self, inf: InferenceResult,
+                               role: DiscourseRole) -> GroundedSentence {
+        let nl = inference_result_natural_language(inf)
+        let tier = _confidence_tier(inf.confidence)
+        let hedge = ""
+        if tier in _CONFIDENCE_HEDGES {
+            hedge = _CONFIDENCE_HEDGES[tier]
+        }
+
+        let text = hedge + nl + "."
+        if len(text) > 0 {
+            text = text[0].upper() + text[1:]
+        }
+
+        return GroundedSentence {
+            text: text,
+            role: role,
+            edge_ids: [],
+            confidence: inf.confidence,
+            source_type: "inference",
+            is_speculative: tier == "speculative",
+            alternatives: []
+        }
+    }
+
+    fn compose_gap(self, concept: string) -> GroundedSentence {
+        return GroundedSentence {
+            text: "The system's knowledge about '" + concept + "' is limited and further information would improve this answer.",
+            role: DiscourseRole.UNKNOWN_BOUNDARY,
+            edge_ids: [],
+            confidence: 0.0,
+            source_type: "",
+            is_speculative: false,
+            alternatives: []
+        }
+    }
+
+    fn compose_chain(self, path: List[string], edges: List[GraphEdge]) -> GroundedSentence {
+        if len(path) < 2 {
+            return GroundedSentence { text: "", role: DiscourseRole.EVIDENCE, edge_ids: [], confidence: 0.0, source_type: "", is_speculative: false, alternatives: [] }
+        }
+
+        let parts: List[string] = []
+        for i in range(len(path) - 1) {
+            let src = path[i]
+            let tgt = path[i + 1]
+            let found = false
+            for e in edges {
+                if e.source == src and e.target == tgt {
+                    parts.append(_edge_to_sentence(e, i))
+                    found = true
+                    break
+                }
+            }
+            if not found {
+                parts.append(src + " connects to " + tgt)
+            }
+        }
+
+        let text = ", which ".join(parts) + "."
+        text = text[0].upper() + text[1:]
+
+        let avg_conf = 0.0
+        if len(edges) > 0 {
+            let total = 0.0
+            for e in edges {
+                total += e.confidence
+            }
+            avg_conf = total / len(edges)
+        }
+
+        let eids: List[string] = []
+        for e in edges {
+            eids.append(e.edge_id)
+        }
+
+        return GroundedSentence {
+            text: text,
+            role: DiscourseRole.EVIDENCE,
+            edge_ids: eids,
+            confidence: avg_conf,
+            source_type: "chain",
+            is_speculative: false,
+            alternatives: []
+        }
+    }
+}
+
+/// ---------- Fluency Optimizer ----------
+
+class FluencyOptimizer {
+    fn optimize(self, sentences: List[GroundedSentence]) -> List[any] {
+        if len(sentences) == 0 {
+            return []
+        }
+        let deduped = self._remove_duplicates(sentences)
+        let ordered = self._order_by_discourse(deduped)
+        let smoothed = self._add_transitions(ordered)
+        return smoothed
+    }
+
+    fn _remove_duplicates(self, sentences: List[GroundedSentence]) -> List[any] {
+        let seen_keys: Set[string] = set()
+        let result: List[GroundedSentence] = []
+        for s in sentences {
+            let key = ""
+            if len(s.edge_ids) > 0 {
+                key = "|".join(s.edge_ids)
+            } else {
+                key = s.text[:50]
+            }
+            if key not in seen_keys {
+                seen_keys.add(key)
+                result.append(s)
+            }
+        }
+        return result
+    }
+
+    fn _order_by_discourse(self, sentences: List[GroundedSentence]) -> List[any] {
+        let order: Dict[DiscourseRole, int] = {
+            DiscourseRole.CONTEXT: 0,
+            DiscourseRole.CLAIM: 1,
+            DiscourseRole.EVIDENCE: 2,
+            DiscourseRole.QUALIFIER: 3,
+            DiscourseRole.ALTERNATIVE: 4,
+            DiscourseRole.CONCESSION: 5,
+            DiscourseRole.UNKNOWN_BOUNDARY: 6,
+            DiscourseRole.CONCLUSION: 7
+        }
+        let sorted_list: List[GroundedSentence] = []
+        let remaining = list(sentences)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            let best_order = order.get(remaining[0].role, 5)
+            let best_conf = remaining[0].confidence
+            for i in range(1, len(remaining)) {
+                let o = order.get(remaining[i].role, 5)
+                if o < best_order or (o == best_order and remaining[i].confidence > best_conf) {
+                    best_order = o
+                    best_conf = remaining[i].confidence
+                    best_idx = i
+                }
+            }
+            sorted_list.append(remaining.pop(best_idx))
+        }
+        return sorted_list
+    }
+
+    fn _add_transitions(self, sentences: List[GroundedSentence]) -> List[any] {
+        if len(sentences) <= 1 {
+            return sentences
+        }
+        let result: List[GroundedSentence] = [sentences[0]]
+        for i in range(1, len(sentences)) {
+            let prev_role = sentences[i - 1].role
+            let curr_role = sentences[i].role
+            let s = sentences[i]
+
+            if prev_role == DiscourseRole.EVIDENCE and curr_role == DiscourseRole.QUALIFIER {
+                if not s.text.startswith("However") {
+                    let new_text = "That said, " + s.text[0].lower() + s.text[1:]
+                    s = GroundedSentence {
+                        text: new_text,
+                        role: s.role, edge_ids: s.edge_ids,
+                        confidence: s.confidence, source_type: s.source_type,
+                        is_speculative: s.is_speculative, alternatives: s.alternatives
+                    }
+                }
+            }
+            result.append(s)
+        }
+        return result
+    }
+}
+
+/// ---------- Grounded Generator (Unified) ----------
+
+class GroundedGenerator {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._engine = InferenceEngine(graph, None, None)
+        self._collector = FactCollector(graph)
+        self._planner = DiscoursePlanner()
+        self._composer = SentenceComposer()
+        self._fluency = FluencyOptimizer()
+    }
+
+    fn generate(self, concepts: List[string],
+                inferences: Optional[List[InferenceResult]],
+                query_type: string,
+                max_sentences: int) -> GroundedResponse {
+        if max_sentences == None {
+            max_sentences = 8
+        }
+        let facts = self._collector.collect(concepts, 2, 15)
+        let infs: List[InferenceResult] = []
+        if inferences != None {
+            infs = inferences
+        }
+
+        let plan = self._planner.plan(concepts, facts, infs, query_type)
+
+        let sentences: List[GroundedSentence] = []
+        let variation_counter = 0
+
+        for item in plan {
+            let role = item[0]
+            let data = item[1]
+            if type_name(data) == "GraphEdge" {
+                let s = self._composer.compose_from_edge(data, role, variation_counter)
+                sentences.append(s)
+                variation_counter += 1
+            } else if type_name(data) == "InferenceResult" {
+                let s = self._composer.compose_from_inference(data, role)
+                sentences.append(s)
+            }
+        }
+
+        let uncovered: Set[string] = set()
+        for c in concepts {
+            let covered = false
+            for s in sentences {
+                if c in s.text.lower() {
+                    covered = true
+                    break
+                }
+            }
+            if not covered and not self._graph.has_node(c) {
+                uncovered.add(c)
+            }
+        }
+
+        for gap_concept in uncovered {
+            sentences.append(self._composer.compose_gap(gap_concept))
+        }
+
+        sentences = self._fluency.optimize(sentences)
+        let limited: List[GroundedSentence] = []
+        for i in range(min(max_sentences, len(sentences))) {
+            limited.append(sentences[i])
+        }
+
+        let overall_conf = 0.0
+        if len(limited) > 0 {
+            let conf_list: List[float] = []
+            for s in limited {
+                if s.confidence > 0.0 {
+                    conf_list.append(s.confidence)
+                }
+            }
+            if len(conf_list) > 0 {
+                let total = 0.0
+                for c in conf_list {
+                    total += c
+                }
+                overall_conf = total / len(conf_list)
+            }
+        }
+
+        let gap_list: List[string] = []
+        for g in uncovered {
+            gap_list.append(g)
+        }
+
+        return GroundedResponse {
+            sentences: limited,
+            overall_confidence: overall_conf,
+            knowledge_gaps: gap_list,
+            reasoning_mode: query_type,
+            concepts_used: concepts
+        }
+    }
+}
+
+/// ---------- Gate ----------
+
+gate language_gate(data: raw[GroundedResponse]) -> validated[GroundedResponse] {
+    require confidence >= 0.4
+    validate grounding_check
+    validate provenance_check
+}
+
+/// ---------- Exports ----------
+
+export DiscourseRole, GroundedSentence, GroundedResponse
+export response_text, response_claim_count, response_grounded_ratio
+export DiscoursePlanner, FactCollector, SentenceComposer
+export FluencyOptimizer, GroundedGenerator
+export language_gate

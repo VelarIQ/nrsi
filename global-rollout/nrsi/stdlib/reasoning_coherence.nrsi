@@ -1,0 +1,419 @@
+/// NRSI — Cognitive Coherence Controller.
+///
+/// Ensures the system never contradicts itself: belief propagation,
+/// contradiction prevention, temporal consistency, response history
+/// tracking, and worldview maintenance.
+/// All transformer-free.
+
+module reasoning_coherence
+
+
+import time from "std/time"
+from "reasoning_graph" import CausalGraph, GraphEdge, RelationType
+
+/// ---------- Types ----------
+
+type Commitment {
+    claim_id: string,
+    subject: string,
+    relation: string,
+    obj: string,
+    confidence: float,
+    session_id: string,
+    timestamp: float,
+    edge_id: string,
+    retracted: bool
+}
+
+type CoherenceViolation {
+    violation_type: string,
+    description: string,
+    severity: float,
+    claim_a: Optional[Commitment],
+    claim_b: Optional[Commitment],
+    resolution: string
+}
+
+/// ---------- Contradicting relations ----------
+
+let _CONTRADICTING_RELATIONS: List[Tuple[RelationType, RelationType]] = [
+    (RelationType.CAUSES, RelationType.PREVENTS),
+    (RelationType.PREVENTS, RelationType.CAUSES),
+    (RelationType.ENABLES, RelationType.PREVENTS),
+    (RelationType.PREVENTS, RelationType.ENABLES),
+    (RelationType.ENABLES, RelationType.INHIBITS),
+    (RelationType.INHIBITS, RelationType.ENABLES)
+]
+
+fn _is_contradicting_pair(a: RelationType, b: RelationType) -> bool {
+    for pair in _CONTRADICTING_RELATIONS {
+        if pair[0] == a and pair[1] == b {
+            return true
+        }
+    }
+    return false
+}
+
+/// ---------- Belief Propagator ----------
+
+class BeliefPropagator {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn propagate_update(self, source: string, target: string,
+                         relation: RelationType,
+                         new_confidence: float) -> Dict[string, Any] {
+        let source_norm = source.lower().strip()
+        let target_norm = target.lower().strip()
+
+        let edge = self._graph.get_edge(source_norm, relation, target_norm)
+        if edge == None {
+            return {"updated": 0, "affected": []}
+        }
+
+        let old_confidence = edge.confidence
+        edge.confidence = new_confidence
+
+        let affected: List[Dict[string, Any]] = []
+        let ratio = new_confidence / max(old_confidence, 0.01)
+
+        let visited: Set[string] = set()
+        visited.add(target_norm)
+        let frontier: List[string] = [target_norm]
+
+        while len(frontier) > 0 {
+            let current = frontier.pop(0)
+            for downstream in self._graph.outgoing(current) {
+                if downstream.derived or downstream.evidence == "" {
+                    let old_ds = downstream.confidence
+                    downstream.confidence = downstream.confidence * ratio
+                    if downstream.confidence > 1.0 {
+                        downstream.confidence = 1.0
+                    }
+                    if downstream.confidence < 0.0 {
+                        downstream.confidence = 0.0
+                    }
+                    affected.append({
+                        "edge": downstream.edge_id,
+                        "old_confidence": old_ds,
+                        "new_confidence": downstream.confidence,
+                        "reason": "Cascaded from " + source_norm + "→" + target_norm + " update"
+                    })
+                    if downstream.target not in visited {
+                        visited.add(downstream.target)
+                        frontier.append(downstream.target)
+                    }
+                }
+            }
+        }
+
+        return {
+            "updated": len(affected) + 1,
+            "root_change": {
+                "edge": source_norm + "|" + relation.value + "|" + target_norm,
+                "old": old_confidence,
+                "new": new_confidence
+            },
+            "affected": affected
+        }
+    }
+
+    fn propagate_retraction(self, source: string, target: string,
+                             relation: RelationType) -> Dict[string, Any] {
+        return self.propagate_update(source, target, relation, 0.0)
+    }
+}
+
+/// ---------- Response Coherence Checker ----------
+
+class ResponseCoherenceChecker {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._commitments: Dict[string, Commitment] = {}
+        self._session_commitments: Dict[string, List[string]] = {}
+    }
+
+    fn commit(self, subject: string, relation: string, obj: string,
+              confidence: float, session_id: string,
+              edge_id: string) -> Commitment {
+        let claim_id = subject + "|" + relation + "|" + obj
+        let c = Commitment {
+            claim_id: claim_id, subject: subject, relation: relation,
+            obj: obj, confidence: confidence, session_id: session_id,
+            timestamp: time.time(), edge_id: edge_id, retracted: false
+        }
+        self._commitments[claim_id] = c
+        if session_id not in self._session_commitments {
+            self._session_commitments[session_id] = []
+        }
+        self._session_commitments[session_id].append(claim_id)
+        return c
+    }
+
+    fn check_consistency(self, subject: string, relation: string,
+                          obj: string) -> List[any] {
+        let violations: List[CoherenceViolation] = []
+
+        for cid in self._commitments {
+            let existing = self._commitments[cid]
+            if existing.retracted {
+                continue
+            }
+
+            if existing.subject == subject and existing.obj == obj {
+                if existing.relation != relation {
+                    try {
+                        let existing_rel = RelationType(existing.relation)
+                        let new_rel = RelationType(relation)
+                        if _is_contradicting_pair(existing_rel, new_rel) {
+                            violations.append(CoherenceViolation {
+                                violation_type: "direct_contradiction",
+                                description: "Previously stated '" + subject + " " + existing.relation + " " + obj + "' but now claiming '" + subject + " " + relation + " " + obj + "'",
+                                severity: 0.9,
+                                claim_a: existing,
+                                claim_b: None,
+                                resolution: "Retract earlier claim or clarify the distinction"
+                            })
+                        }
+                    } catch e {
+                        pass
+                    }
+                }
+            }
+
+            if existing.subject == obj and existing.obj == subject and existing.relation == relation {
+                violations.append(CoherenceViolation {
+                    violation_type: "reversal",
+                    description: "Previously stated '" + existing.subject + " " + relation + " " + existing.obj + "' but now claiming the reverse",
+                    severity: 0.8,
+                    claim_a: existing,
+                    claim_b: None,
+                    resolution: "Clarify directionality or context"
+                })
+            }
+        }
+
+        return violations
+    }
+
+    fn retract(self, subject: string, relation: string, obj: string,
+               reason: string) -> bool {
+        let claim_id = subject + "|" + relation + "|" + obj
+        if claim_id in self._commitments {
+            self._commitments[claim_id].retracted = true
+            return true
+        }
+        return false
+    }
+
+    fn session_commitments(self, session_id: string) -> List[any] {
+        let cids: List[string] = []
+        if session_id in self._session_commitments {
+            cids = self._session_commitments[session_id]
+        }
+        let result: List[Commitment] = []
+        for cid in cids {
+            if cid in self._commitments and not self._commitments[cid].retracted {
+                result.append(self._commitments[cid])
+            }
+        }
+        return result
+    }
+
+    fn all_active_commitments(self) -> List[any] {
+        let result: List[Commitment] = []
+        for cid in self._commitments {
+            if not self._commitments[cid].retracted {
+                result.append(self._commitments[cid])
+            }
+        }
+        return result
+    }
+}
+
+/// ---------- Temporal Consistency Checker ----------
+
+class TemporalConsistencyChecker {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn check_temporal_order(self, claim_a: string, relation_ab: string,
+                             claim_b: string) -> Optional[CoherenceViolation] {
+        let a_props = self._graph.get_node(claim_a)
+        let b_props = self._graph.get_node(claim_b)
+
+        if a_props == None or b_props == None {
+            return None
+        }
+
+        let a_time = a_props.properties.get("year_start")
+        let b_time = b_props.properties.get("year_start")
+
+        if a_time != None and b_time != None {
+            if relation_ab == "causes" and a_time > b_time {
+                return CoherenceViolation {
+                    violation_type: "temporal_violation",
+                    description: "'" + claim_a + "' (year " + str(a_time) + ") cannot cause '" + claim_b + "' (year " + str(b_time) + ") — the cause occurs after the effect",
+                    severity: 0.95,
+                    claim_a: None,
+                    claim_b: None,
+                    resolution: "Check temporal facts or restate causality"
+                }
+            }
+        }
+
+        return None
+    }
+}
+
+/// ---------- Worldview Maintainer ----------
+
+class WorldviewMaintainer {
+    fn __init__(self) {
+        self._stances: Dict[string, Dict[string, Any]] = {}
+    }
+
+    fn set_stance(self, topic: string, position: string,
+                  confidence: float, evidence: string) {
+        self._stances[topic.lower()] = {
+            "position": position,
+            "confidence": confidence,
+            "evidence": evidence,
+            "set_at": time.time()
+        }
+    }
+
+    fn get_stance(self, topic: string) -> Optional[Dict[string, Any]] {
+        if topic.lower() in self._stances {
+            return self._stances[topic.lower()]
+        }
+        return None
+    }
+
+    fn check_alignment(self, topic: string, proposed_position: string) -> Optional[CoherenceViolation] {
+        let existing = self.get_stance(topic)
+        if existing == None {
+            return None
+        }
+
+        if existing["position"].lower() != proposed_position.lower() {
+            return CoherenceViolation {
+                violation_type: "worldview_inconsistency",
+                description: "On '" + topic + "': established stance is '" + existing["position"] + "' (conf " + str(round(existing["confidence"], 2)) + ") but proposed '" + proposed_position + "'",
+                severity: 0.7,
+                claim_a: None,
+                claim_b: None,
+                resolution: "Update stance explicitly with evidence, or explain why position has changed"
+            }
+        }
+        return None
+    }
+
+    fn all_stances(self) -> Dict[string, Dict[string, Any]] {
+        return self._stances
+    }
+}
+
+/// ---------- Coherence Controller (Unified) ----------
+
+class CoherenceController {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+        self._propagator = BeliefPropagator(graph)
+        self._checker = ResponseCoherenceChecker(graph)
+        self._temporal = TemporalConsistencyChecker(graph)
+        self._worldview = WorldviewMaintainer()
+    }
+
+    fn propagator(self) -> BeliefPropagator {
+        return self._propagator
+    }
+
+    fn commitments(self) -> ResponseCoherenceChecker {
+        return self._checker
+    }
+
+    fn worldview(self) -> WorldviewMaintainer {
+        return self._worldview
+    }
+
+    fn validate_response(self, claims: List[Tuple[string, string, string]],
+                          session_id: string) -> Dict[string, Any] {
+        let all_violations: List[CoherenceViolation] = []
+
+        for claim in claims {
+            let violations = self._checker.check_consistency(claim[0], claim[1], claim[2])
+            for v in violations {
+                all_violations.append(v)
+            }
+            let tv = self._temporal.check_temporal_order(claim[0], claim[1], claim[2])
+            if tv != None {
+                all_violations.append(tv)
+            }
+        }
+
+        let is_coherent = len(all_violations) == 0
+        let max_severity = 0.0
+        for v in all_violations {
+            if v.severity > max_severity {
+                max_severity = v.severity
+            }
+        }
+
+        let violation_dicts: List[Dict[string, Any]] = []
+        for v in all_violations {
+            violation_dicts.append({
+                "type": v.violation_type,
+                "description": v.description,
+                "severity": v.severity,
+                "resolution": v.resolution
+            })
+        }
+
+        return {
+            "coherent": is_coherent,
+            "violations": violation_dicts,
+            "max_severity": max_severity,
+            "claim_count": len(claims)
+        }
+    }
+
+    fn commit_response(self, claims: List[Tuple[string, string, string]],
+                        session_id: string,
+                        confidences: Optional[List[float]]) -> int {
+        let committed = 0
+        for i in range(len(claims)) {
+            let conf = 0.5
+            if confidences != None and i < len(confidences) {
+                conf = confidences[i]
+            }
+            self._checker.commit(claims[i][0], claims[i][1], claims[i][2], conf, session_id, "")
+            committed += 1
+        }
+        return committed
+    }
+
+    fn update_belief(self, source: string, target: string,
+                      relation: RelationType,
+                      new_confidence: float) -> Dict[string, Any] {
+        return self._propagator.propagate_update(source, target, relation, new_confidence)
+    }
+}
+
+/// ---------- Gate ----------
+
+gate coherence_gate(data: raw[Dict[string, Any]]) -> validated[Dict[string, Any]] {
+    require confidence >= 0.5
+    validate consistency_check
+    validate temporal_check
+}
+
+/// ---------- Exports ----------
+
+export Commitment, CoherenceViolation
+export BeliefPropagator, ResponseCoherenceChecker
+export TemporalConsistencyChecker, WorldviewMaintainer
+export CoherenceController
+export coherence_gate

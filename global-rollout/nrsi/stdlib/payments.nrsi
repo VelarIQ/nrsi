@@ -1,0 +1,262 @@
+/// NRSIP Payment Channels & AI Service Marketplace.
+///
+/// Full implementation of `nrsip/payments.py`.
+/// Patent-covered: Payment channels, micropayments, PoVI settlement, marketplace.
+
+module payments
+
+
+import time from "std/time"
+/// ---------- Enumerations ----------
+
+enum ChannelState {
+    OPEN,
+    ACTIVE,
+    SETTLING,
+    CLOSED,
+    DISPUTED
+}
+
+enum PaymentCurrency {
+    USD,
+    EUR,
+    AED,
+    CRYPTO
+}
+
+/// ---------- Data types ----------
+
+type PaymentRecord {
+    payment_id: string,
+    amount: float,
+    currency: PaymentCurrency,
+    query_hash: string,
+    povi_proof_hash: string,
+    timestamp_ms: int,
+    validated: bool
+}
+
+type PaymentChannel {
+    channel_id: string,
+    payer: string,
+    payee: string,
+    prefunded_amount: float,
+    currency: PaymentCurrency,
+    state: ChannelState,
+    balance: float,
+    total_paid: float,
+    total_queries: int,
+    payments: List[PaymentRecord],
+    opened_at_ms: int,
+    closed_at_ms: Optional[int]
+}
+
+fn new_payment_channel(channel_id: string, payer: string, payee: string,
+                       prefunded_amount: float, currency: PaymentCurrency) -> PaymentChannel {
+    let ch = PaymentChannel {
+        channel_id: channel_id,
+        payer: payer,
+        payee: payee,
+        prefunded_amount: prefunded_amount,
+        currency: currency,
+        state: ChannelState.ACTIVE,
+        balance: prefunded_amount,
+        total_paid: 0.0,
+        total_queries: 0,
+        payments: [],
+        opened_at_ms: int(time.time() * 1000),
+        closed_at_ms: None
+    }
+    return ch
+}
+
+fn channel_pay_per_query(ch: PaymentChannel, amount: float, query_hash: string,
+                         povi_proof_hash: string) -> PaymentRecord {
+    if ch.state != ChannelState.ACTIVE {
+        raise ValueError("Channel " + ch.channel_id + " not active (state=" + str(ch.state) + ")")
+    }
+    if ch.balance < amount {
+        raise ValueError("Insufficient balance: " + str(ch.balance) + " < " + str(amount))
+    }
+
+    let payment_id = slice_string(
+        sha256_hex(ch.channel_id + ":" + query_hash + ":" + str(ch.total_queries)),
+        0, 16
+    )
+
+    let validated = false
+    if povi_proof_hash != "" {
+        validated = true
+    }
+
+    let record = PaymentRecord {
+        payment_id: payment_id,
+        amount: amount,
+        currency: ch.currency,
+        query_hash: query_hash,
+        povi_proof_hash: povi_proof_hash,
+        timestamp_ms: int(time.time() * 1000),
+        validated: validated
+    }
+
+    ch.balance -= amount
+    ch.total_paid += amount
+    ch.total_queries += 1
+    append(ch.payments, record)
+
+    if ch.balance <= 0 {
+        ch.state = ChannelState.SETTLING
+    }
+
+    return record
+}
+
+fn channel_top_up(ch: PaymentChannel, amount: float) {
+    ch.prefunded_amount += amount
+    ch.balance += amount
+    if ch.state == ChannelState.SETTLING {
+        ch.state = ChannelState.ACTIVE
+    }
+}
+
+fn channel_close(ch: PaymentChannel) -> Dict[string, Any] {
+    ch.state = ChannelState.CLOSED
+    ch.closed_at_ms = int(time.time() * 1000)
+    return {
+        "channel_id": ch.channel_id,
+        "total_paid": ch.total_paid,
+        "total_queries": ch.total_queries,
+        "remaining_balance": ch.balance,
+        "refund_to_payer": ch.balance
+    }
+}
+
+/// ---------- Service Listing ----------
+
+type ServiceListing {
+    listing_id: string,
+    provider: string,
+    provider_nrsip_address: string,
+    capability: string,
+    description: string,
+    price_per_query: float,
+    currency: PaymentCurrency,
+    trust_score: float,
+    domains: List[string],
+    min_tier: string,
+    processing_modes: List[string],
+    active: bool,
+    queries_served: int,
+    avg_h_score: float,
+    registered_at_ms: int
+}
+
+/// ---------- AI Service Marketplace ----------
+
+class ServiceMarketplace {
+    fn new(self) {
+        self._listings = {}
+    }
+
+    fn register_service(self, provider: string, capability: string,
+                        price_per_query: float, trust_score: float,
+                        nrsip_address: string, description: string,
+                        domains: Optional[List[string]]) -> ServiceListing {
+        let listing_id = slice_string(
+            sha256_hex(provider + ":" + capability + ":" + str(time.time())),
+            0, 12
+        )
+
+        let desc = description
+        if desc == "" {
+            desc = capability + " by " + provider
+        }
+        let dom = domains
+        if dom == None {
+            dom = []
+        }
+
+        let listing = ServiceListing {
+            listing_id: listing_id,
+            provider: provider,
+            provider_nrsip_address: nrsip_address,
+            capability: capability,
+            description: desc,
+            price_per_query: price_per_query,
+            currency: PaymentCurrency.USD,
+            trust_score: trust_score,
+            domains: dom,
+            min_tier: "T1",
+            processing_modes: ["DETERMINISTIC", "PROBABILISTIC", "HYBRID"],
+            active: true,
+            queries_served: 0,
+            avg_h_score: 0.0,
+            registered_at_ms: int(time.time() * 1000)
+        }
+        self._listings[listing_id] = listing
+        return listing
+    }
+
+    fn discover(self, capability: Optional[string], domain: Optional[string],
+                min_trust_score: float, max_price: float,
+                active_only: bool) -> List[any] {
+        let results = []
+        for listing_id in keys(self._listings) {
+            let listing = self._listings[listing_id]
+            if active_only and !listing.active {
+                continue
+            }
+            if capability != None and listing.capability != capability {
+                continue
+            }
+            if domain != None and domain not in listing.domains {
+                continue
+            }
+            if listing.trust_score < min_trust_score {
+                continue
+            }
+            if listing.price_per_query > max_price {
+                continue
+            }
+            append(results, listing)
+        }
+        sort_by(results, fn(l: ServiceListing) -> Tuple[float, float] {
+            return (-l.trust_score, l.price_per_query)
+        })
+        return results
+    }
+
+    fn record_query(self, listing_id: string, h_score: float) {
+        let listing = get_or_default(self._listings, listing_id, None)
+        if listing != None {
+            let total = listing.avg_h_score * listing.queries_served + h_score
+            listing.queries_served += 1
+            listing.avg_h_score = total / listing.queries_served
+        }
+    }
+
+    fn deactivate(self, listing_id: string) {
+        let listing = get_or_default(self._listings, listing_id, None)
+        if listing != None {
+            listing.active = false
+        }
+    }
+
+    fn count(self, active_only: bool) -> int {
+        if active_only {
+            let c = 0
+            for lid in keys(self._listings) {
+                if self._listings[lid].active {
+                    c += 1
+                }
+            }
+            return c
+        }
+        return len(self._listings)
+    }
+}
+
+export ChannelState, PaymentCurrency
+export PaymentRecord, PaymentChannel
+export new_payment_channel, channel_pay_per_query, channel_top_up, channel_close
+export ServiceListing, ServiceMarketplace

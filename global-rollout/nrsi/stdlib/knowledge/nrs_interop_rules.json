@@ -1,0 +1,50 @@
+{
+  "domain": "nrs_interop",
+  "version": "2026.1",
+  "source": "development_session",
+  "source_tier": "t2_verified",
+  "facts": [
+    {
+      "id": "interop-nrsi-imports-python",
+      "text": "NRSI files import Python standard library modules using the syntax: import time from \"std/time\". The transpiler strips the std/ prefix, remaps known aliases (hash->hashlib, regex->re), and emits a standard Python import statement. The imported module must exist in the Python environment.",
+      "confidence": 0.95,
+      "tags": ["nrsi", "python", "imports", "std"]
+    },
+    {
+      "id": "interop-optional-deps",
+      "text": "NRSI files use __import__(\"package_name\") inside try/catch blocks for optional Python dependencies. This is the standard pattern for libraries that may not be installed in all deployment environments (e.g., pandas, scapy, paramiko).",
+      "confidence": 0.93,
+      "tags": ["nrsi", "python", "optional-deps", "__import__"]
+    },
+    {
+      "id": "interop-python-imports-nrsi",
+      "text": "Python code can import NRSI modules after two steps: (1) add the nrsi/stdlib directory to sys.path, and (2) install the NRSI import hook via nrsi.lang.runtime.install(). Without the import hook, bare imports like 'from nrs_file_engine import get_engine' will fail even though the .nrsi file exists on sys.path.",
+      "confidence": 0.95,
+      "tags": ["python", "nrsi", "import-hook", "runtime"]
+    },
+    {
+      "id": "interop-transpilation-chain",
+      "text": "NRSI compilation: Lexer (source -> tokens) -> Parser (tokens -> AST) -> TypeChecker (optional, can abort) -> Transpiler (AST -> Python source string). The Python string is compiled and exec'd into a types.ModuleType registered in sys.modules. No .py files are written to disk in normal operation.",
+      "confidence": 0.95,
+      "tags": ["transpilation", "compilation", "runtime"]
+    },
+    {
+      "id": "interop-runtime-types",
+      "text": "NRSI transpiled code imports runtime types from nrsi.core.types (NRSIData, TrustLevel, Confidence, raw, validated, trusted, certified), nrsi.core.validation (ValidationGate, ValidationResult), and nrsi.core.normative (Norm, NormSet, DeonticType, NormScope). These are injected by the transpiler preamble.",
+      "confidence": 0.95,
+      "tags": ["runtime-types", "transpiler", "preamble"]
+    },
+    {
+      "id": "interop-service-pattern",
+      "text": "FastAPI services that use NRSI modules must call _activate_nrsi_runtime() at module load time. This function adds nrsi/stdlib, nrsi/, and nrsip/ to sys.path, then calls nrsi.lang.runtime.install() to register the NRSI import hook on sys.meta_path. Without this, .nrsi file imports silently fail.",
+      "confidence": 0.95,
+      "tags": ["fastapi", "services", "runtime-activation", "edge-gateway"]
+    },
+    {
+      "id": "interop-both-directions",
+      "text": "NRSI and Python are fully bidirectional: NRSI modules can import and call Python modules (via std/ imports and __import__), and Python code can import and call NRSI module exports (via the import hook). The transpiled NRSI code is standard Python at runtime, so there is no performance penalty for cross-language calls.",
+      "confidence": 0.93,
+      "tags": ["bidirectional", "interop", "performance"]
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+/// NRSI Multimodal — Binding Types and Fusion Contracts
+///
+/// Declares modality types, binding IDs, and norms for
+/// cross-modal integration.
+
+module multimodal
+
+import NRSIData from "types"
+
+/// ---------- Modality Types ----------
+
+enum Modality {
+    TEXT,
+    IMAGE,
+    AUDIO,
+    VIDEO,
+    DOCUMENT,
+    SENSOR,
+    THREE_D
+}
+
+enum FusionStrategy {
+    EARLY,
+    LATE,
+    HYBRID,
+    ATTENTION_WEIGHTED
+}
+
+type ModalityBinding {
+    modality: Modality,
+    content_ref: String,
+    confidence: Float,
+    fusion: FusionStrategy
+}
+
+/// ---------- Multimodal Norms ----------
+
+norm text_always_primary {
+    type: obligation,
+    scope: global,
+    action: "text_as_primary_modality",
+    priority: 70,
+    condition: true
+}
+
+norm media_requires_digest {
+    type: obligation,
+    scope: global,
+    action: "produce_media_digest",
+    priority: 85,
+    condition: modality != Modality.TEXT
+}
+
+norm no_unvalidated_media_output {
+    type: prohibition,
+    scope: global,
+    action: "output_unvalidated_media",
+    priority: 90,
+    condition: confidence < 0.60
+}
+
+/// ---------- Multimodal Gate ----------
+
+gate media_validation(data: raw[NRSIData]) -> validated[NRSIData] {
+    require confidence >= 0.60
+    validate digest_produced
+    validate content_safe
+}

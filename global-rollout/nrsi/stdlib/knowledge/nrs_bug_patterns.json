@@ -1,0 +1,678 @@
+{
+  "domain": "nrs_bugs",
+  "version": "2026.1",
+  "source": "development_session",
+  "source_tier": "t2_verified",
+  "facts": [
+    {
+      "id": "bug-transpiler-norm-conditions",
+      "text": "The NRSI transpiler was silently dropping norm condition expressions and emitting lambda ctx: True for all norms. Root cause: _transpile_norm_decl only checked for decl.domain and ignored decl.condition (the parsed AST expression). Fix: check for decl.condition first, transpile it via _transpile_expr, and emit it as the lambda body. This was disabling dozens of safety norms across the entire stdlib.",
+      "confidence": 0.95,
+      "tags": [
+        "transpiler",
+        "norms",
+        "bug",
+        "critical",
+        "safety"
+      ]
+    },
+    {
+      "id": "bug-gate-require-dropped",
+      "text": "Gate require clauses beyond 'require confidence >= X' were silently dropped by the transpiler. For example, 'require data.domain == medical' was never emitted as a runtime check. Fix: collect non-confidence require expressions and emit them as if-not-raise assertions inside the gate function body.",
+      "confidence": 0.95,
+      "tags": [
+        "transpiler",
+        "gates",
+        "require",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-validator-pass-through",
+      "text": "Unknown validator names in _resolve_named_validator returned (True, 0.7) as a pass-through, meaning misspelled or unimplemented validators appeared to successfully validate data. Fix: changed to fail-closed behavior returning (False, 0.3) with a warning log.",
+      "confidence": 0.95,
+      "tags": [
+        "validation",
+        "fail-closed",
+        "bug",
+        "security"
+      ]
+    },
+    {
+      "id": "bug-epistemic-stubs",
+      "text": "epistemic.nrsi had stub implementations: classify_evidence always returned OBSERVATIONAL/UNKNOWN/UNCERTAIN regardless of source, and calibrated_confidence returned raw_confidence unchanged. Fix: implemented real classification based on source type (axiomatic, empirical, testimonial, speculative) and real calibration with evidence-strength ceilings and source-count bonuses.",
+      "confidence": 0.95,
+      "tags": [
+        "epistemic",
+        "stubs",
+        "calibration",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-no-hallucination-heuristic",
+      "text": "The no_hallucination validator was a hedge-word heuristic: it checked for words like 'reportedly' and 'allegedly' in strings, and only checked for key presence (not content) in dicts. Fix: now requires actual evidence chains, rejects generated/llm_output knowledge levels, detects unsupported quantitative claims, and fails closed on missing evidence.",
+      "confidence": 0.93,
+      "tags": [
+        "validation",
+        "hallucination",
+        "heuristic",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-creases-search-stub",
+      "text": "creases.nrsi search_crease() was a complete stub returning empty list regardless of input. Domain knowledge stored in creases was unretrievable. Fix: implemented keyword-overlap relevance scoring across all crease layers with layer-specific boost factors and combined key+content scoring.",
+      "confidence": 0.95,
+      "tags": [
+        "creases",
+        "search",
+        "stub",
+        "knowledge-retrieval",
+        "critical"
+      ]
+    },
+    {
+      "id": "bug-reasoning-conflict-stub",
+      "text": "reasoning.nrsi resolve_conflict() always returned step_a, accumulate_evidence() returned existing list unchanged, aggregate_confidence() returned hardcoded 0.5. Fix: resolve_conflict now uses strategy priority ordering (deductive>causal>inductive>abductive>analogical) with confidence tiebreak. accumulate_evidence deduplicates by source+strategy. aggregate_confidence uses weighted mean.",
+      "confidence": 0.95,
+      "tags": [
+        "reasoning",
+        "conflict-resolution",
+        "evidence",
+        "stub"
+      ]
+    },
+    {
+      "id": "bug-bayesian-bare-exp",
+      "text": "reasoning_bayesian.nrsi _from_log_odds used bare exp() instead of math.exp(). Module imports math but exp is not a global in NRSI runtime. Fix: changed to math.exp(-lo).",
+      "confidence": 0.95,
+      "tags": [
+        "bayesian",
+        "math",
+        "import",
+        "runtime-error"
+      ]
+    },
+    {
+      "id": "bug-learning-hashlib-undefined",
+      "text": "reasoning_learning.nrsi called hashlib_md5(text) which is not defined or imported anywhere. Fix: added import hashlib from std/hashlib and changed to hashlib.md5(text.encode('utf-8')).hexdigest()[:8].",
+      "confidence": 0.95,
+      "tags": [
+        "learning",
+        "hashlib",
+        "import",
+        "runtime-error"
+      ]
+    },
+    {
+      "id": "bug-silent-exception-swallowing",
+      "text": "agi_integration.py post_process, post_process_full, get_context_for_response, and apply_mode_tuning all had except Exception: pass blocks. mode_control.py _verify_claim returned (True, 0.5, '') on exception (fail-open). reasoning_bridge.py think_stream swallowed all phase errors. Fix: all converted to logger.warning with exception details. _verify_claim changed to fail-closed returning (False, 0.3, 'vlt_search_error').",
+      "confidence": 0.95,
+      "tags": [
+        "exception-handling",
+        "auditability",
+        "fail-open",
+        "critical"
+      ]
+    },
+    {
+      "id": "bug-edge-v1-routing-gap",
+      "text": "The production ingress sent all /v1 traffic to edge-gateway, but edge-gateway did not proxy the OpenAI-shaped public platform routes such as /v1/chat/completions, /v1/models, /v1/embeddings, or multimodal endpoints. Root cause: ingress and platform-api surface evolved independently. Fix: add explicit edge-gateway pass-through routes for the public /v1 platform-api endpoints so the production host and the service implementation stay aligned.",
+      "confidence": 0.93,
+      "tags": [
+        "edge-gateway",
+        "ingress",
+        "routing",
+        "api-contract",
+        "production"
+      ]
+    },
+    {
+      "id": "bug-public-route-trailing-slash-auth",
+      "text": "Next.js middleware used exact PUBLIC_PATHS matches without normalizing trailing slashes and omitted /auth/callback from the allowlist. With trailingSlash enabled, public pages like /docs/ and OAuth callback routes could be treated as protected, causing auth redirects or a broken callback flow. Fix: normalize trailing slashes before matching and explicitly include /auth/callback in the public route set.",
+      "confidence": 0.92,
+      "tags": [
+        "nextjs",
+        "middleware",
+        "oauth",
+        "routing",
+        "frontend"
+      ]
+    },
+    {
+      "id": "bug-local-secure-cookie-and-host-drift",
+      "text": "The web auth client always wrote the session cookie with the Secure flag and several frontend/native clients each hardcoded their own production gateway URL fallback. On non-HTTPS local environments, the Secure cookie could be dropped, breaking middleware-backed auth transitions such as OAuth callback routing. Independent host fallbacks also caused staging and native release drift. Fix: only append Secure when the browser is on HTTPS, centralize web API base resolution in a shared runtime-config helper, and expose Android/iOS build-time gateway overrides so all clients can be pointed at the intended edge host without code edits.",
+      "confidence": 0.93,
+      "tags": [
+        "auth",
+        "cookie",
+        "oauth",
+        "runtime-config",
+        "mobile",
+        "frontend",
+        "deployment"
+      ]
+    },
+    {
+      "id": "bug-observability-metric-drift",
+      "text": "The rollout observability manifest referenced Prometheus metrics that the services did not actually emit, including stale names for code-agent, audio generation, node registry, key rotation, learning-engine, and cache panels. The generic monitors also missed non-http metrics endpoints such as redis-exporter and otel-collector. Root cause: dashboards, alerts, and scrape config drifted from the Python services' actual prometheus_client counters/histograms. Fix: align Grafana/Prometheus queries to live metric names and add dedicated ServiceMonitors for exporter/prometheus ports that are not exposed as the default http port.",
+      "confidence": 0.94,
+      "tags": [
+        "observability",
+        "prometheus",
+        "grafana",
+        "metrics",
+        "deployment",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-platform-api-router-mount-drift",
+      "text": "platform-api route modules existed but services/platform-api/main.py mounted only a subset of non-/v1 routers, creating surface drift between ingress or frontend expectations and actual FastAPI handlers. Fix: mount auth, brain, devices, tools, and usage routers in main.py; keep keys under /keys; extend services/platform-api/routes/api.py with /models, /models/{model_id}, and /embeddings so the public /v1 compatibility surface is present.",
+      "confidence": 0.94,
+      "tags": [
+        "platform-api",
+        "fastapi",
+        "routing",
+        "api-contract",
+        "mount",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-edge-gateway-worker-route-auth-gap",
+      "text": "edge-gateway enforced identity and entitlements for /v1/process-sse and code streaming paths but not consistently for other worker-facing routes. Fix: add shared _enforce_capability_auth() and call it from /v1/process, /v1/process-stream, /v1/media, /v1/process-sse, and /v1/code/generate-stream.",
+      "confidence": 0.94,
+      "tags": [
+        "edge-gateway",
+        "auth",
+        "entitlements",
+        "capability",
+        "security",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-empty-committed-python-modules-git-restore",
+      "text": "Multiple runtime-critical Python packages and service entrypoints were committed as empty files, breaking imports and container starts. Recovery: restore contents from a known-good git revision (or another trusted baseline) rather than hand-rebuilding large modules from memory.",
+      "confidence": 0.94,
+      "tags": [
+        "git",
+        "empty-file",
+        "python",
+        "services",
+        "recovery",
+        "deployment"
+      ]
+    },
+    {
+      "id": "bug-postgres-role-password-drift-persisted-volume",
+      "text": "platform-api durable-store failures against Postgres can occur when the database role password stored on a persisted Docker volume no longer matches the password supplied via compose secrets or env. Symptom: auth failures despite compose looking correct. Fix: reset the DB role password to match the compose-defined secret (or rotate secrets and align the role), then restart dependents.",
+      "confidence": 0.93,
+      "tags": [
+        "postgres",
+        "docker",
+        "secrets",
+        "platform-api",
+        "durable-store",
+        "compose"
+      ]
+    },
+    {
+      "id": "bug-oauth-surface-split-between-platform-and-edge",
+      "text": "The web auth client resolved its API base to platform-api on localhost:8000, but OAuth start/callback routes only existed on edge-gateway under /v1/auth/oauth/*. Result: signup and login worked while Google/Apple SSO reliably failed with 404. Fix: align the frontend to the versioned /v1 OAuth path and expose thin platform-api proxy routes for OAuth start/callback that forward to edge-gateway, preserving one browser-facing auth origin.",
+      "confidence": 0.95,
+      "tags": [
+        "oauth",
+        "platform-api",
+        "edge-gateway",
+        "routing",
+        "frontend",
+        "auth",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-platform-api-token-contract-mismatch",
+      "text": "Authenticated authed frontend pages called platform APIs with platform-issued JWTs, but platform-api chat/keys usage dependencies validated tokens only through identity /v1/auth/validate, causing 401 Invalid or expired token for otherwise valid sessions. Fix: resolve local JWT session first in chat.py get_user_id path using settings.jwt_secret/algorithm, then fallback to identity validation only when needed.",
+      "confidence": 0.93,
+      "tags": [
+        "platform-api",
+        "auth",
+        "jwt",
+        "identity",
+        "compatibility",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-chat-undefined-sticky-stream",
+      "text": "The chat web UI could persist a malformed conversation titled 'undefined' and leave the composer stuck in Stop mode after an abort or automation race. Root cause: conversation/message state trusted localStorage and submit payloads without runtime sanitization, while Stop only aborted the fetch controller and waited for the stream promise to unwind. Fix: sanitize conversations/messages on load/save, make titleFromFirstMessage robust to non-string/empty values, coerce submit inputs before creating messages, and have Stop immediately finalize/remove the active streaming placeholder while clearing streaming refs.",
+      "confidence": 0.92,
+      "tags": [
+        "chat-web",
+        "localStorage",
+        "streaming",
+        "abort",
+        "frontend",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-chat-history-localstorage-only",
+      "text": "The chat web sidebar could show different history in Cursor Browser versus Safari for the same account, and stale conversations could appear for a different authenticated user on the same browser, because /chat hydrated from a shared browser localStorage key. The platform-api already persisted conversations/messages from /chat/completions and exposed /chat/conversations plus /chat/conversations/{id}/messages, but chat/page.tsx never loaded them. Fix: namespace local conversation cache per authenticated user, hydrate the web chat from authenticated server history on mount, merge it with the user-scoped local cache for offline fallback, and persist the merged cache back to user-scoped localStorage so same-account browsers converge after reload without cross-user bleed.",
+      "confidence": 0.94,
+      "tags": [
+        "chat-web",
+        "history-sync",
+        "localStorage",
+        "user-isolation",
+        "platform-api",
+        "frontend",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-chat-audit-telemetry-normal-user-clutter",
+      "text": "The chat UI exposed audit/developer telemetry in normal conversations, including PoVI badges on non-value-transfer replies and reasoning panels with placeholder-looking values such as 0 nodes or fractional confidence rendered as percentages. Root cause: ChatMessage rendered poviProof and reasoning whenever fields existed, without checking whether telemetry was meaningful or contextually relevant. Fix: gate PoVI receipts to payment/transfer/ledger contexts, render reasoning telemetry only when live confidence and neuron counts are present, normalize 0..1 confidence to percent, and replace unnatural starter prompts with user-style actions.",
+      "confidence": 0.93,
+      "tags": [
+        "chat-web",
+        "ux",
+        "telemetry",
+        "povi",
+        "frontend",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-weather-location-fell-through-to-analogy",
+      "text": "Simple live weather prompts such as 'tell me about the weather in Abu Dhabi' fell through to the static knowledge and analogy pipeline because realtime_data_guard only intercepted weather when explicit time words like 'today' or 'right now' were present. Result: unrelated facts and analogies (Falcon, weather-as-mood) instead of current conditions. Fix: treat weather+location phrasing as a current-conditions request unless the prompt asks for historical/climate/general weather, geocode and fetch live current conditions from Open-Meteo, and only fall back to a short no-live-weather message if the lookup fails.",
+      "confidence": 0.94,
+      "tags": [
+        "platform-api",
+        "chat",
+        "weather",
+        "realtime-data",
+        "answer-quality",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-current-prompts-static-fallthrough-and-code-bare-snippet",
+      "text": "Current/live prompts for markets, sports, traffic, flights, software/docs, and legal-currentness could leak into static NRS reasoning when users omitted explicit words like 'right now'. Code mode could also fall through to generic Python facts when users entered a bare snippet such as print(2+2) without a fenced code block. Fix: mark live-by-nature topics in realtime_data_guard, answer no-key providers directly where reliable (Open-Meteo, CoinGecko, Frankfurter/ECB, npm registry), return concise source-required responses for categories without an authoritative provider, strip fake live-lookup metrics from Query Details, and let code_runner execute clear bare Python snippets in explicit Code mode or return a sandbox error.",
+      "confidence": 0.94,
+      "tags": [
+        "platform-api",
+        "chat-web",
+        "realtime-data",
+        "code-mode",
+        "answer-quality",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-production-chat-api-base-stale-domain",
+      "text": "Production chat-web-next could keep calling api.atheriongroup.com after platform-api fixes were deployed to Cloud Run, so production browser tests still exercised old backend behavior and returned stale/simple-math failures. Fix: set the production browser API base to the platform-api Cloud Run URL, deploy platform-api and chat-web-next together when routing contracts change, and verify direct production smoke paths rather than relying only on the web origin.",
+      "confidence": 0.94,
+      "tags": [
+        "chat-web",
+        "platform-api",
+        "cloud-run",
+        "runtime-config",
+        "deployment",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-deterministic-math-shortcut-exact-answer",
+      "text": "A simple deterministic prompt such as 'What is 2+2? Reply with just 4.' could route into stale/static chat behavior and return unrelated explanatory text instead of the exact requested answer. Fix: run deterministic arithmetic shortcuts before broad knowledge/analogy generation, preserve explicit brevity instructions such as 'reply with just', and production-test the exact prompt so the final content is exactly '4'.",
+      "confidence": 0.95,
+      "tags": [
+        "platform-api",
+        "chat",
+        "deterministic",
+        "math",
+        "instruction-following",
+        "answer-quality",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-threat-detector-context-balance",
+      "text": "Full backend tests found threat_detector overblocked benign legal-policy/curiosity/explanatory contexts while missing a stalking variant with possessive phrasing and location/whereabouts language. Fix: allow clearly academic, journalistic, professional, legal-policy, curiosity-explanation, and fictional exonerators for CSAM and mass-casualty categories where safe, and expand stalking detection for possessive targets and location/whereabouts terms.",
+      "confidence": 0.93,
+      "tags": [
+        "platform-api",
+        "threat-detector",
+        "safety-routing",
+        "false-positive",
+        "false-negative",
+        "tests",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-query-details-prism-validation-inferred",
+      "text": "Chat Query Details could imply Prism hallucination/drift validation for deterministic or reflex responses even when platform-api had not emitted explicit validation metadata. Root cause: chat-web-next inferred validation labels and risk values from frontend-side assumptions instead of a backend contract. Fix: platform-api now emits explicit prismValidation metadata for deterministic/reflex responses, and chat-web-next displays Prism validation status, drift, and hallucination values only from backend metadata. Production validation at https://atheriongroup.com/chat with a natural math prompt confirmed answer '45', 'Prism validated', 'Prism hallucination/drift validation', and 0.000% hallucination/drift risk.",
+      "confidence": 0.95,
+      "tags": [
+        "platform-api",
+        "chat-web",
+        "query-details",
+        "prism-validation",
+        "hallucination-risk",
+        "metadata-contract",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-chat-query-details-latest-state-only",
+      "text": "Chat Query Details regressed when the drawer depended only on latest-response component state: reopening details after messages already existed could show 'Send a query to see details here' even though assistant responses had metadata. Fix: make QueryDetails an exported type, store queryDetails on assistant Message and MessageVariant records when streaming, non-stream, and local fallback responses finish, reconstruct older records with detailsFromMessage, and let each assistant bubble plus its Details action open that message's own details. Production chat-web-next deploys to us-central1 and asia-northeast1 were validated at https://atheriongroup.com/chat by clicking response '42' for 'What is 23 + 19?' and confirming the drawer showed the query, model nrs-reflex, mathematics domain, Prism validator, confidence, and 0.000% hallucination/drift risk.",
+      "confidence": 0.95,
+      "tags": [
+        "chat-web",
+        "query-details",
+        "message-state",
+        "streaming",
+        "local-fallback",
+        "ui-state-persistence",
+        "frontend",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-ios-peer-hub-empty-direct-and-arena-reset",
+      "text": "The iOS Peer Hub Direct tab stranded new users on an empty thread list with instructions to start elsewhere, and AI Arena appeared to close/reset after Start because the view only showed the transcript while isAIConversationActive was true. Fix: add an in-sheet Add Peer flow backed by /peers/search and /peers/connect, open the selected peer's DM immediately, keep the AI Arena transcript visible whenever messages exist, and generate alternating NRS turns through the normal query path after seeding any selected peer conversation. Validation: generic iOS xcodebuild succeeds.",
+      "confidence": 0.94,
+      "tags": [
+        "ios",
+        "peer-hub",
+        "direct-messages",
+        "ai-arena",
+        "empty-state",
+        "ui-state",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-ios-appintents-source-not-in-target",
+      "text": "Xcode can emit `Metadata extraction skipped. No AppIntents.framework dependency found.` when an AppIntents source file exists in the repository but is not included in the app target. Fix: include the AppIntents source folder in the Xcode target and source project definition so the build has a real AppIntents dependency during metadata extraction. Validation: generic iOS xcodebuild succeeds with no warning or error lines.",
+      "confidence": 0.94,
+      "tags": [
+        "ios",
+        "xcode",
+        "appintents",
+        "build-warning",
+        "project-config",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-android-screenshots-blocked-by-flag-secure",
+      "text": "Android screenshots and screen recordings can be blocked app-wide if MainActivity sets WindowManager.LayoutParams.FLAG_SECURE during onCreate. For NRS TestFlight/Play validation and support capture, remove the global FLAG_SECURE call unless a specific sensitive payment/auth surface needs its own scoped secure-window policy. Validation: :app:compileDebugKotlin succeeds after removal.",
+      "confidence": 0.94,
+      "tags": [
+        "android",
+        "screenshots",
+        "flag-secure",
+        "mainactivity",
+        "ux",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-android-deprecation-warning-drift",
+      "text": "Android compile output had accumulated Compose, Stripe, Kotlin DSL, and Room deprecation warnings across MainActivity, AppMenu, PeerHub, PeopleSheet, PeerGroupsClient, and NRSDatabase. Fix warnings at the source: use AutoMirrored icons for directional glyphs, HorizontalDivider instead of Divider, Android ClipboardManager instead of LocalClipboardManager, Text with tap hit-testing instead of ClickableText, Stripe PaymentSheet.Builder instead of rememberPaymentSheet, Kotlin compilerOptions DSL instead of kotlinOptions.jvmTarget, nullable JSON extraction instead of optString(null), and Room's explicit downgrade fallback overload. Keep the Gradle wrapper aligned with AGP's supported line when Gradle itself introduces plugin-internal deprecation noise. Validation: :app:compileDebugKotlin --warning-mode all succeeds with no warning lines.",
+      "confidence": 0.94,
+      "tags": [
+        "android",
+        "compose",
+        "stripe",
+        "room",
+        "gradle",
+        "deprecation",
+        "build"
+      ]
+    },
+    {
+      "id": "bug-android-auth-sso-password-submit-coupling",
+      "text": "Android SSO buttons can appear to submit the email/password form if they reuse the same isAuthLoading state and leave the one-shot browser redirect URL in state. Fix: clear input focus before SSO, set only ssoRedirectUrl for SSO launches, consume that URL immediately after startActivity, and report browser-launch failure separately. Also keep mobile auth contracts aligned with platform-api: signup is POST /v1/auth/signup with first_name/last_name/email/password, not /v1/auth/register with name. Validation: :app:compileDebugKotlin --warning-mode all succeeds with no warning lines.",
+      "confidence": 0.94,
+      "tags": [
+        "android",
+        "auth",
+        "sso",
+        "oauth",
+        "login",
+        "signup",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-platform-api-sso-return-url-query-preservation",
+      "text": "platform-api SSO same-origin return URL handling can drop query strings if redirect validation stores only the path component. This breaks post-login return targets that carry state in the query string and can mask open-redirect regressions. Fix: preserve path plus query for same-origin return URLs, keep external/open redirects rejected, and cover SSO redirect, open-redirect, and native callback behavior with unit tests.",
+      "confidence": 0.95,
+      "tags": [
+        "platform-api",
+        "sso",
+        "oauth",
+        "redirect",
+        "open-redirect",
+        "native-callback",
+        "tests",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-povi-proof-route-public-middleware",
+      "text": "Production web route smoke showed API /povi/verify is public while web proof receipt routes under /povi/proof/<hash> were incorrectly protected by chat_web_next middleware and redirected to login. Fix: add the /povi/proof/ prefix to public middleware paths and cover it with middleware unit tests so public PoVI proof receipts remain browser-accessible during release smoke.",
+      "confidence": 0.95,
+      "tags": [
+        "chat-web",
+        "nextjs",
+        "middleware",
+        "povi",
+        "proof-receipts",
+        "public-route",
+        "release-smoke",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-chat-mode-contract-output-drift",
+      "text": "Production-mode smoke can pass metadata checks while /chat/completions still violates the requested mode contract: nrs_meta.reasoningMode may report hybrid or creative even when the worker text is off-topic retrieval output or generic analytical boilerplate. Fix: add deterministic mode-contract shaping in services/platform-api/routes/chat.py so streaming hybrid/creative responses buffer tokens and emit contract-shaped final text when needed, while non-streaming responses are rewritten before returning. Cover this with release smoke tests in services/platform-api/tests/test_release_finance_povi_smoke.py.",
+      "confidence": 0.95,
+      "tags": [
+        "platform-api",
+        "chat",
+        "reasoning-mode",
+        "mode-contract",
+        "streaming",
+        "release-smoke",
+        "answer-quality",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-admin-user-management-display-only-fields",
+      "text": "chat_web_next admin/users exposed role and plan as display-only values while PATCH /admin/users/{id} persisted only status, so operators could not complete user-management changes from the live admin UI. Fix: extend platform-api admin updates to accept status, role, plan, firstName, and lastName; wire live-admin updateManagedUser plus admin/users role and plan dropdowns; restrict role changes to super_admin and refuse super_admin demotion.",
+      "confidence": 0.95,
+      "tags": [
+        "platform-api",
+        "chat-web",
+        "admin",
+        "user-management",
+        "rbac",
+        "plan",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-admin-account-status-not-enforced",
+      "text": "Admin account controls can look complete while remaining unenforced if role/plan/status changes are stored as profile fields without mapping suspended or banned states to canonical suspension records and without checking them in auth/chat paths. Fix: make admin status changes create or lift account_suspension records, return active suspension details from admin user APIs, block inactive/suspended/banned accounts in login, /auth/me, and chat, auto-reactivate expired timed suspensions, and reserve password-reset actions for super_admin through the existing reset-token email path.",
+      "confidence": 0.95,
+      "tags": [
+        "platform-api",
+        "chat-web",
+        "admin",
+        "account-control",
+        "suspension",
+        "rbac",
+        "auth",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-usage-cost-rollup-storage-mismatch",
+      "text": "Cost tracking showed $0.00 because /usage/summary and admin users/financials read daily Redis hashes at usage:{uid}:{date}, but /v1/chat/completions wrote usage_log:* entries plus a usage:{uid} zset, while web chat only fired the Stripe meter. Fix: add get_usage_rollups/get_usage_totals with legacy usage_log fallback in routes/usage.py, call meter_query from routes/api.py, and meter both non-streaming and streaming chat paths in routes/chat.py.",
+      "confidence": 0.95,
+      "tags": [
+        "platform-api",
+        "usage",
+        "redis",
+        "metering",
+        "stripe",
+        "financials",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-prod-healthz-404-ingress-drift",
+      "text": "Production RBAC/cost acceptance after deploying platform-api/chat-web-next images prod-dev-20260426221209 passed against api.atheriongroup.com, but GET /healthz still returned HTTP 404 while /health and /readyz returned 200. Treat /healthz as ingress/API-gateway routing drift or a stale public contract until reconciled; public uptime probes should use the documented passing /health or /readyz paths unless /healthz is explicitly restored.",
+      "confidence": 0.85,
+      "tags": [
+        "platform-api",
+        "health",
+        "ingress",
+        "observability",
+        "production-acceptance",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-dev-domain-dns-authority-auth-scope",
+      "text": "Cloudflare DNS writes for atheriongroup.com can fail even when Cloudflare auth is present if the token is dns_records read-only. Porkbun is the registrar/original DNS host, but Cloudflare nameservers are authoritative for live atheriongroup.com records, so Porkbun DNS API changes will not affect dev.atheriongroup.com or dev-api.atheriongroup.com. Fix: verify authoritative nameservers first, then use a Cloudflare token with DNS edit permission for the zone or have an operator update the Cloudflare zone directly.",
+      "confidence": 0.95,
+      "tags": [
+        "cloudflare",
+        "dns",
+        "porkbun",
+        "domain-mapping",
+        "permissions",
+        "deployment",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-production-billing-stripe-price-env-missing",
+      "text": "Production checkout can be blocked when platform-api lacks live Stripe price IDs for advertised plans or treats metered Stripe prices like licensed prices. PAYG was listed by /billing/plans but failed until a Stripe Billing Meter-backed metered price was created for event nrs_api_units (meter mtr_61UZruPv9qfaFZkF041KTB5gksTYhON6, price price_1TQTx3KTB5gksTYhwTdxNJ21) and STRIPE_PRICE_ID_PAYG was set. Checkout then failed because routes/billing.py always sent quantity in Checkout line_items, which Stripe rejects for usage_type=metered prices. Fix: omit quantity for tier payg, preserve STRIPE_PRICE_ID_THINKING, STRIPE_PRICE_ID_METACOGNITIVE, and STRIPE_PRICE_ID_PAYG in deploy-platform.sh, then validate /billing/checkout for payg/thinking/metacognitive plus API key creation, chat completion metering, and nonzero usage summary cost.",
+      "confidence": 0.95,
+      "tags": [
+        "platform-api",
+        "stripe",
+        "billing",
+        "cloud-run",
+        "env-vars",
+        "metered-billing",
+        "checkout",
+        "release-readiness",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-platform-api-asia-vpc-secret-config-drift",
+      "text": "Cloud Run platform-api in asia-northeast1 can fail readiness and marketplace APIs when regional runtime config drifts from the known-good us-central1 baseline. Symptom: /readyz reports redis:false (503) and /construct-marketplace/listings returns 500 because Redis/Cloud SQL network and runtime wiring are incomplete. Durable fix: create and attach a regional VPC connector (prism-connector-asia), set VPC egress to private-ranges-only, sync image plus env/secrets to match us-central1, and include the Cloud SQL annotation. Remediation checklist: (1) compare service spec/env/secrets/image against us-central1, (2) verify connector exists in-region and is attached, (3) set egress private-ranges-only, (4) add Cloud SQL annotation, (5) smoke-test /readyz and /construct-marketplace/listings after deploy.",
+      "confidence": 0.96,
+      "tags": [
+        "platform-api",
+        "cloud-run",
+        "asia-northeast1",
+        "vpc-connector",
+        "secrets",
+        "redis",
+        "cloudsql",
+        "deployment",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-android-play-open-testing-foreground-service-and-kotlin-compat",
+      "text": "Google Play open testing can be blocked by undeclared app content, store listing gaps, country targeting gaps, and foreground-service declarations. If AndroidManifest.xml declares FOREGROUND_SERVICE_DATA_SYNC or a data-sync foreground service, Play Console requires a foreground service declaration and demo video; remove unused foreground-service permissions/service declarations and stop starting/stopping the service from NRSViewModel when the app does not need that capability. Kotlin compatibility quick-checks should avoid MutableList.removeLast() when the configured Kotlin/stdlib path may not expose it; use removeAt(lastIndex) instead. Validation: bump Android versionCode/versionName, build the signed AAB with deploy-google-play.sh, upload to open testing, and send Play changes for review.",
+      "confidence": 0.95,
+      "tags": [
+        "android",
+        "google-play",
+        "open-testing",
+        "foreground-service",
+        "kotlin",
+        "release-readiness",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-nrsbench-live-side-effects-reproducibility",
+      "text": "NRSBench full runs and throughput benchmarks can hang or become non-reproducible when benchmark paths allow live web retrieval, optional semantic-vector loading, persistent LearnableStore disk flushes, or optional PostgreSQL/Qdrant connections. Fix: default benchmark/run_all.py and tests.benchmark_throughput to offline/lightweight deterministic env (NRS_OFFLINE=1, NRS_BENCHMARK_LIGHTWEIGHT=1, NRS_SKIP_SEMANTIC_FILTER=1, NRS_LEARN_FROM_WEB=0, NRS_SKIP_KNOWLEDGE_SEED=1 where applicable), skip semantic filters in knowledge_loader during lightweight mode, disable persistent LearnableStore in lightweight learning benchmarks, make vlt_postgres/vlt_qdrant respect NRS_OFFLINE or explicit disable envs, use PVSFastPathProcessor by default for throughput with NRS_THROUGHPUT_FULL_PIPELINE=1 as opt-in, and materialize /tmp/.nrs_api_key from NRS_API_KEY for claude_parity/CI. Verification on 2026-04-28: python3 benchmarks/run_all.py && python3 benchmarks/render_scorecard.py && python3 -m tests.benchmark_throughput --queries 1000 --warmup 100 passed; NRSBench overall 100.0%, 1102/1130 pass-count, throughput warm 71,476 RPS and mixed 64,302 RPS versus target 6,433.",
+      "confidence": 0.95,
+      "tags": [
+        "benchmarks",
+        "nrsbench",
+        "reproducibility",
+        "offline-mode",
+        "throughput",
+        "vlt",
+        "semantic-filter",
+        "ci",
+        "bug"
+      ]
+    },
+    {
+      "id": "bug-benchmark-security-hardening",
+      "text": "Security scans during external benchmark hardening found untracked global-rollout/scripts/arena/creds.json containing local test passwords/JWTs and first-party Python fingerprinting that still used MD5. Fix: remove the untracked credentials file, ignore arena creds and external raw benchmark datasets, replace first-party MD5 fingerprints with SHA-256, and redact OAuth token exchange failure logging in services/platform-api/routes/sso.py so response bodies/tokens are not logged. Verification: filtered first-party Bandit high=0 and medium=26, pip-audit root/platform-api/nrs-worker no known vulnerabilities, npm audit clean for sdks/js, vscode-nrsi, and tree-sitter-nrsi, with chat_web_next retaining 4 moderate advisories via next/postcss and mermaid/uuid that lacked a safe non-breaking npm audit fix.",
+      "confidence": 0.95,
+      "tags": [
+        "security",
+        "secrets",
+        "oauth",
+        "logging",
+        "hashing",
+        "benchmarks",
+        "dependency-audit",
+        "bug"
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "id": "bug-ios-stripe-spm-custom-path",
+      "text": "iOS xcodebuild could fail before app compilation with SwiftPM error `invalid custom path 'Stripe3DS2/Stripe3DS2' for target 'Stripe3DS2'` while resolving Stripe from `https://github.com/stripe/stripe-ios` at 25.11.0. Durable fix: point the Xcode package reference and XcodeGen project.yml package URL to Stripe's SPM-only repository `https://github.com/stripe/stripe-ios-spm`, keep the same products (`StripePaymentSheet`, `StripeApplePay`), and refresh Package.resolved. If local Xcode still reports uncommitted changes in the old DerivedData checkout, reset package caches or resolve with a fresh `-clonedSourcePackagesDirPath`. Validation: `xcodebuild -resolvePackageDependencies` and unsigned generic iOS build pass with stripe-ios-spm 25.11.0.",
+      "confidence": 0.95,
+      "tags": [
+        "ios",
+        "xcode",
+        "swiftpm",
+        "stripe",
+        "build",
+        "dependency",
+        "bug"
+      ]
+    }
+  ],
+  "bugs": [
+    {
+      "id": "bug-ios-stripe-spm-custom-path",
+      "text": "iOS xcodebuild could fail before app compilation with SwiftPM error `invalid custom path 'Stripe3DS2/Stripe3DS2' for target 'Stripe3DS2'` while resolving Stripe from `https://github.com/stripe/stripe-ios` at 25.11.0. Durable fix: point the Xcode package reference and XcodeGen project.yml package URL to Stripe's SPM-only repository `https://github.com/stripe/stripe-ios-spm`, keep the same products (`StripePaymentSheet`, `StripeApplePay`), and refresh Package.resolved. If local Xcode still reports uncommitted changes in the old DerivedData checkout, reset package caches or resolve with a fresh `-clonedSourcePackagesDirPath`. Validation: `xcodebuild -resolvePackageDependencies` and unsigned generic iOS build pass with stripe-ios-spm 25.11.0.",
+      "confidence": 0.95,
+      "tags": [
+        "ios",
+        "xcode",
+        "swiftpm",
+        "stripe",
+        "build",
+        "dependency",
+        "bug"
+      ]
+    }
+  ]
+}

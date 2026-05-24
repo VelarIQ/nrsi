@@ -1,0 +1,304 @@
+/// NRSIP Message Definitions — data structures for NRSIP transport protocol.
+///
+/// Full implementation of `nrsip/nrsip_messages.py`.
+/// Patent coverage: NRS-5 Claims 1-7, Cont. A Claims 1-10, Cont. C Claims 1-8.
+/// All structures use deterministic serialization (sorted keys, compact separators).
+
+module nrsip_messages
+
+
+import time from "std/time"
+import uuid from "std/uuid"
+import json from "std/json"
+/// ---------- Enumerations ----------
+
+enum QoSPriority {
+    BULK = 0,
+    STANDARD = 1,
+    HIGH = 2,
+    CRITICAL = 3
+}
+
+enum ValidationTier {
+    T0_SENSORY = 0,
+    T1_CORTICAL = 1,
+    T2_ASSOCIATION = 2,
+    T3_PREFRONTAL = 3,
+    T4_SYNTHESIS = 4
+}
+
+enum PaymentType {
+    PER_REQUEST = 0,
+    CHANNEL = 1,
+    SUBSCRIPTION = 2
+}
+
+/// ---------- Fixed Header (Continuation A) ----------
+
+type NRSIPHeader {
+    version: int,
+    flags: int,
+    ttl: int,
+    sequence: int,
+    qos: QoSPriority,
+    source_validation_tier: ValidationTier,
+    destination_validation_tier: ValidationTier
+}
+
+fn default_nrsip_header() -> NRSIPHeader {
+    return NRSIPHeader {
+        version: 1,
+        flags: 0,
+        ttl: 64,
+        sequence: 0,
+        qos: QoSPriority.STANDARD,
+        source_validation_tier: ValidationTier.T1_CORTICAL,
+        destination_validation_tier: ValidationTier.T1_CORTICAL
+    }
+}
+
+fn nrsip_header_to_canonical_dict(h: NRSIPHeader) -> Dict[string, Any] {
+    return {
+        "destination_validation_tier": int(h.destination_validation_tier),
+        "flags": h.flags,
+        "qos": int(h.qos),
+        "sequence": h.sequence,
+        "source_validation_tier": int(h.source_validation_tier),
+        "ttl": h.ttl,
+        "version": h.version
+    }
+}
+
+/// ---------- Payment Header (Continuation C) ----------
+
+type PaymentHeader {
+    payment_type: PaymentType,
+    amount: float,
+    currency: string,
+    payer_address: string,
+    payee_address: string,
+    proof_key_id: string,
+    proof_signature: string,
+    nonce: string
+}
+
+fn default_payment_header() -> PaymentHeader {
+    return PaymentHeader {
+        payment_type: PaymentType.PER_REQUEST,
+        amount: 0.0,
+        currency: "USD",
+        payer_address: "",
+        payee_address: "",
+        proof_key_id: "",
+        proof_signature: "",
+        nonce: uuid.uuid4().hex
+    }
+}
+
+fn payment_header_to_canonical_dict(ph: PaymentHeader) -> Dict[string, Any] {
+    return {
+        "amount": ph.amount,
+        "currency": ph.currency,
+        "nonce": ph.nonce,
+        "payee_address": ph.payee_address,
+        "payer_address": ph.payer_address,
+        "payment_type": int(ph.payment_type),
+        "proof_key_id": ph.proof_key_id
+    }
+}
+
+/// ---------- Hop Record (NRS-5) ----------
+
+type HopRecord {
+    hop_index: int,
+    node_id: string,
+    key_id: string,
+    prev_hop_hash: string,
+    message_id: string,
+    decision: string,
+    confidence: Optional[float],
+    latency_ms: Optional[float],
+    hop_hash: string,
+    signature: string
+}
+
+fn hop_record_to_canonical_dict(h: HopRecord) -> Dict[string, Any] {
+    return {
+        "confidence": h.confidence,
+        "decision": h.decision,
+        "hop_index": h.hop_index,
+        "key_id": h.key_id,
+        "latency_ms": h.latency_ms,
+        "message_id": h.message_id,
+        "node_id": h.node_id,
+        "prev_hop_hash": h.prev_hop_hash
+    }
+}
+
+fn hop_record_to_signable_dict(h: HopRecord) -> Dict[string, Any] {
+    let d = hop_record_to_canonical_dict(h)
+    d["hop_hash"] = h.hop_hash
+    return d
+}
+
+/// ---------- Message / Signed Envelope (NRS-5 + Cont. A + Cont. C) ----------
+
+type Message {
+    message_id: string,
+    message_type: string,
+    payload: Dict[string, Any],
+    signer_id: string,
+    key_id: string,
+    signature: string,
+    header: NRSIPHeader,
+    payment: Optional[PaymentHeader],
+    hops: List[HopRecord],
+    created_at: float
+}
+
+fn new_message() -> Message {
+    return Message {
+        message_id: uuid.uuid4().hex,
+        message_type: "request",
+        payload: {},
+        signer_id: "",
+        key_id: "",
+        signature: "",
+        header: default_nrsip_header(),
+        payment: None,
+        hops: [],
+        created_at: time.time()
+    }
+}
+
+fn message_canonical_signed_payload(msg: Message) -> string {
+    let obj = {
+        "header": nrsip_header_to_canonical_dict(msg.header),
+        "key_id": msg.key_id,
+        "message_id": msg.message_id,
+        "message_type": msg.message_type,
+        "payload": _deep_sort(msg.payload),
+        "signer_id": msg.signer_id
+    }
+    if msg.payment != None {
+        obj["payment"] = payment_header_to_canonical_dict(msg.payment)
+    }
+    return json.dumps(obj, sort_keys: true, separators: [",", ":"])
+}
+
+fn message_to_dict(msg: Message) -> Dict[string, Any] {
+    let pay_dict = None
+    if msg.payment != None {
+        pay_dict = payment_header_to_canonical_dict(msg.payment)
+    }
+    let hop_dicts = []
+    for h in msg.hops {
+        let hd = hop_record_to_canonical_dict(h)
+        hd["hop_hash"] = h.hop_hash
+        hd["signature"] = h.signature
+        append(hop_dicts, hd)
+    }
+    return {
+        "message_id": msg.message_id,
+        "message_type": msg.message_type,
+        "payload": msg.payload,
+        "signer_id": msg.signer_id,
+        "key_id": msg.key_id,
+        "signature": msg.signature,
+        "header": nrsip_header_to_canonical_dict(msg.header),
+        "payment": pay_dict,
+        "hops": hop_dicts,
+        "created_at": msg.created_at
+    }
+}
+
+fn message_from_dict(d: Dict[string, Any]) -> Message {
+    let hdr_d = get_or_default(d, "header", {})
+    let header = NRSIPHeader {
+        version: get_or_default(hdr_d, "version", 1),
+        flags: get_or_default(hdr_d, "flags", 0),
+        ttl: get_or_default(hdr_d, "ttl", 64),
+        sequence: get_or_default(hdr_d, "sequence", 0),
+        qos: QoSPriority(get_or_default(hdr_d, "qos", 1)),
+        source_validation_tier: ValidationTier(
+            get_or_default(hdr_d, "source_validation_tier", 1)
+        ),
+        destination_validation_tier: ValidationTier(
+            get_or_default(hdr_d, "destination_validation_tier", 1)
+        )
+    }
+
+    let pay_d = get_or_default(d, "payment", None)
+    let payment = None
+    if pay_d != None {
+        payment = PaymentHeader {
+            payment_type: PaymentType(get_or_default(pay_d, "payment_type", 0)),
+            amount: get_or_default(pay_d, "amount", 0.0),
+            currency: get_or_default(pay_d, "currency", "USD"),
+            payer_address: get_or_default(pay_d, "payer_address", ""),
+            payee_address: get_or_default(pay_d, "payee_address", ""),
+            proof_key_id: get_or_default(pay_d, "proof_key_id", ""),
+            proof_signature: get_or_default(pay_d, "proof_signature", ""),
+            nonce: get_or_default(pay_d, "nonce", uuid.uuid4().hex)
+        }
+    }
+
+    let hops = []
+    let hop_list = get_or_default(d, "hops", [])
+    for h in hop_list {
+        let hop = HopRecord {
+            hop_index: h["hop_index"],
+            node_id: h["node_id"],
+            key_id: h["key_id"],
+            prev_hop_hash: h["prev_hop_hash"],
+            message_id: h["message_id"],
+            decision: get_or_default(h, "decision", "recv"),
+            confidence: get_or_default(h, "confidence", None),
+            latency_ms: get_or_default(h, "latency_ms", None),
+            hop_hash: get_or_default(h, "hop_hash", ""),
+            signature: get_or_default(h, "signature", "")
+        }
+        append(hops, hop)
+    }
+
+    return Message {
+        message_id: get_or_default(d, "message_id", uuid.uuid4().hex),
+        message_type: get_or_default(d, "message_type", "request"),
+        payload: get_or_default(d, "payload", {}),
+        signer_id: get_or_default(d, "signer_id", ""),
+        key_id: get_or_default(d, "key_id", ""),
+        signature: get_or_default(d, "signature", ""),
+        header: header,
+        payment: payment,
+        hops: hops,
+        created_at: get_or_default(d, "created_at", time.time())
+    }
+}
+
+/// ---------- Helpers ----------
+
+fn _deep_sort(obj: Any) -> Any {
+    if is_dict(obj) {
+        let result = {}
+        let sorted_keys = sorted(keys(obj))
+        for k in sorted_keys {
+            result[k] = _deep_sort(obj[k])
+        }
+        return result
+    }
+    if is_list(obj) {
+        let result = []
+        for item in obj {
+            append(result, _deep_sort(item))
+        }
+        return result
+    }
+    return obj
+}
+
+export QoSPriority, ValidationTier, PaymentType
+export NRSIPHeader, default_nrsip_header, nrsip_header_to_canonical_dict
+export PaymentHeader, default_payment_header, payment_header_to_canonical_dict
+export HopRecord, hop_record_to_canonical_dict, hop_record_to_signable_dict
+export Message, new_message, message_canonical_signed_payload
+export message_to_dict, message_from_dict

@@ -1,0 +1,240 @@
+/// NRSI Domain Creases -- Modular Locked Knowledge Units
+///
+/// Cortical-fold analogy: each DomainCrease holds layered knowledge for one
+/// domain. search_crease performs keyword-overlap relevance scoring across
+/// all layers and returns matching entries above the caller's threshold.
+
+module creases
+
+import NRSIData, TrustLevel from "types"
+import factual_verify from "gates"
+
+/// ---------- Enumerations ----------
+
+enum CreaseLayer {
+    CORE_FACTS,
+    INFERENCE_PATTERNS,
+    VALIDATION_CRITERIA,
+    TERMINOLOGY
+}
+
+enum AxiomTier {
+    T0_AXIOM,
+    T1_FACT,
+    T2_INFERENCE,
+    T3_HYPOTHESIS
+}
+
+/// ---------- Core Types ----------
+
+type DomainCrease {
+    domain: string,
+    locked: bool,
+    layers: Map[CreaseLayer, Map[string, NRSIData]],
+    queries_served: int,
+    accuracy_threshold: float
+}
+
+type CreaseRegistry {
+    creases: Map[string, DomainCrease],
+    total_facts: int
+}
+
+type CreaseSearchResult {
+    key: string,
+    layer: string,
+    data: NRSIData,
+    relevance: float
+}
+
+/// ---------- Internal Helpers ----------
+
+fn _tokenize(text: string) -> List[string] {
+    let lower = text.lower()
+    let tokens: List[string] = []
+    let current = ""
+    for ch in lower {
+        if ch.isalnum() {
+            current = current + ch
+        } else {
+            if current.len() > 1 {
+                tokens.append(current)
+            }
+            current = ""
+        }
+    }
+    if current.len() > 1 {
+        tokens.append(current)
+    }
+    return tokens
+}
+
+fn _keyword_relevance(query_tokens: List[string], text: string) -> float {
+    if query_tokens.len() == 0 {
+        return 0.0
+    }
+    let lower = text.lower()
+    let hits = 0
+    for tok in query_tokens {
+        if tok in lower {
+            hits = hits + 1
+        }
+    }
+    return hits / query_tokens.len()
+}
+
+fn _extract_searchable_text(entry: NRSIData) -> string {
+    let parts: List[string] = []
+    if hasattr(entry, "text") and entry.text != nil {
+        parts.append(str(entry.text))
+    }
+    if hasattr(entry, "value") and entry.value != nil {
+        parts.append(str(entry.value))
+    }
+    if hasattr(entry, "content") and entry.content != nil {
+        parts.append(str(entry.content))
+    }
+    if hasattr(entry, "description") and entry.description != nil {
+        parts.append(str(entry.description))
+    }
+    if hasattr(entry, "tags") and entry.tags != nil {
+        for tag in entry.tags {
+            parts.append(str(tag))
+        }
+    }
+    if parts.len() == 0 {
+        parts.append(str(entry))
+    }
+    return " ".join(parts)
+}
+
+/// ---------- Constructor Functions ----------
+
+fn create_crease(domain: string) -> DomainCrease {
+    return DomainCrease {
+        domain: domain,
+        locked: false,
+        layers: {},
+        queries_served: 0,
+        accuracy_threshold: 0.999
+    }
+}
+
+fn lock_crease(crease: DomainCrease) -> DomainCrease {
+    require crease.layers[CreaseLayer.CORE_FACTS].size > 0
+    return crease
+}
+
+fn add_to_crease(crease: DomainCrease, layer: CreaseLayer, key: string, data: NRSIData) -> DomainCrease {
+    if crease.locked {
+        return crease
+    }
+    if layer not in crease.layers {
+        crease.layers[layer] = {}
+    }
+    crease.layers[layer][key] = data
+    return crease
+}
+
+fn search_crease(crease: DomainCrease, query: string, min_relevance: float) -> List[CreaseSearchResult] {
+    require min_relevance >= 0.0
+    require min_relevance <= 1.0
+
+    let query_tokens = _tokenize(query)
+    if query_tokens.len() == 0 {
+        return []
+    }
+
+    let results: List[CreaseSearchResult] = []
+
+    let layer_names = {
+        CreaseLayer.CORE_FACTS: "core_facts",
+        CreaseLayer.INFERENCE_PATTERNS: "inference_patterns",
+        CreaseLayer.VALIDATION_CRITERIA: "validation_criteria",
+        CreaseLayer.TERMINOLOGY: "terminology"
+    }
+
+    let layer_boost = {
+        CreaseLayer.CORE_FACTS: 1.0,
+        CreaseLayer.INFERENCE_PATTERNS: 0.9,
+        CreaseLayer.VALIDATION_CRITERIA: 0.85,
+        CreaseLayer.TERMINOLOGY: 0.8
+    }
+
+    for layer_key in crease.layers {
+        let entries = crease.layers[layer_key]
+        let boost = layer_boost.get(layer_key, 0.8)
+        let layer_name = layer_names.get(layer_key, "unknown")
+
+        for entry_key in entries {
+            let entry = entries[entry_key]
+            let searchable = _extract_searchable_text(entry)
+            let raw_score = _keyword_relevance(query_tokens, searchable)
+
+            let key_score = _keyword_relevance(query_tokens, entry_key.lower())
+            let combined = (raw_score * 0.7 + key_score * 0.3) * boost
+
+            if combined >= min_relevance {
+                results.append(CreaseSearchResult {
+                    key: entry_key,
+                    layer: layer_name,
+                    data: entry,
+                    relevance: combined
+                })
+            }
+        }
+    }
+
+    results.sort(key=lambda r: r.relevance, reverse=true)
+    crease.queries_served = crease.queries_served + 1
+    return results
+}
+
+fn search_registry(registry: CreaseRegistry, query: string, min_relevance: float, max_results: int) -> List[CreaseSearchResult] {
+    let all_results: List[CreaseSearchResult] = []
+    for domain_key in registry.creases {
+        let crease = registry.creases[domain_key]
+        let crease_results = search_crease(crease, query, min_relevance)
+        for r in crease_results {
+            all_results.append(r)
+        }
+    }
+    all_results.sort(key=lambda r: r.relevance, reverse=true)
+    if all_results.len() > max_results {
+        return all_results[:max_results]
+    }
+    return all_results
+}
+
+fn crease_stats(crease: DomainCrease) -> Dict[string, Any] {
+    let total = 0
+    let per_layer = {}
+    for layer_key in crease.layers {
+        let count = len(crease.layers[layer_key])
+        per_layer[str(layer_key)] = count
+        total = total + count
+    }
+    return {
+        "domain": crease.domain,
+        "locked": crease.locked,
+        "total_entries": total,
+        "per_layer": per_layer,
+        "queries_served": crease.queries_served
+    }
+}
+
+/// ---------- Norms ----------
+
+norm no_modify_locked_crease {
+    type: prohibition,
+    scope: global,
+    action: "modify_locked_layer",
+    priority: 100,
+    condition: crease.locked == true
+}
+
+/// ---------- Exports ----------
+
+export DomainCrease, CreaseRegistry, CreaseLayer, AxiomTier, CreaseSearchResult
+export create_crease, lock_crease, add_to_crease, search_crease
+export search_registry, crease_stats

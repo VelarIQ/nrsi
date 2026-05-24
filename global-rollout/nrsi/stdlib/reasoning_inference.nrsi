@@ -1,0 +1,458 @@
+/// NRSI — Inference Engine.
+///
+/// Forward chaining, backward chaining, and multi-hop path finding over the
+/// CausalGraph with confidence propagation and provenance trails.
+/// All transformer-free.
+
+module reasoning_inference
+
+from "reasoning_graph" import CausalGraph, GraphEdge, RelationType
+
+/// ---------- Forward-propagating relations ----------
+
+let _FORWARD_RELATIONS = [
+    RelationType.CAUSES, RelationType.PRODUCES, RelationType.ENABLES,
+    RelationType.PRECEDES
+]
+
+let _BACKWARD_RELATIONS = [
+    RelationType.CAUSES, RelationType.PRODUCES, RelationType.ENABLES,
+    RelationType.REQUIRES
+]
+
+let _INVERSE_RELATION: Dict[RelationType, RelationType] = {
+    RelationType.CAUSES: RelationType.CAUSES,
+    RelationType.PREVENTS: RelationType.PREVENTS,
+    RelationType.REQUIRES: RelationType.REQUIRES,
+    RelationType.ENABLES: RelationType.ENABLES,
+    RelationType.PRODUCES: RelationType.PRODUCES,
+    RelationType.INHIBITS: RelationType.INHIBITS
+}
+
+/// ---------- Types ----------
+
+type InferenceResult {
+    conclusion: string,
+    confidence: float,
+    depth: int,
+    path: List[string],
+    edges: List[GraphEdge],
+    explanation: string,
+    derived: bool
+}
+
+fn inference_result_provenance_trail(r: InferenceResult) -> List[any] {
+    let trail: List[string] = []
+    for e in r.edges {
+        trail.append(e.edge_id)
+    }
+    return trail
+}
+
+fn inference_result_natural_language(r: InferenceResult) -> string {
+    if len(r.edges) == 0 {
+        return r.conclusion
+    }
+    let parts: List[string] = []
+    for e in r.edges {
+        parts.append(e.source + " " + e.relation.value + " " + e.target)
+    }
+    let chain = " → ".join(parts)
+    return chain + " (confidence: " + str(round(r.confidence, 2)) + ", depth: " + str(r.depth) + ")"
+}
+
+type ChainStep {
+    concept: string,
+    confidence: float,
+    depth: int,
+    path: List[string],
+    edges: List[GraphEdge]
+}
+
+/// ---------- Sort helpers ----------
+
+fn _sort_results_by_confidence(results: List[InferenceResult]) -> List[any] {
+    let sorted_list: List[InferenceResult] = []
+    let remaining = list(results)
+    while len(remaining) > 0 {
+        let best_idx = 0
+        let best_conf = remaining[0].confidence
+        for i in range(1, len(remaining)) {
+            if remaining[i].confidence > best_conf {
+                best_conf = remaining[i].confidence
+                best_idx = i
+            }
+        }
+        sorted_list.append(remaining.pop(best_idx))
+    }
+    return sorted_list
+}
+
+/// ---------- Forward Chainer ----------
+
+class ForwardChainer {
+    fn __init__(self, graph: CausalGraph, max_depth: int, min_confidence: float,
+                relations: Optional[List[RelationType]]) {
+        self._graph = graph
+        self._max_depth = max_depth
+        if max_depth == None {
+            self._max_depth = 5
+        }
+        self._min_confidence = min_confidence
+        if min_confidence == None {
+            self._min_confidence = 0.1
+        }
+        if relations != None {
+            self._relations = relations
+        } else {
+            self._relations = _FORWARD_RELATIONS
+        }
+    }
+
+    fn chain(self, start: string, max_results: int) -> List[any] {
+        if max_results == None {
+            max_results = 50
+        }
+        let start_norm = start.lower().strip()
+        if not self._graph.has_node(start_norm) {
+            return []
+        }
+
+        let results: List[InferenceResult] = []
+        let visited: Set[string] = set()
+        visited.add(start_norm)
+        let queue: List[ChainStep] = []
+        queue.append(ChainStep {
+            concept: start_norm, confidence: 1.0, depth: 0,
+            path: [start_norm], edges: []
+        })
+
+        while len(queue) > 0 and len(results) < max_results {
+            let step = queue.pop(0)
+            if step.depth >= self._max_depth {
+                continue
+            }
+
+            for edge in self._graph.outgoing(step.concept) {
+                if edge.relation not in self._relations {
+                    continue
+                }
+                if edge.target in visited {
+                    continue
+                }
+
+                let new_conf = step.confidence * edge.confidence
+                if new_conf < self._min_confidence {
+                    continue
+                }
+
+                visited.add(edge.target)
+                let new_path = step.path + [edge.target]
+                let new_edges = step.edges + [edge]
+
+                let result = InferenceResult {
+                    conclusion: edge.target,
+                    confidence: new_conf,
+                    depth: step.depth + 1,
+                    path: new_path,
+                    edges: new_edges,
+                    explanation: "",
+                    derived: true
+                }
+                results.append(result)
+
+                queue.append(ChainStep {
+                    concept: edge.target, confidence: new_conf,
+                    depth: step.depth + 1, path: new_path, edges: new_edges
+                })
+            }
+        }
+
+        return _sort_results_by_confidence(results)
+    }
+}
+
+/// ---------- Backward Chainer ----------
+
+class BackwardChainer {
+    fn __init__(self, graph: CausalGraph, max_depth: int, min_confidence: float,
+                relations: Optional[List[RelationType]]) {
+        self._graph = graph
+        self._max_depth = max_depth
+        if max_depth == None {
+            self._max_depth = 5
+        }
+        self._min_confidence = min_confidence
+        if min_confidence == None {
+            self._min_confidence = 0.1
+        }
+        if relations != None {
+            self._relations = relations
+        } else {
+            self._relations = _BACKWARD_RELATIONS
+        }
+    }
+
+    fn chain(self, goal: string, max_results: int) -> List[any] {
+        if max_results == None {
+            max_results = 50
+        }
+        let goal_norm = goal.lower().strip()
+        if not self._graph.has_node(goal_norm) {
+            return []
+        }
+
+        let results: List[InferenceResult] = []
+        let visited: Set[string] = set()
+        visited.add(goal_norm)
+        let queue: List[ChainStep] = []
+        queue.append(ChainStep {
+            concept: goal_norm, confidence: 1.0, depth: 0,
+            path: [goal_norm], edges: []
+        })
+
+        while len(queue) > 0 and len(results) < max_results {
+            let step = queue.pop(0)
+            if step.depth >= self._max_depth {
+                continue
+            }
+
+            for edge in self._graph.incoming(step.concept) {
+                if edge.relation not in self._relations {
+                    continue
+                }
+                if edge.source in visited {
+                    continue
+                }
+
+                let new_conf = step.confidence * edge.confidence
+                if new_conf < self._min_confidence {
+                    continue
+                }
+
+                visited.add(edge.source)
+                let new_path = [edge.source] + step.path
+                let new_edges = [edge] + step.edges
+
+                let result = InferenceResult {
+                    conclusion: edge.source,
+                    confidence: new_conf,
+                    depth: step.depth + 1,
+                    path: new_path,
+                    edges: new_edges,
+                    explanation: "",
+                    derived: true
+                }
+                results.append(result)
+
+                queue.append(ChainStep {
+                    concept: edge.source, confidence: new_conf,
+                    depth: step.depth + 1, path: new_path, edges: new_edges
+                })
+            }
+        }
+
+        return _sort_results_by_confidence(results)
+    }
+}
+
+/// ---------- Path Finder ----------
+
+class PathFinder {
+    fn __init__(self, graph: CausalGraph, max_depth: int, min_confidence: float) {
+        self._graph = graph
+        self._max_depth = max_depth
+        if max_depth == None {
+            self._max_depth = 6
+        }
+        self._min_confidence = min_confidence
+        if min_confidence == None {
+            self._min_confidence = 0.05
+        }
+    }
+
+    fn find_paths(self, source: string, target: string, max_paths: int) -> List[any] {
+        if max_paths == None {
+            max_paths = 10
+        }
+        let source_norm = source.lower().strip()
+        let target_norm = target.lower().strip()
+
+        if not self._graph.has_node(source_norm) or not self._graph.has_node(target_norm) {
+            return []
+        }
+        if source_norm == target_norm {
+            return [InferenceResult {
+                conclusion: target_norm, confidence: 1.0, depth: 0,
+                path: [source_norm], edges: [], explanation: "Source equals target.",
+                derived: true
+            }]
+        }
+
+        let results: List[InferenceResult] = []
+        let queue: List[ChainStep] = []
+        queue.append(ChainStep {
+            concept: source_norm, confidence: 1.0, depth: 0,
+            path: [source_norm], edges: []
+        })
+
+        while len(queue) > 0 and len(results) < max_paths {
+            let step = queue.pop(0)
+            if step.depth >= self._max_depth {
+                continue
+            }
+
+            for edge in self._graph.outgoing(step.concept) {
+                if edge.target in step.path {
+                    continue
+                }
+
+                let new_conf = step.confidence * edge.confidence
+                if new_conf < self._min_confidence {
+                    continue
+                }
+
+                let new_path = step.path + [edge.target]
+                let new_edges = step.edges + [edge]
+
+                if edge.target == target_norm {
+                    results.append(InferenceResult {
+                        conclusion: target_norm,
+                        confidence: new_conf,
+                        depth: step.depth + 1,
+                        path: new_path,
+                        edges: new_edges,
+                        explanation: "",
+                        derived: true
+                    })
+                } else {
+                    queue.append(ChainStep {
+                        concept: edge.target, confidence: new_conf,
+                        depth: step.depth + 1, path: new_path, edges: new_edges
+                    })
+                }
+            }
+        }
+
+        return _sort_results_by_confidence(results)
+    }
+
+    fn explain(self, source: string, target: string) -> string {
+        let paths = self.find_paths(source, target, 3)
+        if len(paths) == 0 {
+            return "No reasoning path found between '" + source + "' and '" + target + "'."
+        }
+
+        let lines: List[string] = []
+        lines.append("Found " + str(len(paths)) + " path(s) from '" + source + "' to '" + target + "':")
+        for i in range(len(paths)) {
+            let p = paths[i]
+            let steps: List[string] = []
+            for e in p.edges {
+                steps.append(e.source + " --[" + e.relation.value + "]--> " + e.target)
+            }
+            let chain_str = ""
+            if len(steps) > 0 {
+                chain_str = " → ".join(steps)
+            } else {
+                chain_str = "(direct)"
+            }
+            lines.append("  Path " + str(i + 1) + " (confidence " + str(round(p.confidence, 3)) + "): " + chain_str)
+        }
+        return "\n".join(lines)
+    }
+}
+
+/// ---------- Unified Inference Engine ----------
+
+class InferenceEngine {
+    fn __init__(self, graph: CausalGraph, max_depth: int, min_confidence: float) {
+        if max_depth == None {
+            max_depth = 5
+        }
+        if min_confidence == None {
+            min_confidence = 0.1
+        }
+        self._graph = graph
+        self._forward = ForwardChainer(graph, max_depth, min_confidence, None)
+        self._backward = BackwardChainer(graph, max_depth, min_confidence, None)
+        self._pathfinder = PathFinder(graph, max_depth + 1, min_confidence * 0.5)
+    }
+
+    fn forward(self, concept: string, max_results: int) -> List[any] {
+        if max_results == None {
+            max_results = 20
+        }
+        return self._forward.chain(concept, max_results)
+    }
+
+    fn backward(self, concept: string, max_results: int) -> List[any] {
+        if max_results == None {
+            max_results = 20
+        }
+        return self._backward.chain(concept, max_results)
+    }
+
+    fn connect(self, source: string, target: string, max_paths: int) -> List[any] {
+        if max_paths == None {
+            max_paths = 5
+        }
+        return self._pathfinder.find_paths(source, target, max_paths)
+    }
+
+    fn explain(self, source: string, target: string) -> string {
+        return self._pathfinder.explain(source, target)
+    }
+
+    fn derive_and_store(self, concept: string, max_depth: int, min_confidence: float) -> int {
+        if max_depth == None {
+            max_depth = 3
+        }
+        if min_confidence == None {
+            min_confidence = 0.2
+        }
+        let fwd = ForwardChainer(self._graph, max_depth, min_confidence, None)
+        let results = fwd.chain(concept, 100)
+        let count = 0
+        for r in results {
+            if r.depth < 2 {
+                continue
+            }
+            let existing = self._graph.get_edge(concept, RelationType.CAUSES, r.conclusion)
+            if existing != None {
+                continue
+            }
+            let domain_val = ""
+            if len(r.edges) > 0 {
+                domain_val = r.edges[0].domain
+            }
+            let evidence_str = "Derived: " + " → ".join(r.path)
+            self._graph.add_edge(
+                concept, r.conclusion,
+                RelationType.CAUSES,
+                r.confidence,
+                domain_val,
+                evidence_str,
+                true,
+                inference_result_provenance_trail(r)
+            )
+            count += 1
+        }
+        return count
+    }
+}
+
+/// ---------- Gate ----------
+
+gate inference_gate(data: raw[InferenceResult]) -> validated[InferenceResult] {
+    require confidence >= 0.55
+    validate proof_completeness
+    validate premise_check
+}
+
+/// ---------- Exports ----------
+
+export InferenceResult, ChainStep
+export inference_result_provenance_trail, inference_result_natural_language
+export ForwardChainer, BackwardChainer, PathFinder, InferenceEngine
+export inference_gate

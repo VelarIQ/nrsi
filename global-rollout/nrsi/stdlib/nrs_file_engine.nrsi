@@ -1,0 +1,2135 @@
+/// NRS Universal File Engine — Platform-Wide Ingestion and Conversion.
+///
+/// Industry-agnostic, lobe-agnostic file processing that any NRS module
+/// can import and use. Converts ANY file format into structured data
+/// that reasoning lobes, analysis engines, and services can consume.
+///
+/// Unlike the telecom-specific converter, this engine:
+///   - Works for ALL industries and domains
+///   - Registers as an NRS capability in the registry hierarchy
+///   - Integrates with the lobe system for domain-aware parsing
+///   - Delegates to the ParserFactory for dynamic handler generation
+///   - Produces typed IngestResult objects with provenance
+///
+/// ═══════════════════════════════════════════════════════════════════
+///   ARCHITECTURE
+/// ═══════════════════════════════════════════════════════════════════
+///
+///   ANY FILE
+///      │
+///      ▼
+///   ┌─ DETECT ──────────────────────────────────────────────────────┐
+///   │  Magic bytes, extension, heuristic content sniffing           │
+///   └────────┬──────────────────────────────────────────────────────┘
+///            │
+///            ▼
+///   ┌─ HANDLER LOOKUP ──────────────────────────────────────────────┐
+///   │  Registry of format → handler mappings                        │
+///   │  If no handler exists → ParserFactory builds one on the fly   │
+///   └────────┬──────────────────────────────────────────────────────┘
+///            │
+///            ▼
+///   ┌─ CONVERT ─────────────────────────────────────────────────────┐
+///   │  Multi-strategy with fallback chains                          │
+///   │  Compressed/archive → recursive descent                       │
+///   └────────┬──────────────────────────────────────────────────────┘
+///            │
+///            ▼
+///   ┌─ STRUCTURE ───────────────────────────────────────────────────┐
+///   │  Tabular, key-value, hierarchical, freeform → typed output    │
+///   └────────┬──────────────────────────────────────────────────────┘
+///            │
+///            ▼
+///   ┌─ IngestResult ────────────────────────────────────────────────┐
+///   │  Typed data + schema + provenance + quality metrics           │
+///   └───────────────────────────────────────────────────────────────┘
+
+module nrs_file_engine
+
+import os from "std/os"
+import json from "std/json"
+import re from "std/re"
+import io from "std/io"
+import time from "std/time"
+import hashlib from "std/hashlib"
+import logging from "std/logging"
+
+let logger = logging.getLogger("nrs.file-engine")
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  CORE TYPES
+// ═══════════════════════════════════════════════════════════════════
+
+enum DataShape {
+    TABULAR = "tabular",
+    KEY_VALUE = "key_value",
+    HIERARCHICAL = "hierarchical",
+    SEQUENTIAL = "sequential",
+    GRAPH = "graph",
+    FREEFORM = "freeform",
+    BINARY = "binary"
+}
+
+enum IngestQuality {
+    LOSSLESS = "lossless",
+    NEAR_LOSSLESS = "near_lossless",
+    LOSSY = "lossy",
+    PARTIAL = "partial",
+    FAILED = "failed"
+}
+
+type ColumnSchema {
+    name: string,
+    inferred_type: string,
+    nullable: bool,
+    sample_values: List[string],
+    unique_count: int
+}
+
+type DataSchema {
+    shape: string,
+    columns: List[ColumnSchema],
+    row_count: int,
+    column_count: int,
+    detected_domain: string,
+    detected_entities: List[string]
+}
+
+type IngestResult {
+    success: bool,
+    format_detected: string,
+    original_path: string,
+    data_text: string,
+    data_format: string,
+    data_shape: string,
+    schema: DataSchema,
+    quality: string,
+    records_count: int,
+    warnings: List[string],
+    sub_files: List[string],
+    provenance_hash: string,
+    handler_used: string,
+    handler_was_generated: bool,
+    elapsed_ms: float
+}
+
+type FormatHandler {
+    format_id: string,
+    extensions: List[string],
+    mime_types: List[string],
+    magic_bytes: List[bytes],
+    handler_fn: Any,
+    fallback_fns: List[Any],
+    is_generated: bool,
+    generation_source: string
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAGIC BYTE SIGNATURES
+// ═══════════════════════════════════════════════════════════════════
+
+let _MAGIC_SIGNATURES = {
+    b"\x50\x4b\x03\x04": "zip",
+    b"\x50\x4b\x05\x06": "zip",
+    b"\x1f\x8b": "gzip",
+    b"\x42\x5a\x68": "bz2",
+    b"\xfd\x37\x7a\x58\x5a": "xz",
+    b"\x04\x22\x4d\x18": "lz4",
+    b"\x28\xb5\x2f\xfd": "zstd",
+    b"\x89\x50\x4e\x47": "png",
+    b"\xff\xd8\xff": "jpeg",
+    b"\x47\x49\x46\x38": "gif",
+    b"\x49\x49\x2a\x00": "tiff",
+    b"\x4d\x4d\x00\x2a": "tiff",
+    b"\x42\x4d": "bmp",
+    b"\x25\x50\x44\x46": "pdf",
+    b"\xd0\xcf\x11\xe0": "ole2",
+    b"\x52\x61\x72\x21": "rar",
+    b"\x37\x7a\xbc\xaf": "7z",
+    b"\x50\x41\x52\x31": "parquet",
+    b"\x4f\x62\x6a\x01": "avro",
+    b"\x4f\x52\x43": "orc",
+    b"\x41\x52\x52\x4f\x57\x31": "arrow",
+    b"\x53\x51\x4c\x69\x74\x65": "sqlite",
+    b"\xd4\xc3\xb2\xa1": "pcap",
+    b"\xa1\xb2\xc3\xd4": "pcap",
+    b"\x0a\x0d\x0d\x0a": "pcapng"
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  FORMAT HANDLER REGISTRY
+// ═══════════════════════════════════════════════════════════════════
+
+class FormatRegistry {
+
+    fn init(self) {
+        self._handlers: Dict[string, FormatHandler] = {}
+        self._ext_map: Dict[string, string] = {}
+        self._mime_map: Dict[string, string] = {}
+        self._magic_map: Dict[bytes, string] = {}
+        self._generated_handlers: Dict[string, FormatHandler] = {}
+        self._register_builtins()
+    }
+
+    fn register(self, handler: FormatHandler) {
+        self._handlers[handler.format_id] = handler
+        for ext in handler.extensions {
+            self._ext_map[ext] = handler.format_id
+        }
+        for mime in handler.mime_types {
+            self._mime_map[mime] = handler.format_id
+        }
+        for magic in handler.magic_bytes {
+            self._magic_map[magic] = handler.format_id
+        }
+        if handler.is_generated {
+            self._generated_handlers[handler.format_id] = handler
+        }
+    }
+
+    fn lookup_by_extension(self, ext: string) -> Optional[FormatHandler] {
+        let fmt_id = self._ext_map.get(ext.lower(), None)
+        if fmt_id == None { return None }
+        return self._handlers.get(fmt_id, None)
+    }
+
+    fn lookup_by_mime(self, mime: string) -> Optional[FormatHandler] {
+        let fmt_id = self._mime_map.get(mime.lower(), None)
+        if fmt_id == None { return None }
+        return self._handlers.get(fmt_id, None)
+    }
+
+    fn lookup_by_magic(self, header_bytes: bytes) -> Optional[FormatHandler] {
+        for sig in self._magic_map {
+            if header_bytes[0:len(sig)] == sig {
+                let fmt_id = self._magic_map[sig]
+                return self._handlers.get(fmt_id, None)
+            }
+        }
+        return None
+    }
+
+    fn get_handler(self, format_id: string) -> Optional[FormatHandler] {
+        return self._handlers.get(format_id, None)
+    }
+
+    fn all_extensions(self) -> List[string] {
+        let exts: List[string] = []
+        for ext in self._ext_map { append(exts, ext) }
+        return exts
+    }
+
+    fn all_format_ids(self) -> List[string] {
+        let ids: List[string] = []
+        for fid in self._handlers { append(ids, fid) }
+        return ids
+    }
+
+    fn generated_count(self) -> int {
+        return len(self._generated_handlers)
+    }
+
+    fn _register_builtins(self) {
+        // Text pass-through formats
+        let text_exts = [".csv", ".tsv", ".txt", ".log", ".dat",
+                         ".json", ".jsonl", ".ndjson",
+                         ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+                         ".md", ".rst", ".tex"]
+        self.register(FormatHandler {
+            format_id: "text",
+            extensions: text_exts,
+            mime_types: ["text/plain", "text/csv", "text/tab-separated-values",
+                         "application/json", "application/xml", "text/xml",
+                         "application/x-yaml", "text/yaml", "text/markdown"],
+            magic_bytes: [],
+            handler_fn: _handle_text,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Spreadsheets
+        self.register(FormatHandler {
+            format_id: "excel",
+            extensions: [".xlsx", ".xls", ".ods", ".xlsm", ".xlsb"],
+            mime_types: ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                         "application/vnd.ms-excel",
+                         "application/vnd.oasis.opendocument.spreadsheet"],
+            magic_bytes: [],
+            handler_fn: _handle_excel,
+            fallback_fns: [_handle_excel_xlrd],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // PDF
+        self.register(FormatHandler {
+            format_id: "pdf",
+            extensions: [".pdf"],
+            mime_types: ["application/pdf"],
+            magic_bytes: [b"\x25\x50\x44\x46"],
+            handler_fn: _handle_pdf,
+            fallback_fns: [_handle_pdf_pypdf, _handle_pdf_cli],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Word documents
+        self.register(FormatHandler {
+            format_id: "docx",
+            extensions: [".docx"],
+            mime_types: ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+            magic_bytes: [],
+            handler_fn: _handle_docx,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "doc",
+            extensions: [".doc"],
+            mime_types: ["application/msword"],
+            magic_bytes: [],
+            handler_fn: _handle_doc_legacy,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "rtf",
+            extensions: [".rtf"],
+            mime_types: ["application/rtf", "text/rtf"],
+            magic_bytes: [],
+            handler_fn: _handle_rtf,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // HTML
+        self.register(FormatHandler {
+            format_id: "html",
+            extensions: [".html", ".htm", ".mhtml", ".xhtml"],
+            mime_types: ["text/html", "application/xhtml+xml"],
+            magic_bytes: [],
+            handler_fn: _handle_html,
+            fallback_fns: [_handle_html_regex],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Binary data formats
+        self.register(FormatHandler {
+            format_id: "parquet",
+            extensions: [".parquet"],
+            mime_types: ["application/x-parquet"],
+            magic_bytes: [b"\x50\x41\x52\x31"],
+            handler_fn: _handle_parquet,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "avro",
+            extensions: [".avro"],
+            mime_types: ["application/avro"],
+            magic_bytes: [b"\x4f\x62\x6a\x01"],
+            handler_fn: _handle_avro,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "arrow",
+            extensions: [".arrow", ".feather", ".ipc"],
+            mime_types: ["application/vnd.apache.arrow.file"],
+            magic_bytes: [],
+            handler_fn: _handle_arrow,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "orc",
+            extensions: [".orc"],
+            mime_types: [],
+            magic_bytes: [b"\x4f\x52\x43"],
+            handler_fn: _handle_orc,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Databases
+        self.register(FormatHandler {
+            format_id: "sqlite",
+            extensions: [".sqlite", ".db", ".sqlite3"],
+            mime_types: ["application/x-sqlite3"],
+            magic_bytes: [b"\x53\x51\x4c\x69\x74\x65"],
+            handler_fn: _handle_sqlite,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "access",
+            extensions: [".mdb", ".accdb"],
+            mime_types: ["application/x-msaccess"],
+            magic_bytes: [],
+            handler_fn: _handle_access,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Network captures
+        self.register(FormatHandler {
+            format_id: "pcap",
+            extensions: [".pcap", ".pcapng", ".cap"],
+            mime_types: ["application/vnd.tcpdump.pcap"],
+            magic_bytes: [b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x0a\x0d\x0d\x0a"],
+            handler_fn: _handle_pcap,
+            fallback_fns: [_handle_pcap_scapy],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // ASN.1 / telecom binary
+        self.register(FormatHandler {
+            format_id: "asn1",
+            extensions: [".asn1", ".ber", ".der", ".3gpp", ".cdr"],
+            mime_types: [],
+            magic_bytes: [],
+            handler_fn: _handle_asn1,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Compressed
+        self.register(FormatHandler {
+            format_id: "gzip",
+            extensions: [".gz"],
+            mime_types: ["application/gzip"],
+            magic_bytes: [b"\x1f\x8b"],
+            handler_fn: _handle_gzip,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "bz2",
+            extensions: [".bz2"],
+            mime_types: ["application/x-bzip2"],
+            magic_bytes: [b"\x42\x5a\x68"],
+            handler_fn: _handle_bz2,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "xz",
+            extensions: [".xz", ".lzma"],
+            mime_types: ["application/x-xz"],
+            magic_bytes: [b"\xfd\x37\x7a\x58\x5a"],
+            handler_fn: _handle_xz,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "zstd",
+            extensions: [".zst"],
+            mime_types: [],
+            magic_bytes: [b"\x28\xb5\x2f\xfd"],
+            handler_fn: _handle_zstd,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "lz4",
+            extensions: [".lz4"],
+            mime_types: [],
+            magic_bytes: [b"\x04\x22\x4d\x18"],
+            handler_fn: _handle_lz4,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Archives
+        self.register(FormatHandler {
+            format_id: "zip",
+            extensions: [".zip"],
+            mime_types: ["application/zip"],
+            magic_bytes: [b"\x50\x4b\x03\x04"],
+            handler_fn: _handle_zip,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "tar",
+            extensions: [".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.xz"],
+            mime_types: ["application/x-tar"],
+            magic_bytes: [],
+            handler_fn: _handle_tar,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "7z",
+            extensions: [".7z"],
+            mime_types: ["application/x-7z-compressed"],
+            magic_bytes: [b"\x37\x7a\xbc\xaf"],
+            handler_fn: _handle_7z,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "rar",
+            extensions: [".rar"],
+            mime_types: ["application/x-rar-compressed"],
+            magic_bytes: [b"\x52\x61\x72\x21"],
+            handler_fn: _handle_rar,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Images (OCR)
+        self.register(FormatHandler {
+            format_id: "image",
+            extensions: [".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif",
+                         ".webp", ".svg", ".ico"],
+            mime_types: ["image/png", "image/jpeg", "image/tiff", "image/bmp",
+                         "image/gif", "image/webp", "image/svg+xml"],
+            magic_bytes: [b"\x89\x50\x4e\x47", b"\xff\xd8\xff", b"\x47\x49\x46\x38",
+                          b"\x42\x4d", b"\x49\x49\x2a\x00", b"\x4d\x4d\x00\x2a"],
+            handler_fn: _handle_image,
+            fallback_fns: [_handle_image_cli],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Industry-specific: Ericsson OSS
+        self.register(FormatHandler {
+            format_id: "ericsson",
+            extensions: [".erl", ".oss"],
+            mime_types: [],
+            magic_bytes: [],
+            handler_fn: _handle_ericsson,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Performance logs
+        self.register(FormatHandler {
+            format_id: "perflog",
+            extensions: [".nmon", ".sar", ".iostat", ".vmstat"],
+            mime_types: [],
+            magic_bytes: [],
+            handler_fn: _handle_perflog,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Email
+        self.register(FormatHandler {
+            format_id: "email",
+            extensions: [".eml", ".msg", ".mbox"],
+            mime_types: ["message/rfc822"],
+            magic_bytes: [],
+            handler_fn: _handle_email,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Protobuf / MessagePack / CBOR
+        self.register(FormatHandler {
+            format_id: "msgpack",
+            extensions: [".msgpack", ".mp"],
+            mime_types: ["application/msgpack"],
+            magic_bytes: [],
+            handler_fn: _handle_msgpack,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "cbor",
+            extensions: [".cbor"],
+            mime_types: ["application/cbor"],
+            magic_bytes: [],
+            handler_fn: _handle_cbor,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // HDF5 / NetCDF (scientific)
+        self.register(FormatHandler {
+            format_id: "hdf5",
+            extensions: [".h5", ".hdf5", ".hdf", ".he5"],
+            mime_types: ["application/x-hdf5"],
+            magic_bytes: [b"\x89\x48\x44\x46"],
+            handler_fn: _handle_hdf5,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "netcdf",
+            extensions: [".nc", ".nc4", ".netcdf"],
+            mime_types: ["application/x-netcdf"],
+            magic_bytes: [b"\x43\x44\x46"],
+            handler_fn: _handle_netcdf,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // DICOM (medical)
+        self.register(FormatHandler {
+            format_id: "dicom",
+            extensions: [".dcm", ".dicom"],
+            mime_types: ["application/dicom"],
+            magic_bytes: [],
+            handler_fn: _handle_dicom,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // FITS (astronomy)
+        self.register(FormatHandler {
+            format_id: "fits",
+            extensions: [".fits", ".fit", ".fts"],
+            mime_types: ["application/fits"],
+            magic_bytes: [b"\x53\x49\x4d\x50\x4c\x45"],
+            handler_fn: _handle_fits,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Shapefile / GeoJSON (GIS)
+        self.register(FormatHandler {
+            format_id: "geojson",
+            extensions: [".geojson"],
+            mime_types: ["application/geo+json"],
+            magic_bytes: [],
+            handler_fn: _handle_geojson,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+        self.register(FormatHandler {
+            format_id: "shapefile",
+            extensions: [".shp", ".shx", ".dbf"],
+            mime_types: ["application/x-shapefile"],
+            magic_bytes: [],
+            handler_fn: _handle_shapefile,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Audio metadata
+        self.register(FormatHandler {
+            format_id: "audio",
+            extensions: [".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a", ".wma"],
+            mime_types: ["audio/wav", "audio/mpeg", "audio/flac"],
+            magic_bytes: [],
+            handler_fn: _handle_audio_metadata,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+
+        // Video metadata
+        self.register(FormatHandler {
+            format_id: "video",
+            extensions: [".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv"],
+            mime_types: ["video/mp4", "video/x-matroska"],
+            magic_bytes: [],
+            handler_fn: _handle_video_metadata,
+            fallback_fns: [],
+            is_generated: false,
+            generation_source: ""
+        })
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  STRUCTURE DETECTOR
+// ═══════════════════════════════════════════════════════════════════
+
+class StructureDetector {
+
+    fn init(self) {
+        self._kv_re = re.compile(r"^(.+?)[:=]\s*(.+)$")
+        self._delimiters = [",", "\t", "|", ";", "::"]
+    }
+
+    fn detect_shape(self, text: string) -> string {
+        let trimmed = text.strip()
+        if len(trimmed) == 0 { return "freeform" }
+
+        // JSON object or array
+        if trimmed[0] == "{" or trimmed[0] == "[" {
+            try {
+                json.loads(trimmed)
+                if trimmed[0] == "[" { return "tabular" }
+                return "hierarchical"
+            } catch {}
+        }
+
+        // XML
+        if trimmed[0:1] == "<" and ">" in trimmed[0:100] { return "hierarchical" }
+
+        let lines = trimmed.split("\n")
+
+        // Delimited tabular
+        for delim in self._delimiters {
+            if self._is_consistent_delimiter(lines, delim) { return "tabular" }
+        }
+
+        // Fixed-width
+        if self._is_fixed_width(lines) { return "tabular" }
+
+        // Key-value
+        let kv_count = 0
+        let check = min(30, len(lines))
+        for i in range(check) {
+            if self._kv_re.match(lines[i].strip()) != None { kv_count = kv_count + 1 }
+        }
+        if float(kv_count) / float(max(check, 1)) > 0.5 { return "key_value" }
+
+        // Sequential (numbered lines, log entries)
+        let seq_count = 0
+        for i in range(check) {
+            if re.match(r"^\s*\d+[\.\)]\s+", lines[i]) != None { seq_count = seq_count + 1 }
+        }
+        if float(seq_count) / float(max(check, 1)) > 0.5 { return "sequential" }
+
+        return "freeform"
+    }
+
+    fn _is_consistent_delimiter(self, lines: List[string], delim: string) -> bool {
+        if len(lines) < 2 { return false }
+        let check = min(20, len(lines))
+        let counts: List[int] = []
+        for i in range(check) {
+            append(counts, lines[i].count(delim))
+        }
+        if counts[0] == 0 { return false }
+        let consistent = 0
+        for c in counts {
+            if c == counts[0] { consistent = consistent + 1 }
+        }
+        return float(consistent) / float(check) > 0.7
+    }
+
+    fn _is_fixed_width(self, lines: List[string]) -> bool {
+        if len(lines) < 3 { return false }
+        let space_cols: Dict[int, int] = {}
+        let check = min(20, len(lines))
+        for i in range(check) {
+            let line = lines[i]
+            let in_run = false
+            for j in range(len(line)) {
+                if line[j] == " " {
+                    if !in_run and j > 0 {
+                        if j not in space_cols { space_cols[j] = 0 }
+                        space_cols[j] = space_cols[j] + 1
+                    }
+                    in_run = true
+                } else {
+                    in_run = false
+                }
+            }
+        }
+        let threshold = int(check * 0.6)
+        let consistent = 0
+        for pos in space_cols {
+            if space_cols[pos] >= threshold { consistent = consistent + 1 }
+        }
+        return consistent >= 3
+    }
+
+    fn infer_schema(self, text: string, shape: string) -> DataSchema {
+        let lines = text.strip().split("\n")
+        let columns: List[ColumnSchema] = []
+        let row_count = max(len(lines) - 1, 0)
+        let col_count = 0
+        let domain = "unknown"
+        let entities: List[string] = []
+
+        if shape == "tabular" and len(lines) > 1 {
+            let header = lines[0]
+            let delim = self._detect_delimiter(header)
+            let col_names = header.split(delim)
+            col_count = len(col_names)
+
+            for idx in range(len(col_names)) {
+                let name = col_names[idx].strip().strip('"')
+                let samples: List[string] = []
+                let unique_vals: Dict[string, bool] = {}
+                let nullable = false
+
+                let sample_count = min(50, len(lines) - 1)
+                for r in range(1, sample_count + 1) {
+                    if r >= len(lines) { break }
+                    let row_parts = lines[r].split(delim)
+                    if idx < len(row_parts) {
+                        let val = row_parts[idx].strip().strip('"')
+                        if val == "" or val == "null" or val == "None" or val == "NA" {
+                            nullable = true
+                        } else {
+                            if len(samples) < 5 { append(samples, val) }
+                            unique_vals[val] = true
+                        }
+                    }
+                }
+
+                let inferred = self._infer_type(samples)
+                append(columns, ColumnSchema {
+                    name: name,
+                    inferred_type: inferred,
+                    nullable: nullable,
+                    sample_values: samples,
+                    unique_count: len(unique_vals)
+                })
+            }
+
+            domain = self._detect_domain(col_names)
+            entities = self._detect_entities(col_names)
+        }
+
+        return DataSchema {
+            shape: shape,
+            columns: columns,
+            row_count: row_count,
+            column_count: col_count,
+            detected_domain: domain,
+            detected_entities: entities
+        }
+    }
+
+    fn _detect_delimiter(self, line: string) -> string {
+        let best_delim = ","
+        let best_count = 0
+        for delim in self._delimiters {
+            let count = line.count(delim)
+            if count > best_count {
+                best_count = count
+                best_delim = delim
+            }
+        }
+        return best_delim
+    }
+
+    fn _infer_type(self, samples: List[string]) -> string {
+        if len(samples) == 0 { return "string" }
+        let all_int = true
+        let all_float = true
+        let all_bool = true
+        let all_date = true
+
+        for s in samples {
+            try { int(s) } catch { all_int = false }
+            try { float(s) } catch { all_float = false }
+            if s.lower() not in ["true", "false", "0", "1", "yes", "no"] { all_bool = false }
+            if !re.match(r"\d{4}[-/]\d{2}[-/]\d{2}", s) { all_date = false }
+        }
+
+        if all_int { return "integer" }
+        if all_float { return "float" }
+        if all_bool { return "boolean" }
+        if all_date { return "datetime" }
+        return "string"
+    }
+
+    fn _detect_domain(self, col_names: List[string]) -> string {
+        let lower_cols = []
+        for c in col_names { append(lower_cols, c.lower().strip()) }
+        let joined = join(lower_cols, " ")
+
+        let domain_signals = {
+            "telecom": ["cell", "tower", "lac", "rnc", "msc", "smsc", "imsi", "earfcn", "bts", "handover"],
+            "finance": ["account", "transaction", "balance", "debit", "credit", "currency", "portfolio", "ticker"],
+            "healthcare": ["patient", "diagnosis", "icd", "medication", "dosage", "vitals", "bp", "heart_rate"],
+            "manufacturing": ["machine", "sensor", "oee", "downtime", "defect", "batch", "yield", "tolerance"],
+            "logistics": ["shipment", "tracking", "warehouse", "route", "delivery", "carrier", "sku", "inventory"],
+            "energy": ["meter", "kwh", "voltage", "transformer", "outage", "load", "generation", "grid"],
+            "agriculture": ["crop", "soil", "moisture", "yield", "fertilizer", "irrigation", "harvest", "ndvi"],
+            "cybersecurity": ["alert", "threat", "cve", "firewall", "intrusion", "malware", "incident", "ioc"],
+            "environmental": ["emission", "pollutant", "aqi", "co2", "temperature", "humidity", "precipitation"],
+            "retail": ["product", "sku", "price", "discount", "customer", "order", "cart", "revenue"],
+            "education": ["student", "grade", "course", "enrollment", "gpa", "attendance", "score"],
+            "legal": ["case", "statute", "plaintiff", "defendant", "ruling", "docket", "citation"],
+            "real_estate": ["property", "listing", "sqft", "bedroom", "mortgage", "appraisal", "zoning"],
+            "aviation": ["flight", "altitude", "airspeed", "waypoint", "runway", "squawk", "metar"],
+            "maritime": ["vessel", "imo", "mmsi", "port", "draft", "cargo", "ais", "berth"],
+            "oil_gas": ["well", "reservoir", "boe", "drilling", "casing", "perforation", "psi"]
+        }
+
+        let best_domain = "general"
+        let best_score = 0
+        for domain in domain_signals {
+            let score = 0
+            for signal in domain_signals[domain] {
+                if signal in joined { score = score + 1 }
+            }
+            if score > best_score {
+                best_score = score
+                best_domain = domain
+            }
+        }
+
+        return best_domain
+    }
+
+    fn _detect_entities(self, col_names: List[string]) -> List[string] {
+        let entities: List[string] = []
+        let id_patterns = ["_id", "id_", "code", "number", "key", "name"]
+        for col in col_names {
+            let lower = col.lower()
+            for pat in id_patterns {
+                if pat in lower {
+                    append(entities, col)
+                    break
+                }
+            }
+        }
+        return entities
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  TEXT STRUCTURING UTILITIES
+// ═══════════════════════════════════════════════════════════════════
+
+fn _csv_escape(val: string) -> string {
+    if "," in val or '"' in val or "\n" in val {
+        return '"' + val.replace('"', '""') + '"'
+    }
+    return val
+}
+
+fn _fixed_width_to_csv(lines: List[string]) -> string {
+    if len(lines) < 2 { return join(lines, "\n") }
+
+    let max_len = 0
+    for line in lines {
+        if len(line) > max_len { max_len = len(line) }
+    }
+
+    let char_counts: List[int] = []
+    for i in range(max_len) { append(char_counts, 0) }
+
+    let sample = min(50, len(lines))
+    for i in range(sample) {
+        for j in range(len(lines[i])) {
+            if lines[i][j] != " " { char_counts[j] = char_counts[j] + 1 }
+        }
+    }
+
+    let gap_threshold = int(sample * 0.3)
+    let boundaries: List[List[int]] = []
+    let in_gap = true
+    let col_start = 0
+
+    for pos in range(max_len) {
+        let is_gap = char_counts[pos] < gap_threshold
+        if in_gap and !is_gap {
+            col_start = pos
+            in_gap = false
+        }
+        if !in_gap and is_gap {
+            append(boundaries, [col_start, pos])
+            in_gap = true
+        }
+    }
+    if !in_gap { append(boundaries, [col_start, max_len]) }
+
+    let csv_rows: List[string] = []
+    for line in lines {
+        if len(line.strip()) == 0 { continue }
+        let stripped = line.strip()
+        let is_sep = true
+        for ch in stripped {
+            if ch != "-" and ch != "=" and ch != "+" and ch != "|" and ch != " " {
+                is_sep = false
+                break
+            }
+        }
+        if is_sep and len(stripped) > 2 { continue }
+
+        let cells: List[string] = []
+        for b in boundaries {
+            let s = b[0]
+            let e = min(b[1], len(line))
+            let val = ""
+            if s < len(line) { val = line[s:e].strip() }
+            append(cells, _csv_escape(val))
+        }
+        append(csv_rows, join(cells, ","))
+    }
+    return join(csv_rows, "\n")
+}
+
+fn _kv_to_csv(text: string) -> string {
+    let kv_re = re.compile(r"^(.+?)[:=]\s*(.+)$")
+    let lines = text.strip().split("\n")
+    let records: List[Dict[string, string]] = []
+    let current: Dict[string, string] = {}
+
+    for line in lines {
+        let stripped = line.strip()
+        if len(stripped) == 0 {
+            if len(current) > 0 {
+                append(records, current)
+                current = {}
+            }
+            continue
+        }
+        let m = kv_re.match(stripped)
+        if m != None {
+            current[m.group(1).strip()] = m.group(2).strip()
+        }
+    }
+    if len(current) > 0 { append(records, current) }
+    if len(records) == 0 { return text }
+
+    let all_keys: List[string] = []
+    for rec in records {
+        for k in rec {
+            if k not in all_keys { append(all_keys, k) }
+        }
+    }
+
+    let rows: List[string] = [join([_csv_escape(k) for k in all_keys], ",")]
+    for rec in records {
+        let cells: List[string] = []
+        for k in all_keys {
+            append(cells, _csv_escape(rec.get(k, "")))
+        }
+        append(rows, join(cells, ","))
+    }
+    return join(rows, "\n")
+}
+
+fn _delimited_to_csv(text: string, delim: string) -> string {
+    if delim == "," { return text }
+    let lines = text.strip().split("\n")
+    let csv_lines: List[string] = []
+    for line in lines {
+        let parts = line.split(delim)
+        let cells: List[string] = []
+        for p in parts { append(cells, _csv_escape(p.strip())) }
+        append(csv_lines, join(cells, ","))
+    }
+    return join(csv_lines, "\n")
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  BUILT-IN HANDLERS (each returns (text, format, warnings))
+// ═══════════════════════════════════════════════════════════════════
+
+fn _handle_text(path: string) -> Tuple[string, string, List[string]] {
+    let f = open(path, "r", encoding="utf-8", errors="replace")
+    let text = f.read()
+    f.close()
+    return (text, "auto", [])
+}
+
+fn _handle_excel(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let openpyxl = __import__("openpyxl")
+        let wb = openpyxl.load_workbook(path, read_only=true, data_only=true)
+        let csv_parts: List[string] = []
+        for sheet_name in wb.sheetnames {
+            let ws = wb[sheet_name]
+            let rows: List[string] = []
+            for row in ws.iter_rows(values_only=true) {
+                let cells: List[string] = []
+                for cell in row {
+                    append(cells, _csv_escape(str(cell) if cell != None else ""))
+                }
+                append(rows, join(cells, ","))
+            }
+            if len(rows) > 0 { append(csv_parts, join(rows, "\n")) }
+        }
+        wb.close()
+        return (join(csv_parts, "\n"), "csv", warnings)
+    } catch as e {
+        append(warnings, "openpyxl: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_excel_xlrd(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let xlrd = __import__("xlrd")
+        let wb = xlrd.open_workbook(path)
+        let csv_parts: List[string] = []
+        for idx in range(wb.nsheets) {
+            let ws = wb.sheet_by_index(idx)
+            let rows: List[string] = []
+            for r in range(ws.nrows) {
+                let cells: List[string] = []
+                for c in range(ws.ncols) { append(cells, _csv_escape(str(ws.cell_value(r, c)))) }
+                append(rows, join(cells, ","))
+            }
+            if len(rows) > 0 { append(csv_parts, join(rows, "\n")) }
+        }
+        return (join(csv_parts, "\n"), "csv", warnings)
+    } catch as e {
+        append(warnings, "xlrd: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_pdf(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let pdfplumber = __import__("pdfplumber")
+        let pdf = pdfplumber.open(path)
+        let all_rows: List[string] = []
+        let header_done = false
+        for page in pdf.pages {
+            let tables = page.extract_tables()
+            for table in tables {
+                for ri in range(len(table)) {
+                    let row = table[ri]
+                    if ri == 0 and !header_done {
+                        let hdr: List[string] = []
+                        for c in row { append(hdr, _csv_escape(str(c).replace("\n", " ") if c != None else "")) }
+                        append(all_rows, join(hdr, ","))
+                        header_done = true
+                        continue
+                    }
+                    if ri == 0 and header_done { continue }
+                    let cells: List[string] = []
+                    for c in row { append(cells, _csv_escape(str(c).replace("\n", " ") if c != None else "")) }
+                    append(all_rows, join(cells, ","))
+                }
+            }
+            if len(tables) == 0 {
+                let pt = page.extract_text()
+                if pt != None and len(pt.strip()) > 0 { append(all_rows, pt) }
+            }
+        }
+        pdf.close()
+        return (join(all_rows, "\n"), "csv", warnings)
+    } catch as e {
+        append(warnings, "pdfplumber: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_pdf_pypdf(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let pypdf = __import__("pypdf")
+        let reader = pypdf.PdfReader(path)
+        let parts: List[string] = []
+        for page in reader.pages {
+            let t = page.extract_text()
+            if t != None { append(parts, t) }
+        }
+        return (join(parts, "\n"), "auto", warnings)
+    } catch as e {
+        append(warnings, "pypdf: " + str(e))
+        return ("", "auto", warnings)
+    }
+}
+
+fn _handle_pdf_cli(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let subprocess = __import__("subprocess")
+        let proc = subprocess.run(["pdftotext", "-layout", path, "-"],
+                                   capture_output=true, text=true, timeout=60)
+        if proc.returncode == 0 { return (proc.stdout, "auto", warnings) }
+        append(warnings, "pdftotext exit " + str(proc.returncode))
+    } catch as e {
+        append(warnings, "pdftotext: " + str(e))
+    }
+    return ("", "auto", warnings)
+}
+
+fn _handle_docx(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let docx = __import__("docx")
+        let doc = docx.Document(path)
+        let parts: List[string] = []
+        for table in doc.tables {
+            let rows: List[string] = []
+            for row in table.rows {
+                let cells: List[string] = []
+                for cell in row.cells { append(cells, _csv_escape(cell.text.replace("\n", " "))) }
+                append(rows, join(cells, ","))
+            }
+            append(parts, join(rows, "\n"))
+        }
+        if len(parts) == 0 {
+            let paras: List[string] = []
+            for p in doc.paragraphs {
+                if len(p.text.strip()) > 0 { append(paras, p.text) }
+            }
+            return (join(paras, "\n"), "auto", warnings)
+        }
+        return (join(parts, "\n"), "csv", warnings)
+    } catch as e {
+        append(warnings, "python-docx: " + str(e))
+        return ("", "auto", warnings)
+    }
+}
+
+fn _handle_doc_legacy(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let subprocess = __import__("subprocess")
+        let proc = subprocess.run(["antiword", path], capture_output=true, text=true, timeout=30)
+        if proc.returncode == 0 { return (proc.stdout, "auto", warnings) }
+    } catch as e { append(warnings, "antiword: " + str(e)) }
+    return ("", "auto", warnings)
+}
+
+fn _handle_rtf(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let striprtf = __import__("striprtf.striprtf")
+        let f = open(path, "r", encoding="utf-8", errors="replace")
+        let raw = f.read()
+        f.close()
+        return (striprtf.striprtf.rtf_to_text(raw), "auto", warnings)
+    } catch as e {
+        append(warnings, "striprtf: " + str(e))
+        let f = open(path, "r", encoding="utf-8", errors="replace")
+        let raw = f.read()
+        f.close()
+        let cleaned = re.sub(r"\\[a-z]+\d*\s?", " ", raw)
+        cleaned = re.sub(r"[{}]", "", cleaned)
+        return (cleaned, "auto", warnings)
+    }
+}
+
+fn _handle_html(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    let f = open(path, "r", encoding="utf-8", errors="replace")
+    let raw = f.read()
+    f.close()
+    try {
+        let bs4 = __import__("bs4")
+        let soup = bs4.BeautifulSoup(raw, "html.parser")
+        let tables = soup.find_all("table")
+        if len(tables) > 0 {
+            let rows: List[string] = []
+            for table in tables {
+                for tr in table.find_all("tr") {
+                    let cells: List[string] = []
+                    for td in tr.find_all(["td", "th"]) {
+                        append(cells, _csv_escape(td.get_text(strip=true)))
+                    }
+                    append(rows, join(cells, ","))
+                }
+            }
+            return (join(rows, "\n"), "csv", warnings)
+        }
+        return (soup.get_text("\n", strip=true), "auto", warnings)
+    } catch as e {
+        append(warnings, "bs4: " + str(e))
+        return ("", "auto", warnings)
+    }
+}
+
+fn _handle_html_regex(path: string) -> Tuple[string, string, List[string]] {
+    let f = open(path, "r", encoding="utf-8", errors="replace")
+    let raw = f.read()
+    f.close()
+    return (re.sub(r"<[^>]+>", " ", raw), "auto", [])
+}
+
+fn _handle_parquet(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let pd = __import__("pandas")
+        return (pd.read_parquet(path).to_csv(index=false), "csv", warnings)
+    } catch as e {
+        append(warnings, "pandas parquet: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_avro(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let fastavro = __import__("fastavro")
+        let f = open(path, "rb")
+        let lines: List[string] = []
+        for rec in fastavro.reader(f) { append(lines, json.dumps(rec)) }
+        f.close()
+        return (join(lines, "\n"), "json", warnings)
+    } catch as e {
+        append(warnings, "fastavro: " + str(e))
+        return ("", "json", warnings)
+    }
+}
+
+fn _handle_arrow(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let pd = __import__("pandas")
+        return (pd.read_feather(path).to_csv(index=false), "csv", warnings)
+    } catch as e {
+        append(warnings, "feather: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_orc(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let pa_orc = __import__("pyarrow.orc")
+        let pd = __import__("pandas")
+        return (pa_orc.orc.read_table(path).to_pandas().to_csv(index=false), "csv", warnings)
+    } catch as e {
+        append(warnings, "orc: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_sqlite(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let sqlite3 = __import__("sqlite3")
+        let conn = sqlite3.connect(path)
+        let cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        let parts: List[string] = []
+        for row in cur.fetchall() {
+            let tbl = row[0]
+            if tbl.startswith("sqlite_") { continue }
+            cur.execute("PRAGMA table_info('" + tbl + "')")
+            let cols = [c[1] for c in cur.fetchall()]
+            cur.execute("SELECT * FROM '" + tbl + "'")
+            let rows: List[string] = [join(cols, ",")]
+            for r in cur.fetchall() {
+                append(rows, join([_csv_escape(str(c) if c != None else "") for c in r], ","))
+            }
+            append(parts, join(rows, "\n"))
+        }
+        conn.close()
+        return (join(parts, "\n"), "csv", warnings)
+    } catch as e {
+        append(warnings, "sqlite: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_access(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let subprocess = __import__("subprocess")
+        let proc = subprocess.run(["mdb-tables", "-1", path], capture_output=true, text=true, timeout=30)
+        if proc.returncode != 0 { return ("", "csv", ["mdb-tables failed"]) }
+        let parts: List[string] = []
+        for tbl in proc.stdout.strip().split("\n") {
+            if len(tbl.strip()) == 0 { continue }
+            let ep = subprocess.run(["mdb-export", path, tbl.strip()], capture_output=true, text=true, timeout=60)
+            if ep.returncode == 0 and len(ep.stdout.strip()) > 0 { append(parts, ep.stdout.strip()) }
+        }
+        return (join(parts, "\n"), "csv", warnings)
+    } catch as e {
+        append(warnings, "mdbtools: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_pcap(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let subprocess = __import__("subprocess")
+        let proc = subprocess.run(
+            ["tshark", "-r", path, "-T", "fields",
+             "-e", "frame.time_epoch", "-e", "ip.src", "-e", "ip.dst",
+             "-e", "frame.protocols", "-e", "frame.len",
+             "-E", "header=y", "-E", "separator=,"],
+            capture_output=true, text=true, timeout=120)
+        if proc.returncode == 0 { return (proc.stdout, "csv", warnings) }
+    } catch as e { append(warnings, "tshark: " + str(e)) }
+    return ("", "csv", warnings)
+}
+
+fn _handle_pcap_scapy(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let scapy = __import__("scapy.all")
+        let pkts = scapy.all.rdpcap(path)
+        let rows: List[string] = ["timestamp,src,dst,protocol,length"]
+        for pkt in pkts {
+            let ts = str(float(pkt.time))
+            let src = pkt.sprintf("%IP.src%") if pkt.haslayer("IP") else ""
+            let dst = pkt.sprintf("%IP.dst%") if pkt.haslayer("IP") else ""
+            append(rows, ts + "," + src + "," + dst + "," + str(pkt.lastlayer().name) + "," + str(len(pkt)))
+        }
+        return (join(rows, "\n"), "csv", warnings)
+    } catch as e {
+        append(warnings, "scapy: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_asn1(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let pyasn1_dec = __import__("pyasn1.codec.ber.decoder")
+        let f = open(path, "rb")
+        let raw = f.read()
+        f.close()
+        let decoded = pyasn1_dec.codec.ber.decoder.decode(raw)
+        return (str(decoded[0]), "json", warnings)
+    } catch as e {
+        append(warnings, "pyasn1: " + str(e))
+        return ("", "json", warnings)
+    }
+}
+
+fn _handle_gzip(path: string) -> Tuple[string, string, List[string]] {
+    let gzip = __import__("gzip")
+    let f = gzip.open(path, "rb")
+    let data = f.read()
+    f.close()
+    return (data, "__compressed__", [])
+}
+
+fn _handle_bz2(path: string) -> Tuple[string, string, List[string]] {
+    let bz2 = __import__("bz2")
+    let f = bz2.open(path, "rb")
+    let data = f.read()
+    f.close()
+    return (data, "__compressed__", [])
+}
+
+fn _handle_xz(path: string) -> Tuple[string, string, List[string]] {
+    let lzma = __import__("lzma")
+    let f = lzma.open(path, "rb")
+    let data = f.read()
+    f.close()
+    return (data, "__compressed__", [])
+}
+
+fn _handle_zstd(path: string) -> Tuple[string, string, List[string]] {
+    let zstd = __import__("zstandard")
+    let f = open(path, "rb")
+    let data = zstd.ZstdDecompressor().decompress(f.read())
+    f.close()
+    return (data, "__compressed__", [])
+}
+
+fn _handle_lz4(path: string) -> Tuple[string, string, List[string]] {
+    let lz4f = __import__("lz4.frame")
+    let f = open(path, "rb")
+    let data = lz4f.frame.decompress(f.read())
+    f.close()
+    return (data, "__compressed__", [])
+}
+
+fn _handle_zip(path: string) -> Tuple[string, string, List[string]] {
+    return (path, "__archive__", [])
+}
+
+fn _handle_tar(path: string) -> Tuple[string, string, List[string]] {
+    return (path, "__archive__", [])
+}
+
+fn _handle_7z(path: string) -> Tuple[string, string, List[string]] {
+    return (path, "__archive__", [])
+}
+
+fn _handle_rar(path: string) -> Tuple[string, string, List[string]] {
+    return (path, "__archive__", [])
+}
+
+fn _handle_image(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let pytesseract = __import__("pytesseract")
+        let PIL = __import__("PIL.Image")
+        let img = PIL.Image.open(path)
+        return (pytesseract.image_to_string(img), "auto", warnings)
+    } catch as e {
+        append(warnings, "pytesseract: " + str(e))
+        return ("", "auto", warnings)
+    }
+}
+
+fn _handle_image_cli(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let subprocess = __import__("subprocess")
+        let proc = subprocess.run(["tesseract", path, "stdout"], capture_output=true, text=true, timeout=60)
+        if proc.returncode == 0 { return (proc.stdout, "auto", warnings) }
+    } catch as e { append(warnings, "tesseract: " + str(e)) }
+    return ("", "auto", warnings)
+}
+
+fn _handle_ericsson(path: string) -> Tuple[string, string, List[string]] {
+    let f = open(path, "r", encoding="utf-8", errors="replace")
+    let raw = f.read()
+    f.close()
+    let lines = raw.split("\n")
+    let data_start = 0
+    for i in range(len(lines)) {
+        let line = lines[i].strip()
+        if line.startswith("%") or line.startswith("#") or line.startswith("!") {
+            data_start = i + 1
+            continue
+        }
+        if ";" in line or "\t" in line { data_start = i; break }
+        break
+    }
+    let text = join(lines[data_start:], "\n")
+    if ";" in text and "," not in text { text = text.replace(";", ",") }
+    return (text, "csv", [])
+}
+
+fn _handle_perflog(path: string) -> Tuple[string, string, List[string]] {
+    let f = open(path, "r", encoding="utf-8", errors="replace")
+    let raw = f.read()
+    f.close()
+    return (raw, "auto", [])
+}
+
+fn _handle_email(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let email_mod = __import__("email")
+        let email_policy = __import__("email.policy")
+        let f = open(path, "r", encoding="utf-8", errors="replace")
+        let msg = email_mod.message_from_file(f, policy=email_policy.policy.default)
+        f.close()
+        let body = msg.get_body(preferencelist=("plain",))
+        let text = body.get_content() if body != None else ""
+        let header_csv = "from,to,subject,date\n"
+        header_csv = header_csv + _csv_escape(str(msg["from"])) + ","
+        header_csv = header_csv + _csv_escape(str(msg["to"])) + ","
+        header_csv = header_csv + _csv_escape(str(msg["subject"])) + ","
+        header_csv = header_csv + _csv_escape(str(msg["date"]))
+        return (header_csv + "\n\n" + text, "auto", warnings)
+    } catch as e {
+        append(warnings, "email: " + str(e))
+        return ("", "auto", warnings)
+    }
+}
+
+fn _handle_msgpack(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let msgpack = __import__("msgpack")
+        let f = open(path, "rb")
+        let data = msgpack.unpack(f, raw=false)
+        f.close()
+        return (json.dumps(data, default=str), "json", warnings)
+    } catch as e {
+        append(warnings, "msgpack: " + str(e))
+        return ("", "json", warnings)
+    }
+}
+
+fn _handle_cbor(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let cbor2 = __import__("cbor2")
+        let f = open(path, "rb")
+        let data = cbor2.load(f)
+        f.close()
+        return (json.dumps(data, default=str), "json", warnings)
+    } catch as e {
+        append(warnings, "cbor2: " + str(e))
+        return ("", "json", warnings)
+    }
+}
+
+fn _handle_hdf5(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let h5py = __import__("h5py")
+        let f = h5py.File(path, "r")
+        let parts: List[string] = []
+        fn _visit(name, obj) {
+            if hasattr(obj, "shape") {
+                let pd = __import__("pandas")
+                let np = __import__("numpy")
+                // In Python h5py "obj[()]" reads the full dataset.
+                // We use numpy.array() here because the NRSI parser does
+                // not yet support empty-tuple subscripts.
+                let df = pd.DataFrame(np.array(obj))
+                append(parts, df.to_csv(index=false))
+            }
+        }
+        f.visititems(_visit)
+        f.close()
+        return (join(parts, "\n"), "csv", warnings)
+    } catch as e {
+        append(warnings, "h5py: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_netcdf(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let xr = __import__("xarray")
+        let ds = xr.open_dataset(path)
+        let pd = __import__("pandas")
+        return (ds.to_dataframe().to_csv(), "csv", warnings)
+    } catch as e {
+        append(warnings, "xarray: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_dicom(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let pydicom = __import__("pydicom")
+        let ds = pydicom.dcmread(path)
+        let kv: List[string] = ["tag,name,value"]
+        for elem in ds {
+            if elem.VR != "SQ" and elem.VR != "OB" and elem.VR != "OW" {
+                append(kv, _csv_escape(str(elem.tag)) + "," + _csv_escape(str(elem.name)) + "," + _csv_escape(str(elem.value)))
+            }
+        }
+        return (join(kv, "\n"), "csv", warnings)
+    } catch as e {
+        append(warnings, "pydicom: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_fits(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let astropy_fits = __import__("astropy.io.fits")
+        let hdul = astropy_fits.io.fits.open(path)
+        let parts: List[string] = []
+        for hdu in hdul {
+            if hasattr(hdu, "columns") and hdu.columns != None {
+                let pd = __import__("pandas")
+                let df = pd.DataFrame(hdu.data)
+                append(parts, df.to_csv(index=false))
+            }
+        }
+        hdul.close()
+        return (join(parts, "\n"), "csv", warnings)
+    } catch as e {
+        append(warnings, "astropy: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_geojson(path: string) -> Tuple[string, string, List[string]] {
+    let f = open(path, "r", encoding="utf-8")
+    let text = f.read()
+    f.close()
+    return (text, "json", [])
+}
+
+fn _handle_shapefile(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let gpd = __import__("geopandas")
+        let df = gpd.read_file(path)
+        return (df.to_csv(index=false), "csv", warnings)
+    } catch as e {
+        append(warnings, "geopandas: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_audio_metadata(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let mutagen = __import__("mutagen")
+        let audio = mutagen.File(path)
+        if audio == None { return ("", "csv", ["Not a recognized audio file"]) }
+        let rows: List[string] = ["key,value"]
+        for key in audio {
+            append(rows, _csv_escape(str(key)) + "," + _csv_escape(str(audio[key])))
+        }
+        if hasattr(audio, "info") {
+            let info = audio.info
+            if hasattr(info, "length") { append(rows, "duration_sec," + str(info.length)) }
+            if hasattr(info, "sample_rate") { append(rows, "sample_rate," + str(info.sample_rate)) }
+            if hasattr(info, "channels") { append(rows, "channels," + str(info.channels)) }
+            if hasattr(info, "bitrate") { append(rows, "bitrate," + str(info.bitrate)) }
+        }
+        return (join(rows, "\n"), "csv", warnings)
+    } catch as e {
+        append(warnings, "mutagen: " + str(e))
+        return ("", "csv", warnings)
+    }
+}
+
+fn _handle_video_metadata(path: string) -> Tuple[string, string, List[string]] {
+    let warnings: List[string] = []
+    try {
+        let subprocess = __import__("subprocess")
+        let proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path],
+            capture_output=true, text=true, timeout=30)
+        if proc.returncode == 0 { return (proc.stdout, "json", warnings) }
+    } catch as e { append(warnings, "ffprobe: " + str(e)) }
+    return ("", "json", warnings)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN ENGINE
+// ═══════════════════════════════════════════════════════════════════
+
+class NRSFileEngine {
+
+    fn init(self) {
+        self._registry = FormatRegistry()
+        self._detector = StructureDetector()
+        self._parser_factory = None
+    }
+
+    fn set_parser_factory(self, factory: Any) {
+        self._parser_factory = factory
+    }
+
+    fn ingest(self, path: string) -> IngestResult {
+        let t0 = time.time()
+        let warnings: List[string] = []
+
+        if !os.path.isfile(path) {
+            return self._fail("File not found: " + path, path, t0)
+        }
+
+        // Step 1: Identify format via magic bytes, then extension
+        let handler = self._identify(path, warnings)
+
+        // Step 2: If no handler found, try the parser factory
+        if handler == None and self._parser_factory != None {
+            handler = self._parser_factory.generate_handler(path)
+            if handler != None {
+                self._registry.register(handler)
+                append(warnings, "Generated new handler: " + handler.format_id)
+            }
+        }
+
+        // Step 3: If still nothing, use the unknown fallback
+        if handler == None {
+            return self._handle_unknown_file(path, t0)
+        }
+
+        // Step 4: Execute handler with fallback chain
+        let text = ""
+        let fmt = "auto"
+        let handler_name = handler.format_id
+        let was_generated = handler.is_generated
+
+        let result_tuple = handler.handler_fn(path)
+        text = result_tuple[0]
+        fmt = result_tuple[1]
+        for w in result_tuple[2] { append(warnings, w) }
+
+        // If primary handler failed, try fallbacks
+        if (text == "" or text == None) and len(handler.fallback_fns) > 0 {
+            for fb in handler.fallback_fns {
+                let fb_result = fb(path)
+                if fb_result[0] != "" and fb_result[0] != None {
+                    text = fb_result[0]
+                    fmt = fb_result[1]
+                    for w in fb_result[2] { append(warnings, w) }
+                    handler_name = handler_name + "+fallback"
+                    break
+                }
+                for w in fb_result[2] { append(warnings, w) }
+            }
+        }
+
+        // Handle compressed: decompress then recurse
+        if fmt == "__compressed__" {
+            return self._handle_compressed_data(text, path, handler_name, t0)
+        }
+
+        // Handle archive: extract then process each file
+        if fmt == "__archive__" {
+            return self._handle_archive_path(path, handler_name, t0)
+        }
+
+        // If text is bytes, decode
+        if type(text).__name__ == "bytes" {
+            try { text = text.decode("utf-8") }
+            catch { text = text.decode("latin-1") }
+        }
+
+        if text == "" or text == None {
+            return self._fail("All handlers returned empty", path, t0)
+        }
+
+        // Step 5: Detect structure and convert to standard form
+        let shape = self._detector.detect_shape(text)
+
+        if shape == "tabular" and fmt == "auto" {
+            let lines = text.strip().split("\n")
+            if self._detector._is_fixed_width(lines) {
+                text = _fixed_width_to_csv(lines)
+                fmt = "csv"
+            }
+        }
+
+        if shape == "key_value" and fmt == "auto" {
+            text = _kv_to_csv(text)
+            fmt = "csv"
+            shape = "tabular"
+        }
+
+        // Step 6: Infer schema
+        let schema = self._detector.infer_schema(text, shape)
+
+        // Step 7: Compute provenance
+        let prov = hashlib.sha256(text.encode("utf-8")).hexdigest()[0:16]
+
+        let elapsed = (time.time() - t0) * 1000.0
+        return IngestResult {
+            success: true,
+            format_detected: handler_name,
+            original_path: path,
+            data_text: text,
+            data_format: fmt,
+            data_shape: shape,
+            schema: schema,
+            quality: "lossless" if was_generated == false else "near_lossless",
+            records_count: schema.row_count,
+            warnings: warnings,
+            sub_files: [],
+            provenance_hash: prov,
+            handler_used: handler_name,
+            handler_was_generated: was_generated,
+            elapsed_ms: elapsed
+        }
+    }
+
+    fn ingest_bytes(self, data: bytes, filename: string) -> IngestResult {
+        import tempfile from "std/tempfile"
+        let ext = "." + filename.split(".")[-1] if "." in filename else ".dat"
+        let tmp = tempfile.NamedTemporaryFile(delete=false, suffix=ext)
+        tmp.write(data)
+        tmp.close()
+        let result = self.ingest(tmp.name)
+        result.original_path = filename
+        try { os.unlink(tmp.name) } catch {}
+        return result
+    }
+
+    fn ingest_text(self, text: string, hint: string) -> IngestResult {
+        let t0 = time.time()
+        let shape = self._detector.detect_shape(text)
+        let schema = self._detector.infer_schema(text, shape)
+        let prov = hashlib.sha256(text.encode("utf-8")).hexdigest()[0:16]
+        return IngestResult {
+            success: true,
+            format_detected: hint,
+            original_path: "<text>",
+            data_text: text,
+            data_format: hint,
+            data_shape: shape,
+            schema: schema,
+            quality: "lossless",
+            records_count: schema.row_count,
+            warnings: [],
+            sub_files: [],
+            provenance_hash: prov,
+            handler_used: "text_direct",
+            handler_was_generated: false,
+            elapsed_ms: (time.time() - t0) * 1000.0
+        }
+    }
+
+    fn supported_extensions(self) -> List[string] {
+        return self._registry.all_extensions()
+    }
+
+    fn supported_formats(self) -> List[string] {
+        return self._registry.all_format_ids()
+    }
+
+    fn register_handler(self, handler: FormatHandler) {
+        self._registry.register(handler)
+    }
+
+    fn _identify(self, path: string, warnings: List[string]) -> Optional[FormatHandler] {
+        // Magic bytes first
+        try {
+            let f = open(path, "rb")
+            let header = f.read(32)
+            f.close()
+            let h = self._registry.lookup_by_magic(header)
+            if h != None { return h }
+        } catch {}
+
+        // Extension
+        let lower = path.lower()
+        if lower.endswith(".tar.gz") or lower.endswith(".tgz") {
+            return self._registry.get_handler("tar")
+        }
+        if lower.endswith(".tar.bz2") {
+            return self._registry.get_handler("tar")
+        }
+        if lower.endswith(".tar.xz") {
+            return self._registry.get_handler("tar")
+        }
+
+        let parts = lower.split(".")
+        if len(parts) >= 2 {
+            let ext = "." + parts[-1]
+            let h = self._registry.lookup_by_extension(ext)
+            if h != None { return h }
+        }
+
+        return None
+    }
+
+    fn _handle_compressed_data(self, data: bytes, orig_path: string,
+                                handler_name: string, t0: float) -> IngestResult {
+        import tempfile from "std/tempfile"
+        let base = os.path.basename(orig_path)
+        for suffix in [".gz", ".bz2", ".xz", ".zst", ".lz4", ".lzma"] {
+            if base.lower().endswith(suffix) { base = base[0:-len(suffix)] }
+        }
+        let tmp = tempfile.NamedTemporaryFile(delete=false, suffix="_" + base)
+        tmp.write(data)
+        tmp.close()
+        let inner = self.ingest(tmp.name)
+        inner.original_path = orig_path
+        inner.format_detected = handler_name + "+" + inner.format_detected
+        try { os.unlink(tmp.name) } catch {}
+        return inner
+    }
+
+    fn _handle_archive_path(self, path: string, handler_name: string,
+                             t0: float) -> IngestResult {
+        import tempfile from "std/tempfile"
+        let extract_dir = tempfile.mkdtemp(prefix="nrs_ingest_")
+        let all_texts: List[string] = []
+        let sub_files: List[string] = []
+        let warnings: List[string] = []
+
+        try {
+            let ext = path.lower()
+            if ext.endswith(".zip") {
+                let zf = __import__("zipfile").ZipFile(path, "r")
+                zf.extractall(extract_dir)
+                zf.close()
+            } else if ext.endswith(".tar") or ext.endswith(".tgz") or ext.endswith(".tar.gz") or ext.endswith(".tar.bz2") or ext.endswith(".tar.xz") {
+                let tf = __import__("tarfile").open(path, "r:*")
+                tf.extractall(extract_dir)
+                tf.close()
+            } else if ext.endswith(".7z") {
+                try {
+                    let sz = __import__("py7zr").SevenZipFile(path, mode="r")
+                    sz.extractall(path=extract_dir)
+                    sz.close()
+                } catch { __import__("subprocess").run(["7z", "x", path, "-o" + extract_dir], timeout=120) }
+            } else if ext.endswith(".rar") {
+                try {
+                    let rf = __import__("rarfile").RarFile(path)
+                    rf.extractall(extract_dir)
+                    rf.close()
+                } catch { __import__("subprocess").run(["unrar", "x", path, extract_dir], timeout=120) }
+            }
+
+            for root_dir, dirs, files in os.walk(extract_dir) {
+                for fname in files {
+                    let fpath = os.path.join(root_dir, fname)
+                    append(sub_files, fname)
+                    let sub = self.ingest(fpath)
+                    if sub.success and len(sub.data_text.strip()) > 0 {
+                        append(all_texts, sub.data_text)
+                    }
+                    for w in sub.warnings { append(warnings, "[" + fname + "] " + w) }
+                }
+            }
+        } catch as e {
+            append(warnings, "Archive extraction: " + str(e))
+        }
+
+        try { __import__("shutil").rmtree(extract_dir) } catch {}
+
+        let combined = join(all_texts, "\n")
+        let shape = self._detector.detect_shape(combined)
+        let schema = self._detector.infer_schema(combined, shape)
+        let prov = hashlib.sha256(combined.encode("utf-8")).hexdigest()[0:16] if len(combined) > 0 else ""
+
+        return IngestResult {
+            success: len(combined.strip()) > 0,
+            format_detected: "archive+" + handler_name,
+            original_path: path,
+            data_text: combined,
+            data_format: "csv",
+            data_shape: shape,
+            schema: schema,
+            quality: "near_lossless",
+            records_count: schema.row_count,
+            warnings: warnings,
+            sub_files: sub_files,
+            provenance_hash: prov,
+            handler_used: handler_name,
+            handler_was_generated: false,
+            elapsed_ms: (time.time() - t0) * 1000.0
+        }
+    }
+
+    fn _handle_unknown_file(self, path: string, t0: float) -> IngestResult {
+        let warnings: List[string] = []
+        // Try text
+        try {
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let raw = f.read()
+            f.close()
+            if len(raw.strip()) > 0 {
+                let shape = self._detector.detect_shape(raw)
+                let text = raw
+                let fmt = "auto"
+                if shape == "key_value" { text = _kv_to_csv(raw); fmt = "csv"; shape = "tabular" }
+                let lines = text.strip().split("\n")
+                if shape == "tabular" and self._detector._is_fixed_width(lines) {
+                    text = _fixed_width_to_csv(lines)
+                    fmt = "csv"
+                }
+                let schema = self._detector.infer_schema(text, shape)
+                let prov = hashlib.sha256(text.encode("utf-8")).hexdigest()[0:16]
+                return IngestResult {
+                    success: true,
+                    format_detected: "unknown_text",
+                    original_path: path,
+                    data_text: text,
+                    data_format: fmt,
+                    data_shape: shape,
+                    schema: schema,
+                    quality: "lossy",
+                    records_count: schema.row_count,
+                    warnings: ["Format not recognized; treated as text"],
+                    sub_files: [],
+                    provenance_hash: prov,
+                    handler_used: "unknown_fallback",
+                    handler_was_generated: false,
+                    elapsed_ms: (time.time() - t0) * 1000.0
+                }
+            }
+        } catch {}
+
+        return self._fail("Cannot read file", path, t0)
+    }
+
+    fn _fail(self, reason: string, path: string, t0: float) -> IngestResult {
+        return IngestResult {
+            success: false,
+            format_detected: "unknown",
+            original_path: path,
+            data_text: "",
+            data_format: "",
+            data_shape: "freeform",
+            schema: DataSchema {
+                shape: "freeform", columns: [], row_count: 0,
+                column_count: 0, detected_domain: "unknown", detected_entities: []
+            },
+            quality: "failed",
+            records_count: 0,
+            warnings: [reason],
+            sub_files: [],
+            provenance_hash: "",
+            handler_used: "none",
+            handler_was_generated: false,
+            elapsed_ms: (time.time() - t0) * 1000.0
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SINGLETON AND CONVENIENCE
+// ═══════════════════════════════════════════════════════════════════
+
+let _global_engine: Optional[NRSFileEngine] = None
+
+fn get_engine() -> NRSFileEngine {
+    if _global_engine == None {
+        _global_engine = NRSFileEngine()
+    }
+    return _global_engine
+}
+
+fn ingest(path: string) -> IngestResult {
+    return get_engine().ingest(path)
+}
+
+fn ingest_bytes(data: bytes, filename: string) -> IngestResult {
+    return get_engine().ingest_bytes(data, filename)
+}
+
+fn ingest_text(text: string, hint: string) -> IngestResult {
+    return get_engine().ingest_text(text, hint)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  NORMS
+// ═══════════════════════════════════════════════════════════════════
+
+norm preserve_original_on_ingest {
+    type: obligation,
+    scope: global,
+    action: "ingest",
+    priority: 95,
+    condition: true
+}
+
+norm warn_on_lossy_conversion {
+    type: obligation,
+    scope: global,
+    action: "ingest",
+    priority: 90,
+    condition: quality == "lossy" or quality == "partial"
+}
+
+norm provenance_required {
+    type: obligation,
+    scope: global,
+    action: "ingest",
+    priority: 95,
+    condition: true
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  EXPORTS
+// ═══════════════════════════════════════════════════════════════════
+
+export DataShape, IngestQuality, ColumnSchema, DataSchema, IngestResult, FormatHandler
+export FormatRegistry, StructureDetector, NRSFileEngine
+export get_engine, ingest, ingest_bytes, ingest_text

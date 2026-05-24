@@ -1,0 +1,474 @@
+/// NRSI Parallel — Multi-Pathway Merge Strategies
+///
+/// When multiple lobes process the same query, their results must be merged
+/// into a single coherent answer.  Seven strategies handle different scenarios:
+///
+///   HIGHEST_CONFIDENCE  — pick the single best result
+///   WEIGHTED_AVERAGE    — blend results by confidence × lobe weight
+///   CONSENSUS           — require majority agreement, flag disagreement
+///   DOMAIN_PRIORITY     — prefer the domain-specialist lobe
+///   ENSEMBLE_VOTE       — majority-rules across all pathways
+///   FIRST_VALID         — take the first result above threshold
+///   CASCADE             — try strategies in order until one succeeds
+
+module parallel
+
+import NRSIData from "types"
+import logging from "std/logging"
+import time from "std/time"
+
+let _log = logging.getLogger("nrs.parallel")
+
+/// ── Enumerations ─────────────────────────────────────────────────────
+
+enum MergeStrategy {
+    HIGHEST_CONFIDENCE,
+    WEIGHTED_AVERAGE,
+    CONSENSUS,
+    DOMAIN_PRIORITY,
+    ENSEMBLE_VOTE,
+    FIRST_VALID,
+    CASCADE
+}
+
+/// ── Core Types ───────────────────────────────────────────────────────
+
+type PathwayResult {
+    lobe: string,
+    result: NRSIData,
+    confidence: float,
+    processing_time_ms: float,
+    domain_affinity: float
+}
+
+type MergeConfig {
+    strategy: MergeStrategy,
+    min_pathways: int,
+    timeout_ms: float,
+    confidence_threshold: float
+}
+
+type MergeOutcome {
+    merged_result: NRSIData,
+    strategy_used: string,
+    pathways_used: int,
+    conflict_detected: bool,
+    conflict_detail: string,
+    merged_confidence: float,
+    merge_time_ms: float
+}
+
+/// ── Conflict Detection ───────────────────────────────────────────────
+
+fn detect_conflict(results: List[PathwayResult]) -> bool {
+    if len(results) < 2 { return false }
+
+    let confidences = []
+    for r in results {
+        append(confidences, r.confidence)
+    }
+
+    let max_conf = confidences[0]
+    let min_conf = confidences[0]
+    for c in confidences {
+        if c > max_conf { max_conf = c }
+        if c < min_conf { min_conf = c }
+    }
+
+    if max_conf - min_conf > 0.4 { return true }
+
+    let values = []
+    for r in results {
+        if r.result != nil and hasattr(r.result, "value") {
+            append(values, str(r.result.value))
+        }
+    }
+    let unique_values = {}
+    for v in values {
+        unique_values[v] = true
+    }
+    if len(unique_values) > 1 and len(unique_values) == len(values) {
+        return true
+    }
+
+    return false
+}
+
+fn _describe_conflict(results: List[PathwayResult]) -> string {
+    let parts = []
+    for r in results {
+        append(parts, r.lobe + "(conf=" + str(round(r.confidence, 2)) + ")")
+    }
+    return "Disagreement among: " + join(parts, ", ")
+}
+
+/// ── Strategy 1: HIGHEST_CONFIDENCE ───────────────────────────────────
+
+fn _merge_highest_confidence(results: List[PathwayResult]) -> PathwayResult {
+    let best = results[0]
+    for r in results {
+        if r.confidence > best.confidence {
+            best = r
+        }
+    }
+    return best
+}
+
+/// ── Strategy 2: WEIGHTED_AVERAGE ─────────────────────────────────────
+
+fn _merge_weighted_average(results: List[PathwayResult]) -> MergeOutcome {
+    let total_weight = 0.0
+    let weighted_conf = 0.0
+    let best = results[0]
+    let best_score = 0.0
+
+    for r in results {
+        let weight = r.confidence * r.domain_affinity
+        if weight <= 0.0 { weight = r.confidence * 0.1 }
+        total_weight = total_weight + weight
+        weighted_conf = weighted_conf + r.confidence * weight
+
+        if weight > best_score {
+            best_score = weight
+            best = r
+        }
+    }
+
+    let merged_conf = 0.0
+    if total_weight > 0.0 {
+        merged_conf = weighted_conf / total_weight
+    }
+
+    return MergeOutcome {
+        merged_result: best.result,
+        strategy_used: "WEIGHTED_AVERAGE",
+        pathways_used: len(results),
+        conflict_detected: detect_conflict(results),
+        conflict_detail: "",
+        merged_confidence: merged_conf,
+        merge_time_ms: 0.0
+    }
+}
+
+/// ── Strategy 3: CONSENSUS ────────────────────────────────────────────
+
+fn _merge_consensus(results: List[PathwayResult], threshold: float) -> MergeOutcome {
+    let above_threshold = []
+    for r in results {
+        if r.confidence >= threshold {
+            append(above_threshold, r)
+        }
+    }
+
+    if len(above_threshold) == 0 {
+        return MergeOutcome {
+            merged_result: results[0].result,
+            strategy_used: "CONSENSUS",
+            pathways_used: 0,
+            conflict_detected: true,
+            conflict_detail: "No pathway met confidence threshold " + str(threshold),
+            merged_confidence: 0.0,
+            merge_time_ms: 0.0
+        }
+    }
+
+    let has_conflict = detect_conflict(above_threshold)
+    let majority_count = len(above_threshold) / 2 + 1
+
+    let value_votes = {}
+    for r in above_threshold {
+        let key = str(r.result.value) if r.result != nil and hasattr(r.result, "value") else r.lobe
+        if key not in value_votes {
+            value_votes[key] = {"count": 0, "best_result": r, "total_conf": 0.0}
+        }
+        value_votes[key]["count"] = value_votes[key]["count"] + 1
+        value_votes[key]["total_conf"] = value_votes[key]["total_conf"] + r.confidence
+        if r.confidence > value_votes[key]["best_result"].confidence {
+            value_votes[key]["best_result"] = r
+        }
+    }
+
+    let winner = nil
+    let winner_count = 0
+    for key in value_votes {
+        if value_votes[key]["count"] > winner_count {
+            winner_count = value_votes[key]["count"]
+            winner = value_votes[key]
+        }
+    }
+
+    let consensus_met = winner_count >= majority_count
+    let conf_detail = ""
+    if has_conflict {
+        conf_detail = _describe_conflict(above_threshold)
+    }
+    if not consensus_met {
+        conf_detail = conf_detail + " No majority consensus reached."
+    }
+
+    return MergeOutcome {
+        merged_result: winner["best_result"].result,
+        strategy_used: "CONSENSUS",
+        pathways_used: len(above_threshold),
+        conflict_detected: has_conflict or not consensus_met,
+        conflict_detail: conf_detail,
+        merged_confidence: winner["total_conf"] / to_float(winner_count),
+        merge_time_ms: 0.0
+    }
+}
+
+/// ── Strategy 4: DOMAIN_PRIORITY ──────────────────────────────────────
+
+fn _merge_domain_priority(results: List[PathwayResult]) -> MergeOutcome {
+    let best = results[0]
+    let best_score = 0.0
+
+    for r in results {
+        let score = r.domain_affinity * 0.6 + r.confidence * 0.4
+        if score > best_score {
+            best_score = score
+            best = r
+        }
+    }
+
+    return MergeOutcome {
+        merged_result: best.result,
+        strategy_used: "DOMAIN_PRIORITY",
+        pathways_used: len(results),
+        conflict_detected: detect_conflict(results),
+        conflict_detail: "Domain specialist: " + best.lobe + " (affinity=" + str(round(best.domain_affinity, 2)) + ")",
+        merged_confidence: best.confidence,
+        merge_time_ms: 0.0
+    }
+}
+
+/// ── Strategy 5: ENSEMBLE_VOTE ────────────────────────────────────────
+
+fn _merge_ensemble_vote(results: List[PathwayResult]) -> MergeOutcome {
+    let value_buckets = {}
+    for r in results {
+        let key = str(r.result.value) if r.result != nil and hasattr(r.result, "value") else r.lobe
+        if key not in value_buckets {
+            value_buckets[key] = {"voters": [], "total_conf": 0.0}
+        }
+        append(value_buckets[key]["voters"], r)
+        value_buckets[key]["total_conf"] = value_buckets[key]["total_conf"] + r.confidence
+    }
+
+    let winner_key = nil
+    let winner_votes = 0
+    let winner_conf = 0.0
+    for key in value_buckets {
+        let votes = len(value_buckets[key]["voters"])
+        let conf = value_buckets[key]["total_conf"]
+        if votes > winner_votes or (votes == winner_votes and conf > winner_conf) {
+            winner_key = key
+            winner_votes = votes
+            winner_conf = conf
+        }
+    }
+
+    let winner_result = value_buckets[winner_key]["voters"][0]
+    for v in value_buckets[winner_key]["voters"] {
+        if v.confidence > winner_result.confidence {
+            winner_result = v
+        }
+    }
+
+    return MergeOutcome {
+        merged_result: winner_result.result,
+        strategy_used: "ENSEMBLE_VOTE",
+        pathways_used: len(results),
+        conflict_detected: len(value_buckets) > 1,
+        conflict_detail: str(winner_votes) + "/" + str(len(results)) + " pathways agree",
+        merged_confidence: winner_conf / to_float(winner_votes),
+        merge_time_ms: 0.0
+    }
+}
+
+/// ── Strategy 6: FIRST_VALID ──────────────────────────────────────────
+
+fn _merge_first_valid(results: List[PathwayResult], threshold: float) -> MergeOutcome {
+    for r in results {
+        if r.confidence >= threshold {
+            return MergeOutcome {
+                merged_result: r.result,
+                strategy_used: "FIRST_VALID",
+                pathways_used: 1,
+                conflict_detected: false,
+                conflict_detail: "First valid from " + r.lobe,
+                merged_confidence: r.confidence,
+                merge_time_ms: 0.0
+            }
+        }
+    }
+
+    let best = _merge_highest_confidence(results)
+    return MergeOutcome {
+        merged_result: best.result,
+        strategy_used: "FIRST_VALID",
+        pathways_used: 1,
+        conflict_detected: true,
+        conflict_detail: "No pathway met threshold " + str(threshold) + "; fell back to highest confidence",
+        merged_confidence: best.confidence,
+        merge_time_ms: 0.0
+    }
+}
+
+/// ── Strategy 7: CASCADE ──────────────────────────────────────────────
+
+fn _merge_cascade(results: List[PathwayResult], threshold: float) -> MergeOutcome {
+    let strategies = [
+        "CONSENSUS",
+        "DOMAIN_PRIORITY",
+        "ENSEMBLE_VOTE",
+        "WEIGHTED_AVERAGE",
+        "HIGHEST_CONFIDENCE"
+    ]
+
+    for strat in strategies {
+        let outcome = nil
+        if strat == "CONSENSUS" {
+            outcome = _merge_consensus(results, threshold)
+        } else if strat == "DOMAIN_PRIORITY" {
+            outcome = _merge_domain_priority(results)
+        } else if strat == "ENSEMBLE_VOTE" {
+            outcome = _merge_ensemble_vote(results)
+        } else if strat == "WEIGHTED_AVERAGE" {
+            outcome = _merge_weighted_average(results)
+        } else {
+            let best = _merge_highest_confidence(results)
+            outcome = MergeOutcome {
+                merged_result: best.result,
+                strategy_used: "HIGHEST_CONFIDENCE",
+                pathways_used: 1,
+                conflict_detected: false,
+                conflict_detail: "",
+                merged_confidence: best.confidence,
+                merge_time_ms: 0.0
+            }
+        }
+
+        if outcome.merged_confidence >= threshold and not outcome.conflict_detected {
+            outcome.strategy_used = "CASCADE:" + strat
+            return outcome
+        }
+    }
+
+    let fallback = _merge_highest_confidence(results)
+    return MergeOutcome {
+        merged_result: fallback.result,
+        strategy_used: "CASCADE:FALLBACK",
+        pathways_used: 1,
+        conflict_detected: true,
+        conflict_detail: "All cascade strategies produced conflicts or low confidence",
+        merged_confidence: fallback.confidence,
+        merge_time_ms: 0.0
+    }
+}
+
+/// ── Main Merge Dispatcher ────────────────────────────────────────────
+
+fn merge_results(results: List[PathwayResult], config: MergeConfig) -> MergeOutcome {
+    let start = time.time()
+
+    if len(results) == 0 {
+        return MergeOutcome {
+            merged_result: NRSIData { value: nil, domain: "", confidence: 0.0, source: "parallel", timestamp: time.time() },
+            strategy_used: "NONE",
+            pathways_used: 0,
+            conflict_detected: false,
+            conflict_detail: "No results to merge",
+            merged_confidence: 0.0,
+            merge_time_ms: 0.0
+        }
+    }
+
+    if len(results) == 1 {
+        return MergeOutcome {
+            merged_result: results[0].result,
+            strategy_used: "SINGLE_PATHWAY",
+            pathways_used: 1,
+            conflict_detected: false,
+            conflict_detail: "",
+            merged_confidence: results[0].confidence,
+            merge_time_ms: 0.0
+        }
+    }
+
+    let sorted_results = sorted(results, key: fn(r) { return -r.confidence })
+
+    let outcome = nil
+    let strategy = config.strategy
+    let threshold = config.confidence_threshold
+    if threshold <= 0.0 { threshold = 0.5 }
+
+    if strategy == MergeStrategy.HIGHEST_CONFIDENCE {
+        let best = _merge_highest_confidence(sorted_results)
+        outcome = MergeOutcome {
+            merged_result: best.result,
+            strategy_used: "HIGHEST_CONFIDENCE",
+            pathways_used: 1,
+            conflict_detected: detect_conflict(sorted_results),
+            conflict_detail: "",
+            merged_confidence: best.confidence,
+            merge_time_ms: 0.0
+        }
+    } else if strategy == MergeStrategy.WEIGHTED_AVERAGE {
+        outcome = _merge_weighted_average(sorted_results)
+    } else if strategy == MergeStrategy.CONSENSUS {
+        outcome = _merge_consensus(sorted_results, threshold)
+    } else if strategy == MergeStrategy.DOMAIN_PRIORITY {
+        outcome = _merge_domain_priority(sorted_results)
+    } else if strategy == MergeStrategy.ENSEMBLE_VOTE {
+        outcome = _merge_ensemble_vote(sorted_results)
+    } else if strategy == MergeStrategy.FIRST_VALID {
+        outcome = _merge_first_valid(sorted_results, threshold)
+    } else if strategy == MergeStrategy.CASCADE {
+        outcome = _merge_cascade(sorted_results, threshold)
+    } else {
+        outcome = _merge_cascade(sorted_results, threshold)
+    }
+
+    outcome.merge_time_ms = (time.time() - start) * 1000.0
+
+    if outcome.conflict_detected {
+        _log.warning("Merge conflict detected (%s): %s",
+                      outcome.strategy_used, outcome.conflict_detail)
+    }
+
+    return outcome
+}
+
+fn resolve_conflict(results: List[PathwayResult], strategy: MergeStrategy) -> MergeOutcome {
+    let config = MergeConfig {
+        strategy: strategy,
+        min_pathways: 1,
+        timeout_ms: 5000.0,
+        confidence_threshold: 0.5
+    }
+    return merge_results(results, config)
+}
+
+/// ── Norms ────────────────────────────────────────────────────────────
+
+norm require_minimum_pathways {
+    type: obligation,
+    scope: global,
+    action: "merge",
+    priority: 80,
+    condition: active_pathways >= config.min_pathways
+}
+
+norm flag_unresolved_conflicts {
+    type: obligation,
+    scope: global,
+    action: "merge",
+    priority: 85,
+    condition: conflict_detected == false or conflict_resolution_attempted == true
+}
+
+/// ── Exports ──────────────────────────────────────────────────────────
+
+export MergeStrategy, PathwayResult, MergeConfig, MergeOutcome
+export merge_results, detect_conflict, resolve_conflict

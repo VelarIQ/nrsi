@@ -1,0 +1,62 @@
+/// NRSIP Client Response Policy.
+///
+/// Applies confidence-floor gating to outbound responses.
+/// If the observed confidence is below the configured floor, the answer
+/// is withheld and replaced with a safe fallback message.
+///
+/// Ported from nrsip/client_response_policy.py.
+
+module client_response_policy
+
+let DEFAULT_WITHHELD_MESSAGE = "I can't return a reliable answer for that request yet. " +
+    "The response was withheld because it did not meet the client confidence threshold."
+
+/// ── Decision Type ──
+
+type ClientResponseDecision {
+    answer: string,
+    delivered_confidence: float,
+    observed_confidence: float,
+    client_visible: bool,
+    reason: Optional[string]
+}
+
+/// ── Policy Application ──
+
+fn apply_client_response_policy(
+    answer: string,
+    observed_confidence: float,
+    floor: float,
+    withheld_message: string
+) -> ClientResponseDecision {
+    let observed = to_float(observed_confidence)
+    let required = to_float(floor)
+
+    if observed >= required {
+        return ClientResponseDecision {
+            answer: answer,
+            delivered_confidence: observed,
+            observed_confidence: observed,
+            client_visible: true,
+            reason: nil
+        }
+    }
+
+    let msg = withheld_message
+    if msg == "" {
+        msg = DEFAULT_WITHHELD_MESSAGE
+    }
+
+    return ClientResponseDecision {
+        answer: msg,
+        delivered_confidence: 0.0,
+        observed_confidence: observed,
+        client_visible: false,
+        reason: "observed confidence " + to_string(observed) +
+                " below floor " + to_string(required)
+    }
+}
+
+export DEFAULT_WITHHELD_MESSAGE
+export ClientResponseDecision
+export apply_client_response_policy

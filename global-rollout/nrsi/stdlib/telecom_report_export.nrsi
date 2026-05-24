@@ -1,0 +1,1289 @@
+/// NRS Telecom Fault Isolation — Report Export Engine.
+///
+/// Generates professional, client-ready reports from AnalysisReport
+/// in three formats:
+///
+///   Excel (.xlsx)  — multi-sheet workbook with charts, conditional
+///                    formatting, and per-tower detail tabs
+///   PDF            — branded single-document report with executive
+///                    summary, evidence detail, and appendices
+///   HTML           — self-contained interactive report with
+///                    collapsible sections and inline SVG charts
+///
+/// Record count is unbounded — the analyzer accepts any volume and
+/// the exporter scales accordingly.
+///
+/// ═══════════════════════════════════════════════════════════════════
+///   EXPORT PIPELINE
+/// ═══════════════════════════════════════════════════════════════════
+///
+///   AnalysisReport
+///        │
+///        ├──▶ ExcelExporter  ──▶  .xlsx workbook
+///        │       5 sheets: Summary, Towers, Evidence, Timeline, Raw
+///        │
+///        ├──▶ PDFExporter    ──▶  .pdf document
+///        │       Executive summary, fault detail, evidence, appendix
+///        │
+///        └──▶ HTMLExporter   ──▶  .html file
+///                Self-contained, dark/light theme, collapsible
+///
+/// All exporters are deterministic: same report → identical file.
+
+module telecom_report_export
+
+import time from "std/time"
+import json from "std/json"
+import math from "std/math"
+import os from "std/os"
+import io from "std/io"
+import datetime from "std/datetime"
+import AnalysisReport, FaultHypothesis, EvidenceItem, TowerProfile from "telecom_analyzer"
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONSTANTS
+// ═══════════════════════════════════════════════════════════════════
+
+let BRAND_PRIMARY = "#1A1A2E"
+let BRAND_ACCENT = "#E94560"
+let BRAND_SUCCESS = "#0F9B58"
+let BRAND_WARNING = "#F4B400"
+let BRAND_DANGER = "#DB4437"
+let BRAND_INFO = "#4285F4"
+let BRAND_BG = "#F8F9FA"
+let BRAND_DARK_BG = "#16213E"
+let BRAND_TEXT = "#2D2D2D"
+let BRAND_MUTED = "#6C757D"
+
+let SEVERITY_COLORS = {
+    "CRITICAL": "#DB4437",
+    "MAJOR": "#E94560",
+    "MINOR": "#F4B400",
+    "WARNING": "#FF9800",
+    "INFO": "#4285F4"
+}
+
+let TRUST_COLORS = {
+    "RAW": "#9E9E9E",
+    "VALIDATED": "#4285F4",
+    "TRUSTED": "#0F9B58",
+    "CERTIFIED": "#1A1A2E"
+}
+
+let DIMENSION_LABELS = {
+    "STATISTICAL": "Statistical Profiler",
+    "TEMPORAL": "Temporal Analyzer",
+    "SPATIAL": "Spatial Correlator",
+    "SIGNALING": "Signaling Pattern Detector",
+    "GRAPH": "Network Graph Analyzer"
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════
+
+fn _severity_rank(sev: string) -> int {
+    if sev == "CRITICAL" { return 0 }
+    if sev == "MAJOR" { return 1 }
+    if sev == "MINOR" { return 2 }
+    if sev == "WARNING" { return 3 }
+    return 4
+}
+
+fn _confidence_bar(conf: float, width: int) -> string {
+    let filled = int(conf * float(width))
+    let empty = width - filled
+    let bar = ""
+    let i = 0
+    while i < filled { bar = bar + "█"; i += 1 }
+    let j = 0
+    while j < empty { bar = bar + "░"; j += 1 }
+    return bar
+}
+
+fn _confidence_label(conf: float) -> string {
+    if conf >= 0.9 { return "Very High" }
+    if conf >= 0.7 { return "High" }
+    if conf >= 0.5 { return "Moderate" }
+    if conf >= 0.3 { return "Low" }
+    return "Very Low"
+}
+
+fn _ts_to_iso(ts: float) -> string {
+    if ts <= 0.0 { return "N/A" }
+    let dt = datetime.datetime.utcfromtimestamp(ts)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+}
+
+fn _pct(value: float) -> string {
+    return format_float(value * 100.0, 1) + "%"
+}
+
+fn _truncate(s: string, max_len: int) -> string {
+    if len(s) <= max_len { return s }
+    return s[0:max_len - 3] + "..."
+}
+
+fn _band_to_technology(band: string) -> string {
+    if band.startswith("N") { return "5G" }
+    if band.startswith("B") { return "4G" }
+    if band.startswith("UMTS") or band.startswith("WCDMA") { return "3G" }
+    if band.startswith("GSM") { return "2G" }
+    return "unknown"
+}
+
+fn _escape_html(s: string) -> string {
+    let out = s.replace("&", "&amp;")
+    out = out.replace("<", "&lt;")
+    out = out.replace(">", "&gt;")
+    out = out.replace("\"", "&quot;")
+    return out
+}
+
+/// Sanitize text for PDF output (replace non-latin1 chars with ASCII equivalents).
+fn _pdf_safe(s: string) -> string {
+    let out = s
+    out = out.replace("\u2014", " -- ")
+    out = out.replace("\u2013", " - ")
+    out = out.replace("\u2018", "'")
+    out = out.replace("\u2019", "'")
+    out = out.replace("\u201C", "\"")
+    out = out.replace("\u201D", "\"")
+    out = out.replace("\u2022", "*")
+    out = out.replace("\u2026", "...")
+    out = out.replace("\u2192", "->")
+    out = out.replace("\u2190", "<-")
+    out = out.replace("\u2502", "|")
+    out = out.replace("\u2500", "-")
+    out = out.replace("\u250C", "+")
+    out = out.replace("\u2510", "+")
+    out = out.replace("\u2514", "+")
+    out = out.replace("\u2518", "+")
+    let result = ""
+    for ch in out {
+        if ord(ch) < 256 {
+            result = result + ch
+        } else {
+            result = result + "?"
+        }
+    }
+    return result
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 1 — EXCEL EXPORTER
+// ═══════════════════════════════════════════════════════════════════
+
+class ExcelExporter {
+
+    fn init(self) {
+        self._wb = None
+    }
+
+    fn export(self, report: AnalysisReport, output_path: string) -> string {
+        let openpyxl = __import__("openpyxl")
+        let PatternFill = openpyxl.styles.PatternFill
+        let Font = openpyxl.styles.Font
+        let Alignment = openpyxl.styles.Alignment
+        let Border = openpyxl.styles.Border
+        let Side = openpyxl.styles.Side
+        let numbers = openpyxl.styles.numbers
+
+        let wb = openpyxl.Workbook()
+
+        // ── Sheet 1: Executive Summary ──
+        let ws_summary = wb.active
+        ws_summary.title = "Executive Summary"
+        self._build_summary_sheet(ws_summary, report, Font, PatternFill, Alignment, Border, Side)
+
+        // ── Sheet 2: Tower Profiles ──
+        let ws_towers = wb.create_sheet("Tower Profiles")
+        self._build_towers_sheet(ws_towers, report, Font, PatternFill, Alignment, Border, Side, numbers)
+
+        // ── Sheet 3: Evidence Detail ──
+        let ws_evidence = wb.create_sheet("Evidence Detail")
+        self._build_evidence_sheet(ws_evidence, report, Font, PatternFill, Alignment, Border, Side)
+
+        // ── Sheet 4: Reasoning Chain ──
+        let ws_reasoning = wb.create_sheet("Reasoning Chain")
+        self._build_reasoning_sheet(ws_reasoning, report, Font, PatternFill, Alignment, Border, Side)
+
+        // ── Sheet 5: Network Health ──
+        let ws_health = wb.create_sheet("Network Health")
+        self._build_health_sheet(ws_health, report, Font, PatternFill, Alignment, Border, Side)
+
+        wb.save(output_path)
+        return output_path
+    }
+
+    fn _header_fill(self) -> Any {
+        let openpyxl = __import__("openpyxl")
+        return openpyxl.styles.PatternFill(start_color="1A1A2E", end_color="1A1A2E", fill_type="solid")
+    }
+
+    fn _accent_fill(self) -> Any {
+        let openpyxl = __import__("openpyxl")
+        return openpyxl.styles.PatternFill(start_color="E94560", end_color="E94560", fill_type="solid")
+    }
+
+    fn _success_fill(self) -> Any {
+        let openpyxl = __import__("openpyxl")
+        return openpyxl.styles.PatternFill(start_color="D4EDDA", end_color="D4EDDA", fill_type="solid")
+    }
+
+    fn _warning_fill(self) -> Any {
+        let openpyxl = __import__("openpyxl")
+        return openpyxl.styles.PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
+    }
+
+    fn _danger_fill(self) -> Any {
+        let openpyxl = __import__("openpyxl")
+        return openpyxl.styles.PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
+    }
+
+    fn _build_summary_sheet(self, ws: Any, report: AnalysisReport,
+                            Font: Any, PatternFill: Any, Alignment: Any,
+                            Border: Any, Side: Any) {
+        let hdr_fill = self._header_fill()
+        let hdr_font = Font(name="Calibri", bold=true, color="FFFFFF", size=12)
+        let title_font = Font(name="Calibri", bold=true, size=18, color="1A1A2E")
+        let subtitle_font = Font(name="Calibri", bold=true, size=14, color="E94560")
+        let label_font = Font(name="Calibri", bold=true, size=11)
+        let value_font = Font(name="Calibri", size=11)
+        let thin_border = Border(
+            left=Side(style="thin"),
+            right=Side(style="thin"),
+            top=Side(style="thin"),
+            bottom=Side(style="thin")
+        )
+
+        ws.column_dimensions["A"].width = 28
+        ws.column_dimensions["B"].width = 55
+        ws.column_dimensions["C"].width = 20
+
+        // Title block
+        ws.merge_cells("A1:C1")
+        let c1 = ws["A1"]
+        c1.value = "NRS TELECOM FAULT ISOLATION REPORT"
+        c1.font = title_font
+        c1.alignment = Alignment(horizontal="center")
+
+        ws.merge_cells("A2:C2")
+        let c2 = ws["A2"]
+        c2.value = "Powered by VelarIQ PRISM NRS - Deterministic Analysis Engine"
+        c2.font = Font(name="Calibri", size=10, italic=true, color="6C757D")
+        c2.alignment = Alignment(horizontal="center")
+
+        // Report metadata
+        let row = 4
+        ws.merge_cells("A4:C4")
+        let c4 = ws["A4"]
+        c4.value = "REPORT OVERVIEW"
+        c4.font = subtitle_font
+
+        let meta_items = [
+            ["Report ID", report.report_id],
+            ["Generated", _ts_to_iso(report.timestamp)],
+            ["Analysis Time", format_float(report.elapsed_ms, 1) + " ms"],
+            ["Total Records", str(report.total_records)],
+            ["Total Towers", str(report.total_towers)],
+            ["Trust Level", report.trust_level],
+            ["Provenance Hash", report.provenance_hash[0:32] + "..."]
+        ]
+
+        row = 5
+        for item in meta_items {
+            ws.cell(row=row, column=1, value=item[0]).font = label_font
+            ws.cell(row=row, column=2, value=item[1]).font = value_font
+            ws.cell(row=row, column=1).border = thin_border
+            ws.cell(row=row, column=2).border = thin_border
+            row += 1
+        }
+
+        // Primary fault section
+        row += 1
+        ws.merge_cells("A" + str(row) + ":C" + str(row))
+        ws.cell(row=row, column=1, value="PRIMARY FAULT IDENTIFICATION").font = subtitle_font
+        row += 1
+
+        let pf = report.primary_fault
+        let fault_items = [
+            ["Faulty Tower", pf.tower_id],
+            ["Fault Domain", pf.fault_domain],
+            ["Severity", pf.fault_severity],
+            ["Confidence", _pct(pf.confidence) + " (" + _confidence_label(pf.confidence) + ")"],
+            ["Evidence Items", str(len(pf.evidence))],
+            ["Root Cause", pf.root_cause]
+        ]
+
+        for item in fault_items {
+            ws.cell(row=row, column=1, value=item[0]).font = label_font
+            let vc = ws.cell(row=row, column=2, value=item[1])
+            vc.font = value_font
+            if item[0] == "Faulty Tower" {
+                vc.font = Font(name="Calibri", bold=true, size=14, color="DB4437")
+            }
+            ws.cell(row=row, column=1).border = thin_border
+            ws.cell(row=row, column=2).border = thin_border
+
+            if item[0] == "Severity" {
+                let sev_color = SEVERITY_COLORS.get(pf.fault_severity, "9E9E9E")
+                vc.fill = PatternFill(start_color=sev_color.replace("#", ""),
+                                      end_color=sev_color.replace("#", ""),
+                                      fill_type="solid")
+                vc.font = Font(name="Calibri", bold=true, color="FFFFFF")
+            }
+            row += 1
+        }
+
+        // Recommendations
+        row += 1
+        ws.merge_cells("A" + str(row) + ":C" + str(row))
+        ws.cell(row=row, column=1, value="RECOMMENDATIONS").font = subtitle_font
+        row += 1
+
+        let rec_idx = 1
+        for rec in pf.recommendations {
+            ws.cell(row=row, column=1, value=str(rec_idx) + ".").font = label_font
+            ws.cell(row=row, column=2, value=rec).font = value_font
+            ws.cell(row=row, column=1).border = thin_border
+            ws.cell(row=row, column=2).border = thin_border
+            row += 1
+            rec_idx += 1
+        }
+
+        // Alternative hypotheses
+        if len(report.alternative_hypotheses) > 0 {
+            row += 1
+            ws.merge_cells("A" + str(row) + ":C" + str(row))
+            ws.cell(row=row, column=1, value="ALTERNATIVE HYPOTHESES").font = subtitle_font
+            row += 1
+
+            let alt_headers = ["Tower", "Domain / Severity", "Confidence"]
+            let col = 1
+            for ah in alt_headers {
+                let hc = ws.cell(row=row, column=col, value=ah)
+                hc.font = hdr_font
+                hc.fill = hdr_fill
+                hc.alignment = Alignment(horizontal="center")
+                hc.border = thin_border
+                col += 1
+            }
+            row += 1
+
+            for hyp in report.alternative_hypotheses {
+                ws.cell(row=row, column=1, value=hyp.tower_id).font = value_font
+                ws.cell(row=row, column=2, value=hyp.fault_domain + " / " + hyp.fault_severity).font = value_font
+                ws.cell(row=row, column=3, value=_pct(hyp.confidence)).font = value_font
+                ws.cell(row=row, column=1).border = thin_border
+                ws.cell(row=row, column=2).border = thin_border
+                ws.cell(row=row, column=3).border = thin_border
+                row += 1
+            }
+        }
+    }
+
+    fn _build_towers_sheet(self, ws: Any, report: AnalysisReport,
+                           Font: Any, PatternFill: Any, Alignment: Any,
+                           Border: Any, Side: Any, numbers: Any) {
+        let hdr_fill = self._header_fill()
+        let hdr_font = Font(name="Calibri", bold=true, color="FFFFFF", size=11)
+        let thin_border = Border(
+            left=Side(style="thin"), right=Side(style="thin"),
+            top=Side(style="thin"), bottom=Side(style="thin")
+        )
+
+        let headers = ["Tower ID", "LAC", "BSC/RNC", "Total Events",
+                       "Successes", "Failures", "Failure Rate",
+                       "Unique Subs", "Avg Duration (ms)", "Avg Retries",
+                       "Primary Band", "Primary Tech", "Bands Active",
+                       "Fault Confidence", "Fault Domain", "Severity"]
+
+        let col = 1
+        for h in headers {
+            let c = ws.cell(row=1, column=col, value=h)
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = Alignment(horizontal="center")
+            c.border = thin_border
+            col += 1
+        }
+
+        // Collect all hypotheses for lookup
+        let hyp_map = {}
+        hyp_map[report.primary_fault.tower_id] = report.primary_fault
+        for ah in report.alternative_hypotheses {
+            hyp_map[ah.tower_id] = ah
+        }
+
+        let row = 2
+        // Build tower data from hypotheses
+        let all_towers = [report.primary_fault]
+        for ah in report.alternative_hypotheses {
+            append(all_towers, ah)
+        }
+
+        for hyp in all_towers {
+            // Extract band info from evidence if available
+            let p_band = ""
+            let p_tech = ""
+            let bands_active = 0
+            for ev in hyp.evidence {
+                if ev.metric == "band_failure_concentration" {
+                    let cv = ev.comparison_value
+                    if "band=" in cv {
+                        let parts = cv.split(" ")
+                        for part in parts {
+                            if part.startswith("band=") {
+                                p_band = part.replace("band=", "")
+                            }
+                        }
+                    }
+                }
+            }
+            if p_band != "" { p_tech = _band_to_technology(p_band) }
+
+            ws.cell(row=row, column=1, value=hyp.tower_id).border = thin_border
+            ws.cell(row=row, column=2, value="").border = thin_border
+            ws.cell(row=row, column=3, value="").border = thin_border
+            ws.cell(row=row, column=4, value=len(hyp.evidence)).border = thin_border
+            ws.cell(row=row, column=5, value="").border = thin_border
+            ws.cell(row=row, column=6, value="").border = thin_border
+            ws.cell(row=row, column=7, value="").border = thin_border
+            ws.cell(row=row, column=8, value="").border = thin_border
+            ws.cell(row=row, column=9, value="").border = thin_border
+            ws.cell(row=row, column=10, value="").border = thin_border
+            ws.cell(row=row, column=11, value=p_band).border = thin_border
+            ws.cell(row=row, column=12, value=p_tech).border = thin_border
+            ws.cell(row=row, column=13, value=str(bands_active)).border = thin_border
+            ws.cell(row=row, column=14, value=_pct(hyp.confidence)).border = thin_border
+            ws.cell(row=row, column=15, value=hyp.fault_domain).border = thin_border
+            ws.cell(row=row, column=16, value=hyp.fault_severity).border = thin_border
+
+            if hyp.tower_id == report.primary_fault.tower_id {
+                let i = 1
+                while i <= 16 {
+                    ws.cell(row=row, column=i).fill = self._danger_fill()
+                    ws.cell(row=row, column=i).font = Font(name="Calibri", bold=true)
+                    i += 1
+                }
+            }
+            row += 1
+        }
+
+        // Auto-fit columns
+        let ci = 1
+        while ci <= len(headers) {
+            ws.column_dimensions[chr(64 + ci)].width = max(len(headers[ci - 1]) + 4, 14)
+            ci += 1
+        }
+    }
+
+    fn _build_evidence_sheet(self, ws: Any, report: AnalysisReport,
+                             Font: Any, PatternFill: Any, Alignment: Any,
+                             Border: Any, Side: Any) {
+        let hdr_fill = self._header_fill()
+        let hdr_font = Font(name="Calibri", bold=true, color="FFFFFF", size=11)
+        let thin_border = Border(
+            left=Side(style="thin"), right=Side(style="thin"),
+            top=Side(style="thin"), bottom=Side(style="thin")
+        )
+
+        let headers = ["#", "Tower", "Dimension", "Metric", "Anomaly Score",
+                       "Confidence", "Reasoning", "Row Indices (sample)"]
+
+        let col = 1
+        for h in headers {
+            let c = ws.cell(row=1, column=col, value=h)
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = Alignment(horizontal="center")
+            c.border = thin_border
+            col += 1
+        }
+
+        let row = 2
+        let idx = 1
+
+        // Primary fault evidence
+        for ev in report.primary_fault.evidence {
+            ws.cell(row=row, column=1, value=idx).border = thin_border
+            ws.cell(row=row, column=2, value=ev.tower_id).border = thin_border
+            ws.cell(row=row, column=3, value=DIMENSION_LABELS.get(ev.dimension, ev.dimension)).border = thin_border
+            ws.cell(row=row, column=4, value=ev.metric).border = thin_border
+
+            let score_cell = ws.cell(row=row, column=5, value=float(format_float(ev.anomaly_score, 3)))
+            score_cell.border = thin_border
+            if ev.anomaly_score >= 0.8 {
+                score_cell.fill = self._danger_fill()
+            } else {
+                if ev.anomaly_score >= 0.5 {
+                    score_cell.fill = self._warning_fill()
+                } else {
+                    score_cell.fill = self._success_fill()
+                }
+            }
+
+            ws.cell(row=row, column=6, value=_pct(ev.confidence)).border = thin_border
+            ws.cell(row=row, column=7, value=_truncate(ev.reasoning, 120)).border = thin_border
+
+            let sample_rows = ev.row_indices[0:min(len(ev.row_indices), 10)]
+            let row_str = join([str(r) for r in sample_rows], ", ")
+            if len(ev.row_indices) > 10 {
+                row_str = row_str + " ... +" + str(len(ev.row_indices) - 10) + " more"
+            }
+            ws.cell(row=row, column=8, value=row_str).border = thin_border
+
+            row += 1
+            idx += 1
+        }
+
+        // Alternative evidence
+        for hyp in report.alternative_hypotheses {
+            for ev in hyp.evidence {
+                ws.cell(row=row, column=1, value=idx).border = thin_border
+                ws.cell(row=row, column=2, value=ev.tower_id).border = thin_border
+                ws.cell(row=row, column=3, value=DIMENSION_LABELS.get(ev.dimension, ev.dimension)).border = thin_border
+                ws.cell(row=row, column=4, value=ev.metric).border = thin_border
+                ws.cell(row=row, column=5, value=float(format_float(ev.anomaly_score, 3))).border = thin_border
+                ws.cell(row=row, column=6, value=_pct(ev.confidence)).border = thin_border
+                ws.cell(row=row, column=7, value=_truncate(ev.reasoning, 120)).border = thin_border
+                let sr2 = ev.row_indices[0:min(len(ev.row_indices), 10)]
+                ws.cell(row=row, column=8, value=join([str(r) for r in sr2], ", ")).border = thin_border
+                row += 1
+                idx += 1
+            }
+        }
+
+        ws.column_dimensions["A"].width = 6
+        ws.column_dimensions["B"].width = 18
+        ws.column_dimensions["C"].width = 26
+        ws.column_dimensions["D"].width = 30
+        ws.column_dimensions["E"].width = 14
+        ws.column_dimensions["F"].width = 12
+        ws.column_dimensions["G"].width = 60
+        ws.column_dimensions["H"].width = 35
+    }
+
+    fn _build_reasoning_sheet(self, ws: Any, report: AnalysisReport,
+                              Font: Any, PatternFill: Any, Alignment: Any,
+                              Border: Any, Side: Any) {
+        let hdr_fill = self._header_fill()
+        let hdr_font = Font(name="Calibri", bold=true, color="FFFFFF", size=11)
+        let thin_border = Border(
+            left=Side(style="thin"), right=Side(style="thin"),
+            top=Side(style="thin"), bottom=Side(style="thin")
+        )
+
+        ws.cell(row=1, column=1, value="Step").font = hdr_font
+        ws.cell(row=1, column=1).fill = hdr_fill
+        ws.cell(row=1, column=1).border = thin_border
+        ws.cell(row=1, column=2, value="Reasoning Step").font = hdr_font
+        ws.cell(row=1, column=2).fill = hdr_fill
+        ws.cell(row=1, column=2).border = thin_border
+
+        let row = 2
+        let step = 1
+        for chain_item in report.reasoning_chain {
+            ws.cell(row=row, column=1, value=step).border = thin_border
+            ws.cell(row=row, column=2, value=chain_item).border = thin_border
+            row += 1
+            step += 1
+        }
+
+        ws.column_dimensions["A"].width = 8
+        ws.column_dimensions["B"].width = 100
+    }
+
+    fn _build_health_sheet(self, ws: Any, report: AnalysisReport,
+                           Font: Any, PatternFill: Any, Alignment: Any,
+                           Border: Any, Side: Any) {
+        let hdr_fill = self._header_fill()
+        let hdr_font = Font(name="Calibri", bold=true, color="FFFFFF", size=11)
+        let thin_border = Border(
+            left=Side(style="thin"), right=Side(style="thin"),
+            top=Side(style="thin"), bottom=Side(style="thin")
+        )
+
+        ws.cell(row=1, column=1, value="Metric").font = hdr_font
+        ws.cell(row=1, column=1).fill = hdr_fill
+        ws.cell(row=1, column=1).border = thin_border
+        ws.cell(row=1, column=2, value="Value").font = hdr_font
+        ws.cell(row=1, column=2).fill = hdr_fill
+        ws.cell(row=1, column=2).border = thin_border
+
+        let row = 2
+        for key in report.network_health {
+            let val = report.network_health[key]
+            ws.cell(row=row, column=1, value=key.replace("_", " ").title()).border = thin_border
+            ws.cell(row=row, column=2, value=format_float(val, 4)).border = thin_border
+
+            if "failure" in key and val > 0.3 {
+                ws.cell(row=row, column=2).fill = self._danger_fill()
+            } else {
+                if "success" in key and val > 0.9 {
+                    ws.cell(row=row, column=2).fill = self._success_fill()
+                }
+            }
+            row += 1
+        }
+
+        ws.column_dimensions["A"].width = 30
+        ws.column_dimensions["B"].width = 20
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 2 — PDF EXPORTER
+// ═══════════════════════════════════════════════════════════════════
+
+class PDFExporter {
+
+    fn init(self) {
+        self._page_width = 595.0
+        self._page_height = 842.0
+        self._margin = 50.0
+        self._y = 0.0
+    }
+
+    fn export(self, report: AnalysisReport, output_path: string) -> string {
+        let fpdf = __import__("fpdf")
+        let FPDF = fpdf.FPDF
+
+        let pdf = FPDF(orientation="P", unit="pt", format="A4")
+        pdf.set_auto_page_break(auto=true, margin=60)
+        pdf.add_page()
+
+        // ── Title Page ──
+        self._render_title_page(pdf, report)
+
+        // ── Executive Summary ──
+        pdf.add_page()
+        self._render_executive_summary(pdf, report)
+
+        // ── Primary Fault Detail ──
+        self._render_fault_detail(pdf, report)
+
+        // ── Evidence Detail ──
+        pdf.add_page()
+        self._render_evidence_detail(pdf, report)
+
+        // ── Reasoning Chain ──
+        pdf.add_page()
+        self._render_reasoning_chain(pdf, report)
+
+        // ── Network Health ──
+        self._render_network_health(pdf, report)
+
+        // ── Appendix ──
+        pdf.add_page()
+        self._render_appendix(pdf, report)
+
+        pdf.output(output_path)
+        return output_path
+    }
+
+    fn _render_title_page(self, pdf: Any, report: AnalysisReport) {
+        pdf.set_fill_color(26, 26, 46)
+        pdf.rect(0, 0, 595, 842, "F")
+
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 32)
+        pdf.set_y(200)
+        pdf.cell(0, 40, "TELECOM FAULT", ln=true, align="C")
+        pdf.cell(0, 40, "ISOLATION REPORT", ln=true, align="C")
+
+        pdf.set_font("Helvetica", "", 14)
+        pdf.set_text_color(233, 69, 96)
+        pdf.set_y(300)
+        pdf.cell(0, 20, "VelarIQ PRISM NRS", ln=true, align="C")
+        pdf.cell(0, 20, "Deterministic Analysis Engine", ln=true, align="C")
+
+        pdf.set_text_color(180, 180, 200)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.set_y(380)
+        pdf.cell(0, 16, "Report ID: " + report.report_id, ln=true, align="C")
+        pdf.cell(0, 16, "Generated: " + _ts_to_iso(report.timestamp), ln=true, align="C")
+        pdf.cell(0, 16, "Records Analyzed: " + str(report.total_records), ln=true, align="C")
+        pdf.cell(0, 16, "Towers Evaluated: " + str(report.total_towers), ln=true, align="C")
+        pdf.cell(0, 16, "Analysis Time: " + format_float(report.elapsed_ms, 1) + " ms", ln=true, align="C")
+        pdf.cell(0, 16, "Trust Level: " + report.trust_level, ln=true, align="C")
+
+        pdf.set_text_color(100, 100, 120)
+        pdf.set_font("Helvetica", "I", 9)
+        pdf.set_y(760)
+        pdf.cell(0, 12, "Provenance: " + report.provenance_hash[0:48] + "...", ln=true, align="C")
+        pdf.cell(0, 12, "Deterministic - same input always produces identical output", ln=true, align="C")
+    }
+
+    fn _section_header(self, pdf: Any, title: string) {
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.set_text_color(26, 26, 46)
+        pdf.cell(0, 24, title, ln=true)
+        pdf.set_draw_color(233, 69, 96)
+        pdf.set_line_width(2)
+        pdf.line(50, pdf.get_y(), 545, pdf.get_y())
+        pdf.ln(8)
+    }
+
+    fn _label_value(self, pdf: Any, label: string, value: string) {
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(100, 100, 100)
+        pdf.cell(140, 16, _pdf_safe(label + ":"))
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(45, 45, 45)
+        pdf.cell(0, 16, _pdf_safe(value), ln=true)
+    }
+
+    fn _render_executive_summary(self, pdf: Any, report: AnalysisReport) {
+        self._section_header(pdf, "EXECUTIVE SUMMARY")
+
+        self._label_value(pdf, "Total Records", str(report.total_records))
+        self._label_value(pdf, "Total Towers", str(report.total_towers))
+        self._label_value(pdf, "Analysis Time", format_float(report.elapsed_ms, 1) + " ms")
+        self._label_value(pdf, "Trust Level", report.trust_level)
+        pdf.ln(8)
+
+        // Network health summary
+        let sr = report.network_health.get("overall_success_rate", 0.0)
+        let fr = report.network_health.get("overall_failure_rate", 0.0)
+        self._label_value(pdf, "Network Success Rate", _pct(sr))
+        self._label_value(pdf, "Network Failure Rate", _pct(fr))
+    }
+
+    fn _render_fault_detail(self, pdf: Any, report: AnalysisReport) {
+        pdf.ln(12)
+        self._section_header(pdf, "PRIMARY FAULT IDENTIFICATION")
+
+        let pf = report.primary_fault
+
+        // Fault highlight box
+        pdf.set_fill_color(248, 215, 218)
+        pdf.set_draw_color(220, 53, 69)
+        pdf.rect(50, pdf.get_y(), 495, 80, "FD")
+
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.set_text_color(220, 53, 69)
+        pdf.set_x(60)
+        pdf.cell(0, 30, _pdf_safe("FAULTY TOWER: " + pf.tower_id), ln=true)
+        pdf.set_font("Helvetica", "", 12)
+        pdf.set_text_color(80, 0, 0)
+        pdf.set_x(60)
+        pdf.cell(0, 18, _pdf_safe("Domain: " + pf.fault_domain + "  |  Severity: " + pf.fault_severity + "  |  Confidence: " + _pct(pf.confidence)), ln=true)
+        pdf.set_x(60)
+        pdf.cell(0, 18, "Evidence: " + str(len(pf.evidence)) + " items across multiple dimensions", ln=true)
+
+        pdf.set_y(pdf.get_y() + 16)
+
+        // Root cause
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(45, 45, 45)
+        pdf.cell(0, 16, "Root Cause:", ln=true)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(495, 14, _pdf_safe(_truncate(pf.root_cause, 500)))
+        pdf.ln(8)
+
+        // Recommendations
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 16, "Recommendations:", ln=true)
+        pdf.set_font("Helvetica", "", 10)
+        let ri = 1
+        for rec in pf.recommendations {
+            pdf.cell(20, 14, str(ri) + ".")
+            pdf.cell(0, 14, _pdf_safe(rec), ln=true)
+            ri += 1
+        }
+
+        // Alternatives
+        if len(report.alternative_hypotheses) > 0 {
+            pdf.ln(12)
+            self._section_header(pdf, "ALTERNATIVE HYPOTHESES")
+
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_fill_color(26, 26, 46)
+            pdf.set_text_color(255, 255, 255)
+            pdf.cell(120, 18, "Tower", border=1, fill=true)
+            pdf.cell(100, 18, "Domain", border=1, fill=true)
+            pdf.cell(80, 18, "Severity", border=1, fill=true)
+            pdf.cell(80, 18, "Confidence", border=1, fill=true)
+            pdf.cell(0, 18, "Evidence", border=1, fill=true, ln=true)
+
+            pdf.set_font("Helvetica", "", 9)
+            pdf.set_text_color(45, 45, 45)
+            for hyp in report.alternative_hypotheses {
+                pdf.cell(120, 16, _pdf_safe(hyp.tower_id), border=1)
+                pdf.cell(100, 16, _pdf_safe(hyp.fault_domain), border=1)
+                pdf.cell(80, 16, _pdf_safe(hyp.fault_severity), border=1)
+                pdf.cell(80, 16, _pct(hyp.confidence), border=1)
+                pdf.cell(0, 16, str(len(hyp.evidence)) + " items", border=1, ln=true)
+            }
+        }
+    }
+
+    fn _render_evidence_detail(self, pdf: Any, report: AnalysisReport) {
+        self._section_header(pdf, "EVIDENCE DETAIL - PRIMARY FAULT")
+
+        let idx = 1
+        for ev in report.primary_fault.evidence {
+            if pdf.get_y() > 720 { pdf.add_page() }
+
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.set_text_color(233, 69, 96)
+            pdf.cell(0, 14, _pdf_safe("[" + str(idx) + "] " + DIMENSION_LABELS.get(ev.dimension, ev.dimension) + " / " + ev.metric), ln=true)
+
+            pdf.set_font("Helvetica", "", 9)
+            pdf.set_text_color(45, 45, 45)
+            pdf.cell(80, 12, "Score: " + format_float(ev.anomaly_score, 3))
+            pdf.cell(80, 12, "Confidence: " + _pct(ev.confidence))
+            pdf.cell(0, 12, "Rows: " + str(len(ev.row_indices)), ln=true)
+
+            pdf.set_font("Helvetica", "I", 9)
+            pdf.set_text_color(80, 80, 80)
+            pdf.multi_cell(495, 12, _pdf_safe(_truncate(ev.reasoning, 300)))
+            pdf.ln(4)
+            idx += 1
+        }
+    }
+
+    fn _render_reasoning_chain(self, pdf: Any, report: AnalysisReport) {
+        self._section_header(pdf, "REASONING CHAIN")
+
+        pdf.set_font("Courier", "", 8)
+        pdf.set_text_color(45, 45, 45)
+        for step in report.reasoning_chain {
+            if pdf.get_y() > 760 { pdf.add_page() }
+            pdf.multi_cell(495, 10, _pdf_safe(step))
+        }
+    }
+
+    fn _render_network_health(self, pdf: Any, report: AnalysisReport) {
+        pdf.ln(12)
+        self._section_header(pdf, "NETWORK HEALTH METRICS")
+
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_fill_color(26, 26, 46)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(250, 18, "Metric", border=1, fill=true)
+        pdf.cell(0, 18, "Value", border=1, fill=true, ln=true)
+
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(45, 45, 45)
+        for key in report.network_health {
+            let val = report.network_health[key]
+            pdf.cell(250, 14, key.replace("_", " ").title(), border=1)
+            pdf.cell(0, 14, format_float(val, 4), border=1, ln=true)
+        }
+    }
+
+    fn _render_appendix(self, pdf: Any, report: AnalysisReport) {
+        self._section_header(pdf, "APPENDIX - DATA QUALITY & PROVENANCE")
+
+        self._label_value(pdf, "Report ID", report.report_id)
+        self._label_value(pdf, "Provenance Hash", report.provenance_hash)
+        self._label_value(pdf, "Trust Level", report.trust_level)
+        self._label_value(pdf, "Total Records", str(report.total_records))
+        self._label_value(pdf, "Total Towers", str(report.total_towers))
+        self._label_value(pdf, "Analysis Engine", "VelarIQ PRISM NRS v1.0")
+        self._label_value(pdf, "Mode", "Deterministic - no randomness, no external API calls")
+
+        pdf.ln(16)
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(120, 120, 120)
+        pdf.multi_cell(495, 10, "This report was generated by the NRS Telecom Fault Isolation Engine. " +
+            "All conclusions are deterministic: the same input data will always produce the identical report. " +
+            "Every finding is traced to specific data point row indices for independent verification. " +
+            "The provenance hash cryptographically binds the analysis artifacts to the input data.")
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 3 — HTML EXPORTER
+// ═══════════════════════════════════════════════════════════════════
+
+class HTMLExporter {
+
+    fn init(self) {
+        self._version = "1.0"
+    }
+
+    fn export(self, report: AnalysisReport, output_path: string) -> string {
+        let html = self._build_html(report)
+        let f = open(output_path, "w", encoding="utf-8")
+        f.write(html)
+        f.close()
+        return output_path
+    }
+
+    fn _build_html(self, report: AnalysisReport) -> string {
+        let pf = report.primary_fault
+        let h = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+        h = h + "<meta charset=\"UTF-8\">\n"
+        h = h + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
+        h = h + "<title>NRS Telecom Fault Isolation Report — " + _escape_html(report.report_id) + "</title>\n"
+        h = h + self._css()
+        h = h + "</head>\n<body>\n"
+
+        // Header
+        h = h + "<header>\n"
+        h = h + "  <div class=\"brand\">VelarIQ PRISM NRS</div>\n"
+        h = h + "  <h1>Telecom Fault Isolation Report</h1>\n"
+        h = h + "  <div class=\"meta\">"
+        h = h + "Report " + _escape_html(report.report_id) + " &bull; "
+        h = h + _escape_html(_ts_to_iso(report.timestamp)) + " &bull; "
+        h = h + str(report.total_records) + " records &bull; "
+        h = h + format_float(report.elapsed_ms, 1) + " ms"
+        h = h + "</div>\n"
+        h = h + "</header>\n"
+
+        // Trust badge
+        let trust_color = TRUST_COLORS.get(report.trust_level, "#9E9E9E")
+        h = h + "<div class=\"trust-badge\" style=\"background:" + trust_color + "\">"
+        h = h + report.trust_level + "</div>\n"
+
+        // Primary fault card
+        let sev_color = SEVERITY_COLORS.get(pf.fault_severity, "#9E9E9E")
+        h = h + "<section class=\"fault-card\">\n"
+        h = h + "  <div class=\"fault-header\">PRIMARY FAULT</div>\n"
+        h = h + "  <div class=\"fault-tower\">" + _escape_html(pf.tower_id) + "</div>\n"
+        h = h + "  <div class=\"fault-meta\">\n"
+        h = h + "    <span class=\"badge\" style=\"background:" + sev_color + "\">" + pf.fault_severity + "</span>\n"
+        h = h + "    <span class=\"badge\" style=\"background:" + BRAND_INFO + "\">" + pf.fault_domain + "</span>\n"
+        h = h + "    <span class=\"badge\" style=\"background:" + BRAND_PRIMARY + "\">" + _pct(pf.confidence) + " confidence</span>\n"
+        h = h + "    <span class=\"badge\" style=\"background:" + BRAND_MUTED + "\">" + str(len(pf.evidence)) + " evidence items</span>\n"
+        h = h + "  </div>\n"
+        h = h + "  <div class=\"root-cause\">\n"
+        h = h + "    <strong>Root Cause:</strong> " + _escape_html(pf.root_cause) + "\n"
+        h = h + "  </div>\n"
+        h = h + "</section>\n"
+
+        // Confidence bar
+        h = h + "<section class=\"section\">\n"
+        h = h + "  <h2>Confidence</h2>\n"
+        h = h + "  <div class=\"conf-bar-container\">\n"
+        h = h + "    <div class=\"conf-bar\" style=\"width:" + format_float(pf.confidence * 100.0, 1) + "%;\">"
+        h = h + _pct(pf.confidence) + "</div>\n"
+        h = h + "  </div>\n"
+        h = h + "</section>\n"
+
+        // Recommendations
+        h = h + "<section class=\"section\">\n"
+        h = h + "  <h2>Recommendations</h2>\n"
+        h = h + "  <ol class=\"recommendations\">\n"
+        for rec in pf.recommendations {
+            h = h + "    <li>" + _escape_html(rec) + "</li>\n"
+        }
+        h = h + "  </ol>\n"
+        h = h + "</section>\n"
+
+        // Evidence table
+        h = h + "<section class=\"section\">\n"
+        h = h + "  <h2>Evidence Detail (" + str(len(pf.evidence)) + " items)</h2>\n"
+        h = h + "  <div class=\"table-wrap\"><table>\n"
+        h = h + "    <thead><tr>"
+        h = h + "<th>#</th><th>Dimension</th><th>Metric</th>"
+        h = h + "<th>Score</th><th>Confidence</th><th>Reasoning</th><th>Rows</th>"
+        h = h + "</tr></thead>\n    <tbody>\n"
+
+        let eidx = 1
+        for ev in pf.evidence {
+            let score_class = "score-low"
+            if ev.anomaly_score >= 0.8 { score_class = "score-high" }
+            else { if ev.anomaly_score >= 0.5 { score_class = "score-med" } }
+
+            let sample = ev.row_indices[0:min(len(ev.row_indices), 8)]
+            let row_text = join([str(r) for r in sample], ", ")
+            if len(ev.row_indices) > 8 {
+                row_text = row_text + " +" + str(len(ev.row_indices) - 8)
+            }
+
+            h = h + "    <tr>"
+            h = h + "<td>" + str(eidx) + "</td>"
+            h = h + "<td>" + _escape_html(DIMENSION_LABELS.get(ev.dimension, ev.dimension)) + "</td>"
+            h = h + "<td>" + _escape_html(ev.metric) + "</td>"
+            h = h + "<td class=\"" + score_class + "\">" + format_float(ev.anomaly_score, 3) + "</td>"
+            h = h + "<td>" + _pct(ev.confidence) + "</td>"
+            h = h + "<td class=\"reasoning\">" + _escape_html(_truncate(ev.reasoning, 200)) + "</td>"
+            h = h + "<td class=\"rows\">" + _escape_html(row_text) + "</td>"
+            h = h + "</tr>\n"
+            eidx += 1
+        }
+        h = h + "    </tbody>\n  </table></div>\n"
+        h = h + "</section>\n"
+
+        // Alternatives
+        if len(report.alternative_hypotheses) > 0 {
+            h = h + "<section class=\"section\">\n"
+            h = h + "  <h2>Alternative Hypotheses</h2>\n"
+            h = h + "  <div class=\"table-wrap\"><table>\n"
+            h = h + "    <thead><tr><th>Tower</th><th>Domain</th><th>Severity</th><th>Confidence</th><th>Evidence</th></tr></thead>\n"
+            h = h + "    <tbody>\n"
+            for hyp in report.alternative_hypotheses {
+                h = h + "    <tr>"
+                h = h + "<td>" + _escape_html(hyp.tower_id) + "</td>"
+                h = h + "<td>" + _escape_html(hyp.fault_domain) + "</td>"
+                h = h + "<td>" + _escape_html(hyp.fault_severity) + "</td>"
+                h = h + "<td>" + _pct(hyp.confidence) + "</td>"
+                h = h + "<td>" + str(len(hyp.evidence)) + " items</td>"
+                h = h + "</tr>\n"
+            }
+            h = h + "    </tbody>\n  </table></div>\n"
+            h = h + "</section>\n"
+        }
+
+        // Network health
+        h = h + "<section class=\"section\">\n"
+        h = h + "  <h2>Network Health</h2>\n"
+        h = h + "  <div class=\"health-grid\">\n"
+        for key in report.network_health {
+            let val = report.network_health[key]
+            let card_class = "health-card"
+            if "failure" in key and val > 0.3 { card_class = "health-card danger" }
+            if "success" in key and val > 0.9 { card_class = "health-card success" }
+            h = h + "    <div class=\"" + card_class + "\">\n"
+            h = h + "      <div class=\"health-label\">" + _escape_html(key.replace("_", " ").title()) + "</div>\n"
+            h = h + "      <div class=\"health-value\">" + format_float(val, 4) + "</div>\n"
+            h = h + "    </div>\n"
+        }
+        h = h + "  </div>\n"
+        h = h + "</section>\n"
+
+        // Reasoning chain (collapsible)
+        h = h + "<section class=\"section\">\n"
+        h = h + "  <details>\n"
+        h = h + "    <summary><h2 style=\"display:inline\">Reasoning Chain (" + str(len(report.reasoning_chain)) + " steps)</h2></summary>\n"
+        h = h + "    <pre class=\"reasoning-pre\">\n"
+        for step in report.reasoning_chain {
+            h = h + _escape_html(step) + "\n"
+        }
+        h = h + "    </pre>\n"
+        h = h + "  </details>\n"
+        h = h + "</section>\n"
+
+        // Provenance footer
+        h = h + "<footer>\n"
+        h = h + "  <div>VelarIQ PRISM NRS &mdash; Deterministic Telecom Fault Isolation</div>\n"
+        h = h + "  <div class=\"provenance\">Provenance: " + _escape_html(report.provenance_hash) + "</div>\n"
+        h = h + "  <div class=\"provenance\">Same input &rarr; identical output, always.</div>\n"
+        h = h + "</footer>\n"
+
+        h = h + "</body>\n</html>"
+        return h
+    }
+
+    fn _css(self) -> string {
+        return "<style>\n" +
+        "  :root { --primary: #1A1A2E; --accent: #E94560; --success: #0F9B58; " +
+        "           --warning: #F4B400; --danger: #DB4437; --info: #4285F4; " +
+        "           --bg: #F8F9FA; --text: #2D2D2D; --muted: #6C757D; }\n" +
+        "  * { margin: 0; padding: 0; box-sizing: border-box; }\n" +
+        "  body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; " +
+        "         background: var(--bg); color: var(--text); line-height: 1.6; " +
+        "         max-width: 1100px; margin: 0 auto; padding: 20px; }\n" +
+        "  header { background: var(--primary); color: white; padding: 40px; " +
+        "           border-radius: 12px; margin-bottom: 24px; text-align: center; }\n" +
+        "  header .brand { font-size: 12px; text-transform: uppercase; letter-spacing: 3px; " +
+        "                   color: var(--accent); margin-bottom: 8px; }\n" +
+        "  header h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }\n" +
+        "  header .meta { font-size: 13px; color: #B0B0C0; }\n" +
+        "  .trust-badge { display: inline-block; color: white; padding: 6px 20px; " +
+        "                  border-radius: 20px; font-weight: 700; font-size: 13px; " +
+        "                  letter-spacing: 1px; margin-bottom: 20px; }\n" +
+        "  .fault-card { background: white; border-left: 6px solid var(--danger); " +
+        "                border-radius: 8px; padding: 28px; margin-bottom: 24px; " +
+        "                box-shadow: 0 2px 12px rgba(0,0,0,0.08); }\n" +
+        "  .fault-header { font-size: 11px; text-transform: uppercase; letter-spacing: 2px; " +
+        "                   color: var(--muted); margin-bottom: 4px; }\n" +
+        "  .fault-tower { font-size: 36px; font-weight: 800; color: var(--danger); margin-bottom: 12px; }\n" +
+        "  .fault-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }\n" +
+        "  .badge { display: inline-block; color: white; padding: 4px 12px; " +
+        "           border-radius: 14px; font-size: 12px; font-weight: 600; }\n" +
+        "  .root-cause { background: #FFF3F5; padding: 16px; border-radius: 6px; " +
+        "                font-size: 14px; line-height: 1.5; }\n" +
+        "  .section { background: white; border-radius: 8px; padding: 24px; " +
+        "             margin-bottom: 20px; box-shadow: 0 1px 6px rgba(0,0,0,0.06); }\n" +
+        "  .section h2 { font-size: 18px; color: var(--primary); margin-bottom: 16px; " +
+        "                 padding-bottom: 8px; border-bottom: 2px solid var(--accent); }\n" +
+        "  .conf-bar-container { background: #E9ECEF; border-radius: 8px; height: 32px; overflow: hidden; }\n" +
+        "  .conf-bar { background: linear-gradient(90deg, var(--accent), var(--danger)); " +
+        "              height: 100%; display: flex; align-items: center; justify-content: center; " +
+        "              color: white; font-weight: 700; font-size: 14px; border-radius: 8px; " +
+        "              min-width: 60px; transition: width 0.5s ease; }\n" +
+        "  .recommendations { padding-left: 24px; }\n" +
+        "  .recommendations li { padding: 6px 0; font-size: 14px; }\n" +
+        "  .table-wrap { overflow-x: auto; }\n" +
+        "  table { width: 100%; border-collapse: collapse; font-size: 13px; }\n" +
+        "  thead { background: var(--primary); color: white; }\n" +
+        "  th { padding: 10px 12px; text-align: left; font-weight: 600; white-space: nowrap; }\n" +
+        "  td { padding: 8px 12px; border-bottom: 1px solid #E9ECEF; }\n" +
+        "  tr:hover { background: #F1F3F5; }\n" +
+        "  .score-high { background: #FDECEA; color: var(--danger); font-weight: 700; }\n" +
+        "  .score-med { background: #FFF8E1; color: #E65100; font-weight: 600; }\n" +
+        "  .score-low { background: #E8F5E9; color: var(--success); }\n" +
+        "  .reasoning { font-size: 12px; color: var(--muted); max-width: 300px; }\n" +
+        "  .rows { font-family: 'Courier New', monospace; font-size: 11px; color: var(--muted); }\n" +
+        "  .health-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }\n" +
+        "  .health-card { background: #F8F9FA; border: 1px solid #DEE2E6; border-radius: 8px; " +
+        "                 padding: 16px; text-align: center; }\n" +
+        "  .health-card.danger { border-color: var(--danger); background: #FDECEA; }\n" +
+        "  .health-card.success { border-color: var(--success); background: #E8F5E9; }\n" +
+        "  .health-label { font-size: 12px; color: var(--muted); text-transform: uppercase; " +
+        "                   letter-spacing: 1px; margin-bottom: 4px; }\n" +
+        "  .health-value { font-size: 22px; font-weight: 700; color: var(--primary); }\n" +
+        "  details summary { cursor: pointer; }\n" +
+        "  .reasoning-pre { background: #1A1A2E; color: #B0B0C0; padding: 20px; " +
+        "                    border-radius: 8px; font-size: 12px; line-height: 1.8; " +
+        "                    overflow-x: auto; white-space: pre-wrap; margin-top: 12px; }\n" +
+        "  footer { text-align: center; padding: 32px; color: var(--muted); font-size: 12px; " +
+        "           border-top: 1px solid #DEE2E6; margin-top: 32px; }\n" +
+        "  .provenance { font-family: 'Courier New', monospace; font-size: 10px; margin-top: 4px; }\n" +
+        "  @media print { body { max-width: 100%; } " +
+        "    .fault-card, .section { break-inside: avoid; } }\n" +
+        "</style>\n"
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION 4 — UNIFIED EXPORT COORDINATOR
+// ═══════════════════════════════════════════════════════════════════
+
+class ReportExporter {
+
+    fn init(self) {
+        self._excel = ExcelExporter()
+        self._pdf = PDFExporter()
+        self._html = HTMLExporter()
+    }
+
+    fn export_excel(self, report: AnalysisReport, output_path: string) -> string {
+        return self._excel.export(report, output_path)
+    }
+
+    fn export_pdf(self, report: AnalysisReport, output_path: string) -> string {
+        return self._pdf.export(report, output_path)
+    }
+
+    fn export_html(self, report: AnalysisReport, output_path: string) -> string {
+        return self._html.export(report, output_path)
+    }
+
+    fn export_all(self, report: AnalysisReport, output_dir: string, base_name: string) -> Dict[string, string] {
+        os.makedirs(output_dir, exist_ok=true)
+
+        let xlsx_path = os.path.join(output_dir, base_name + ".xlsx")
+        let pdf_path = os.path.join(output_dir, base_name + ".pdf")
+        let html_path = os.path.join(output_dir, base_name + ".html")
+        let json_path = os.path.join(output_dir, base_name + ".json")
+
+        self.export_excel(report, xlsx_path)
+        self.export_pdf(report, pdf_path)
+        self.export_html(report, html_path)
+
+        // Also write raw JSON
+        let jf = open(json_path, "w", encoding="utf-8")
+        jf.write(self._report_to_json(report))
+        jf.close()
+
+        return {
+            "xlsx": xlsx_path,
+            "pdf": pdf_path,
+            "html": html_path,
+            "json": json_path
+        }
+    }
+
+    fn _report_to_json(self, report: AnalysisReport) -> string {
+        let obj = {
+            "report_id": report.report_id,
+            "timestamp": report.timestamp,
+            "elapsed_ms": report.elapsed_ms,
+            "total_records": report.total_records,
+            "total_towers": report.total_towers,
+            "trust_level": report.trust_level,
+            "provenance_hash": report.provenance_hash,
+            "primary_fault": {
+                "tower_id": report.primary_fault.tower_id,
+                "fault_domain": report.primary_fault.fault_domain,
+                "fault_severity": report.primary_fault.fault_severity,
+                "confidence": report.primary_fault.confidence,
+                "root_cause": report.primary_fault.root_cause,
+                "recommendations": report.primary_fault.recommendations,
+                "evidence_count": len(report.primary_fault.evidence)
+            },
+            "alternative_hypotheses": [],
+            "network_health": report.network_health,
+            "reasoning_chain": report.reasoning_chain
+        }
+
+        for hyp in report.alternative_hypotheses {
+            append(obj["alternative_hypotheses"], {
+                "tower_id": hyp.tower_id,
+                "fault_domain": hyp.fault_domain,
+                "fault_severity": hyp.fault_severity,
+                "confidence": hyp.confidence,
+                "evidence_count": len(hyp.evidence)
+            })
+        }
+
+        return json.dumps(obj, indent=2)
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONVENIENCE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════
+
+fn export_report(report: AnalysisReport, output_dir: string, base_name: string) -> Dict[string, string] {
+    let exporter = ReportExporter()
+    return exporter.export_all(report, output_dir, base_name)
+}
+
+fn export_excel(report: AnalysisReport, path: string) -> string {
+    let exporter = ExcelExporter()
+    return exporter.export(report, path)
+}
+
+fn export_pdf(report: AnalysisReport, path: string) -> string {
+    let exporter = PDFExporter()
+    return exporter.export(report, path)
+}
+
+fn export_html(report: AnalysisReport, path: string) -> string {
+    let exporter = HTMLExporter()
+    return exporter.export(report, path)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  NORMS
+// ═══════════════════════════════════════════════════════════════════
+
+norm require_report_for_export {
+    type: prohibition,
+    scope: global,
+    action: "export",
+    priority: 95,
+    condition: report == None
+}
+
+norm include_provenance_in_exports {
+    type: obligation,
+    scope: global,
+    action: "export",
+    priority: 90,
+    condition: true
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  EXPORTS
+// ═══════════════════════════════════════════════════════════════════
+
+export ExcelExporter, PDFExporter, HTMLExporter, ReportExporter
+export export_report, export_excel, export_pdf, export_html

@@ -1,0 +1,50 @@
+{
+  "domain": "healthcare",
+  "version": "2026.1",
+  "source": "WHO / NIH / AMA / clinical practice guidelines",
+  "source_tier": "t2_verified",
+  "facts": [
+    {
+      "id": "hc-diagnostic-process",
+      "text": "Clinical diagnostic process: chief complaint and history of present illness (HPI), review of systems (ROS), physical examination, differential diagnosis generation (ranked list of possible conditions), diagnostic testing (labs, imaging, pathology), diagnosis confirmation or revision. Bayesian reasoning applies: pre-test probability updated by test sensitivity/specificity to yield post-test probability.",
+      "confidence": 0.96,
+      "tags": ["diagnosis", "clinical-process", "causal", "logical"]
+    },
+    {
+      "id": "hc-vital-signs",
+      "text": "Normal adult vital sign ranges: heart rate 60-100 bpm, blood pressure <120/80 mmHg (normal), respiratory rate 12-20 breaths/min, temperature 36.1-37.2C (97-99F), SpO2 95-100%. Abnormal vitals indicate: tachycardia (HR>100, causes include fever, pain, hypovolemia, anxiety), bradycardia (HR<60, causes include medications, heart block, hypothyroidism), hypertension (BP>140/90), hypotension (BP<90/60).",
+      "confidence": 0.97,
+      "tags": ["vital-signs", "normal-ranges", "mathematical", "causal"]
+    },
+    {
+      "id": "hc-drug-interactions",
+      "text": "Drug interaction categories: pharmacokinetic (absorption, distribution, metabolism, excretion changes) and pharmacodynamic (additive, synergistic, or antagonistic effects at receptor level). CYP450 enzyme system (CYP3A4, CYP2D6, CYP2C19) mediates most drug metabolism. Inhibitors increase drug levels (risk of toxicity), inducers decrease levels (risk of therapeutic failure). Warfarin, digoxin, and lithium have narrow therapeutic indices requiring careful monitoring.",
+      "confidence": 0.95,
+      "tags": ["drug-interactions", "pharmacology", "causal", "logical"]
+    },
+    {
+      "id": "hc-lab-interpretation",
+      "text": "Common lab panels: CBC (Complete Blood Count: WBC, RBC, hemoglobin, hematocrit, platelets), BMP (Basic Metabolic Panel: sodium, potassium, chloride, CO2, BUN, creatinine, glucose), LFTs (Liver Function Tests: AST, ALT, ALP, bilirubin, albumin), lipid panel (total cholesterol, LDL, HDL, triglycerides), HbA1c (glycated hemoglobin, 3-month glucose average). Critical values requiring immediate notification: potassium <3.0 or >6.0, glucose <50 or >500, hemoglobin <7.0.",
+      "confidence": 0.96,
+      "tags": ["lab-values", "interpretation", "mathematical", "diagnostic"]
+    },
+    {
+      "id": "hc-triage-systems",
+      "text": "Emergency triage systems: ESI (Emergency Severity Index) 5-level scale: Level 1 (resuscitation, immediate life threat), Level 2 (emergent, high risk), Level 3 (urgent, multiple resources needed), Level 4 (less urgent, one resource), Level 5 (non-urgent, no resources). Manchester Triage System uses flowcharts with discriminators. Triage determines treatment priority, not diagnosis.",
+      "confidence": 0.95,
+      "tags": ["triage", "emergency", "classification", "logical"]
+    },
+    {
+      "id": "hc-evidence-levels",
+      "text": "Evidence hierarchy for clinical decisions: Level I (systematic reviews/meta-analyses of RCTs), Level II (randomized controlled trials), Level III (controlled trials without randomization), Level IV (case-control/cohort studies), Level V (systematic reviews of descriptive studies), Level VI (single descriptive/qualitative studies), Level VII (expert opinion). Clinical practice guidelines synthesize evidence into actionable recommendations graded A (strong) through D (weak).",
+      "confidence": 0.96,
+      "tags": ["evidence-based-medicine", "hierarchy", "logical", "metacognitive"]
+    },
+    {
+      "id": "hc-hipaa-requirements",
+      "text": "HIPAA (Health Insurance Portability and Accountability Act) requires: Privacy Rule (limits use/disclosure of PHI, minimum necessary standard, patient access rights), Security Rule (administrative, physical, technical safeguards for ePHI), Breach Notification Rule (notify individuals within 60 days, HHS if >500 affected). PHI includes any individually identifiable health information. De-identification via Safe Harbor (remove 18 identifiers) or Expert Determination methods.",
+      "confidence": 0.96,
+      "tags": ["hipaa", "privacy", "security", "compliance", "logical"]
+    }
+  ]
+}

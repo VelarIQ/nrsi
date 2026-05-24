@@ -1,0 +1,2743 @@
+/// NRS Core Processing Engine — complete neuromorphic reasoning pipeline.
+///
+/// Includes: neuron activation, PVS-4 pattern cache, H-score truthfulness
+/// validation, complexity analysis, lobe processors (linguistic, logical,
+/// mathematical, spatial, temporal, creative), inhibitory network, tuition
+/// system, symbiotic mesh, cross-domain transfer, VLT memory hierarchy,
+/// language detection, and the full NRSProcessingPipeline.
+///
+/// Patent-covered: Binary neuron bank, PVS-4 hypervector cache, H-score,
+/// hierarchical lobe architecture, inhibitory network, tuition system,
+/// symbiotic mesh, VLT 4-layer memory, cross-domain transfer.
+///
+/// Ported from nrsip/nrs_core.py.
+
+module nrs_core
+
+
+import time from "std/time"
+import log from "logging"
+import hashlib from "std/hashlib"
+import json from "std/json"
+import uuid from "std/uuid"
+import os from "std/os"
+import re from "std/re"
+import math from "std/math"
+import FlowDirection, Layer, FlowRecord, HierarchicalPipeline,
+       PipelineResult from "hierarchy"
+import ProvenanceBuilder, SectionLabel from "provenance"
+import KnowledgePattern, KnowledgeBase from "nrs_knowledge"
+
+/// ── Processing Mode ──
+
+enum ProcessingMode {
+    DETERMINISTIC = "DETERMINISTIC",
+    PROBABILISTIC = "PROBABILISTIC",
+    HYBRID = "HYBRID"
+}
+
+/// ── Axiom Tier ──
+
+enum AxiomTier {
+    UNIVERSAL = "UNIVERSAL",
+    DOMAIN = "DOMAIN",
+    CONTEXTUAL = "CONTEXTUAL",
+    HEURISTIC = "HEURISTIC"
+}
+
+/// ── Axiom ──
+
+type Axiom {
+    id: string,
+    tier: AxiomTier,
+    domain: string,
+    statement: string,
+    confidence: float,
+    source: string,
+    created_at: float
+}
+
+/// ── Axiom Store ──
+
+class AxiomStore {
+    fn init(self) {
+        self._axioms = {}
+        self._domain_index = {}
+        self._tier_index = {}
+    }
+
+    fn add(self, axiom: Axiom) {
+        self._axioms[axiom.id] = axiom
+        if self._domain_index.get(axiom.domain, nil) == nil {
+            self._domain_index[axiom.domain] = []
+        }
+        self._domain_index[axiom.domain].append(axiom.id)
+        let tier_key = axiom.tier.value
+        if self._tier_index.get(tier_key, nil) == nil {
+            self._tier_index[tier_key] = []
+        }
+        self._tier_index[tier_key].append(axiom.id)
+    }
+
+    fn get(self, axiom_id: string) -> Optional[Axiom] {
+        return self._axioms.get(axiom_id, nil)
+    }
+
+    fn query(self, domain: Optional[string], tier: Optional[AxiomTier],
+             min_confidence: float) -> List[any] {
+        let results = []
+        let candidates = self._axioms.values()
+        for ax in candidates {
+            if domain != nil {
+                if ax.domain != domain {
+                    continue
+                }
+            }
+            if tier != nil {
+                if ax.tier != tier {
+                    continue
+                }
+            }
+            if ax.confidence < min_confidence {
+                continue
+            }
+            results.append(ax)
+        }
+        results.sort_by(fn(a: Axiom) -> float { return -a.confidence })
+        return results
+    }
+
+    fn count(self) -> int {
+        return self._axioms.len()
+    }
+}
+
+/// ── PVS-4 Pattern Velocity System ──
+
+type PVSMatch {
+    text: string,
+    tier: string,
+    confidence: float,
+    data: Map[string, any],
+    similarity: float,
+    matched_at: float
+}
+
+class PVS4 {
+    fn init(self, vector_bits: int) {
+        self._vector_bits = vector_bits
+        self._patterns = {}
+        self._lookups = 0
+        self._hits = 0
+    }
+
+    fn signature(self, text: string) -> bytes {
+        return hashlib.sha256(text).hexdigest().to_bytes()
+    }
+
+    fn _hash_key(self, text: string) -> string {
+        return hashlib.sha256(text.lower().strip()).hexdigest()
+    }
+
+    fn store(self, text: string, tier: string, confidence: float,
+             data: Optional[Map[string, any]]) {
+        let key = self._hash_key(text)
+        let d = data
+        if d == nil {
+            d = {}
+        }
+        self._patterns[key] = {
+            "text": text,
+            "tier": tier,
+            "confidence": confidence,
+            "data": d,
+            "stored_at": time.time()
+        }
+    }
+
+    fn lookup(self, text: string) -> Optional[PVSMatch] {
+        self._lookups += 1
+        let key = self._hash_key(text)
+        let entry = self._patterns.get(key, nil)
+        if entry == nil {
+            return nil
+        }
+        self._hits += 1
+        return PVSMatch {
+            text: entry["text"],
+            tier: entry["tier"],
+            confidence: entry["confidence"],
+            data: entry["data"],
+            similarity: 1.0,
+            matched_at: time.time()
+        }
+    }
+
+    fn stats(self) -> any {
+        let hit_rate = 0.0
+        if self._lookups > 0 {
+            hit_rate = to_float(self._hits) / to_float(self._lookups)
+        }
+        return {
+            "patterns": self._patterns.len(),
+            "lookups": self._lookups,
+            "hits": self._hits,
+            "hit_rate": hit_rate,
+            "vector_bits": self._vector_bits
+        }
+    }
+}
+
+/// ── H-Score (Truthfulness Validation) ──
+
+type HScoreResult {
+    score: float,
+    verdict: string,
+    components: Map[string, float],
+    claims_unconfirmed: Optional[List[string]]
+}
+
+let TRUTH_FLOOR = 0.72
+
+class HScoreCalculator {
+    fn init(self) {
+        self._evaluations = 0
+        self._claim_patterns = [
+            "is ", "are ", "was ", "were ", "has ", "have ", "will ",
+            "causes ", "leads to ", "results in ", "prevents ",
+            "always ", "never ", "must ", "cannot ", "requires "
+        ]
+        self._strong_claim_words = [
+            "always", "never", "all", "none", "every", "no one",
+            "impossible", "guaranteed", "certain", "definitely",
+            "proven", "absolute", "100%"
+        ]
+    }
+
+    fn _extract_claims(self, answer: string) -> List[string] {
+        let claims = []
+        let sentences = answer.split(".")
+        for sent in sentences {
+            let trimmed = sent.strip()
+            if len(trimmed) < 10 { continue }
+
+            let lower = trimmed.lower()
+            let is_claim = false
+            for pattern in self._claim_patterns {
+                if pattern in lower {
+                    is_claim = true
+                    break
+                }
+            }
+            if is_claim {
+                append(claims, trimmed)
+            }
+        }
+        return claims
+    }
+
+    fn _check_entailment(self, claim: string, axioms_matched: int,
+                          domain: string) -> bool {
+        let lower = claim.lower()
+
+        for strong in self._strong_claim_words {
+            if strong in lower {
+                if axioms_matched < 2 {
+                    return false
+                }
+            }
+        }
+
+        if axioms_matched > 0 { return true }
+
+        let hedged = false
+        let hedge_words = ["might", "perhaps", "possibly", "could", "maybe",
+                           "likely", "probably", "suggests", "appears"]
+        for hw in hedge_words {
+            if hw in lower { hedged = true; break }
+        }
+        if hedged { return true }
+
+        return false
+    }
+
+    fn evaluate(self, answer: string, domain: string, confidence: float,
+                axioms_matched: int, mode: string) -> HScoreResult {
+        self._evaluations += 1
+
+        let factual_grounding = 0.0
+        if axioms_matched > 0 {
+            factual_grounding = min(1.0, to_float(axioms_matched) * 0.25)
+        }
+
+        let consistency = min(1.0, confidence * 1.1)
+
+        let source_quality = 0.7
+        if mode == "DETERMINISTIC" {
+            source_quality = 0.9
+        } else if mode == "HYBRID" {
+            source_quality = 0.8
+        }
+
+        let hedging_penalty = 0.0
+        let answer_lower = answer.lower()
+        let hedge_words = [ "might", "perhaps", "possibly", "could be", "maybe" ]
+        for hw in hedge_words {
+            if answer_lower.contains(hw) {
+                hedging_penalty += 0.02
+            }
+        }
+
+        let length_factor = 1.0
+        if answer.len() < 20 {
+            length_factor = 0.8
+        } else if answer.len() > 2000 {
+            length_factor = 0.95
+        }
+
+        // Claim extraction and entailment checking
+        let claims = self._extract_claims(answer)
+        let unconfirmed = []
+        let entailment_penalty = 0.0
+
+        for claim in claims {
+            let entailed = self._check_entailment(claim, axioms_matched, domain)
+            if not entailed {
+                append(unconfirmed, claim)
+                entailment_penalty += 0.03
+            }
+        }
+
+        if len(claims) > 0 and len(unconfirmed) == len(claims) {
+            entailment_penalty += 0.10
+        }
+
+        let score = (factual_grounding * 0.30 +
+                     consistency * 0.25 +
+                     source_quality * 0.20 +
+                     length_factor * 0.10 +
+                     (1.0 - entailment_penalty) * 0.15) - hedging_penalty
+
+        if score < 0.0 { score = 0.0 }
+        if score > 1.0 { score = 1.0 }
+
+        let verdict = "validated"
+        if score < TRUTH_FLOOR {
+            verdict = "unvalidated"
+        } else if score < 0.85 {
+            verdict = "low_confidence"
+        } else if score >= 0.95 {
+            verdict = "high_confidence"
+        }
+
+        if len(unconfirmed) > 0 and verdict != "unvalidated" {
+            verdict = verdict + "_with_unconfirmed_claims"
+        }
+
+        return HScoreResult {
+            score: score,
+            verdict: verdict,
+            components: {
+                "factual_grounding": factual_grounding,
+                "consistency": consistency,
+                "source_quality": source_quality,
+                "length_factor": length_factor,
+                "hedging_penalty": hedging_penalty,
+                "entailment_penalty": entailment_penalty,
+                "claims_extracted": to_float(len(claims)),
+                "claims_unconfirmed_count": to_float(len(unconfirmed))
+            },
+            claims_unconfirmed: unconfirmed if len(unconfirmed) > 0 else nil
+        }
+    }
+}
+
+/// ── Tier & Complexity ──
+
+enum Tier {
+    T0 = "T0",
+    T1 = "T1",
+    T2 = "T2",
+    T3 = "T3",
+    T4 = "T4"
+}
+
+type ComplexityScore {
+    raw_score: float,
+    tier: Optional[Tier],
+    domain_hint: Optional[string],
+    word_count: int,
+    has_code: bool,
+    has_math: bool,
+    technical_density: float,
+    question_depth: int
+}
+
+fn default_complexity_score() -> ComplexityScore {
+    return ComplexityScore {
+        raw_score: 0.0,
+        tier: nil,
+        domain_hint: nil,
+        word_count: 0,
+        has_code: false,
+        has_math: false,
+        technical_density: 0.0,
+        question_depth: 0
+    }
+}
+
+class ComplexityAnalyzer {
+    fn init(self) {
+        self._analyses = 0
+    }
+
+    fn analyze(self, query: string, pvs_hit: bool,
+               activation_sparsity: float) -> ComplexityScore {
+        self._analyses += 1
+        let words = query.split(" ")
+        let word_count = words.len()
+        let ql = query.lower()
+
+        let has_code = ql.contains("code") || ql.contains("function") ||
+                       ql.contains("class") || ql.contains("def ") ||
+                       ql.contains("import ") || ql.contains("```")
+        let has_math = ql.contains("equation") || ql.contains("integral") ||
+                       ql.contains("derivative") || ql.contains("matrix") ||
+                       ql.contains("solve") || ql.contains("calculate")
+
+        let technical_terms = [
+            "algorithm", "quantum", "neural", "protocol", "cryptographic",
+            "distributed", "concurrent", "asymptotic", "topology", "entropy"
+        ]
+        let tech_count = 0
+        for term in technical_terms {
+            if ql.contains(term) {
+                tech_count += 1
+            }
+        }
+        let technical_density = to_float(tech_count) / max(to_float(word_count), 1.0)
+
+        let question_depth = 0
+        let depth_markers = [ "why", "how does", "explain", "compare",
+                                            "analyze", "evaluate", "what if" ]
+        for marker in depth_markers {
+            if ql.contains(marker) {
+                question_depth += 1
+            }
+        }
+
+        let raw_score = 0.0
+        raw_score += min(to_float(word_count) * 0.5, 30.0)
+        if has_code { raw_score += 15.0 }
+        if has_math { raw_score += 15.0 }
+        raw_score += technical_density * 20.0
+        raw_score += to_float(question_depth) * 5.0
+        raw_score += activation_sparsity * 10.0
+        if pvs_hit { raw_score -= 10.0 }
+        if raw_score < 0.0 { raw_score = 0.0 }
+        if raw_score > 100.0 { raw_score = 100.0 }
+
+        let tier = Tier.T1
+        if raw_score >= 80.0 { tier = Tier.T4 }
+        else if raw_score >= 60.0 { tier = Tier.T3 }
+        else if raw_score >= 35.0 { tier = Tier.T2 }
+        else if raw_score >= 15.0 { tier = Tier.T1 }
+        else { tier = Tier.T0 }
+
+        let domain_hint = nil
+        let domain_keywords = {
+            "medical": [ "patient", "diagnosis", "symptom", "treatment", "disease" ],
+            "financial": [ "stock", "investment", "portfolio", "market", "revenue" ],
+            "legal": [ "law", "court", "statute", "jurisdiction", "contract" ],
+            "engineering": [ "system", "design", "architecture", "component", "infrastructure" ],
+            "physics": [ "quantum", "particle", "energy", "force", "gravity" ]
+        }
+        let best_domain_hits = 0
+        for d in domain_keywords.keys() {
+            let hits = 0
+            for kw in domain_keywords[d] {
+                if ql.contains(kw) { hits += 1 }
+            }
+            if hits > best_domain_hits {
+                best_domain_hits = hits
+                domain_hint = d
+            }
+        }
+
+        return ComplexityScore {
+            raw_score: raw_score,
+            tier: tier,
+            domain_hint: domain_hint,
+            word_count: word_count,
+            has_code: has_code,
+            has_math: has_math,
+            technical_density: technical_density,
+            question_depth: question_depth
+        }
+    }
+}
+
+/// ── Lobe System ──
+
+enum LobeType {
+    LINGUISTIC = "linguistic",
+    LOGICAL = "logical",
+    MATHEMATICAL = "mathematical",
+    SPATIAL = "spatial",
+    TEMPORAL = "temporal",
+    CREATIVE = "creative"
+}
+
+type LobeResult {
+    lobe: LobeType,
+    value: string,
+    confidence: float,
+    needs_escalation: bool,
+    metadata: Map[string, any]
+}
+
+fn default_lobe_result(lobe: LobeType) -> LobeResult {
+    return LobeResult {
+        lobe: lobe,
+        value: "",
+        confidence: 0.0,
+        needs_escalation: false,
+        metadata: {}
+    }
+}
+
+class LobeProcessor {
+    fn init(self, lobe_type: LobeType, escalation_threshold: float) {
+        self.lobe_type = lobe_type
+        self.escalation_threshold = escalation_threshold
+        self._invocations = 0
+        self._knowledge_loader = nil
+        self._cognitive_bridge = nil
+    }
+
+    fn set_knowledge_loader(self, loader: any) {
+        self._knowledge_loader = loader
+    }
+
+    fn set_cognitive_bridge(self, bridge: any) {
+        self._cognitive_bridge = bridge
+    }
+
+    fn process(self, query: string, domain: string) -> LobeResult {
+        self._invocations += 1
+        return default_lobe_result(self.lobe_type)
+    }
+
+    fn stats(self) -> any {
+        return {
+            "lobe": self.lobe_type.value,
+            "invocations": self._invocations,
+            "escalation_threshold": self.escalation_threshold
+        }
+    }
+}
+
+/// ── Linguistic Lobe ──
+
+class LinguisticLobe(LobeProcessor) {
+    fn init(self) {
+        super.init(LobeType.LINGUISTIC, 2.0)
+    }
+
+    fn process(self, query: string, domain: string) -> LobeResult {
+        self._invocations += 1
+        let tokens = query.split(" ")
+        let ql = query.lower()
+
+        let knowledge_facts = []
+        let knowledge_conf = 0.0
+        let crease = nil
+        if self._knowledge_loader != nil {
+            let matches = self._knowledge_loader.query(query, nil, 3)
+            for m in matches {
+                if m.score > 0.05 {
+                    if m.fact.text.len() > 20 {
+                        knowledge_facts.append(m.fact.text)
+                    }
+                }
+            }
+            if knowledge_facts.len() > 0 {
+                knowledge_conf = matches[0].score
+            }
+        }
+
+        let entities = self._extract_entities(query)
+        let key_phrases = self._extract_key_phrases(tokens)
+
+        let answer = ""
+        let conf = 0.0
+        if knowledge_facts.len() > 0 {
+            answer = knowledge_facts.join(" ")
+            conf = min(0.99, max(0.95, knowledge_conf))
+        } else if crease != nil {
+            let topic = query.slice(0, 60)
+            if key_phrases.len() > 0 {
+                topic = key_phrases.slice(0, min(3, key_phrases.len())).join(" ")
+            }
+            answer = "In the " + domain + " domain, " + topic + " relates to " + to_string(crease) +
+                     ". This concept plays an important role in understanding how the underlying systems and principles interact."
+            conf = 0.92
+        } else {
+            answer = self._synthesize_from_entities(query, entities, key_phrases, domain)
+            conf = 0.88
+        }
+
+        let unique_set = set()
+        for t in tokens {
+            unique_set.add(t.lower())
+        }
+        let vocab_richness = to_float(unique_set.len()) / max(to_float(tokens.len()), 1.0)
+
+        return LobeResult {
+            lobe: self.lobe_type,
+            value: answer,
+            confidence: conf,
+            needs_escalation: false,
+            metadata: {
+                "token_count": tokens.len(),
+                "vocab_richness": vocab_richness,
+                "entities": entities,
+                "key_phrases": key_phrases,
+                "knowledge_facts_used": knowledge_facts.len(),
+                "crease_match": crease
+            }
+        }
+    }
+
+    fn _extract_entities(self, text: string) -> List[any] {
+        let entities = []
+        let words = text.split(" ")
+        for i in range(0, words.len()) {
+            let clean = words[i].strip(".,!?;:()")
+            if clean.len() > 1 {
+                if i > 0 {
+                    if clean.char_at(0).is_upper() {
+                        entities.append(clean)
+                    }
+                }
+            }
+        }
+        return entities
+    }
+
+    fn _extract_key_phrases(self, tokens: List[string]) -> List[any] {
+        let question_words = { "what", "who", "where", "when", "why", "how", "which" }
+        let stop_words = { "is", "are", "the", "a", "an", "of", "in", "to", "for", "and", "or", "it", "do", "does" }
+        let meaningful = []
+        for t in tokens {
+            let tl = t.lower()
+            if !question_words.contains(tl) {
+                if !stop_words.contains(tl) {
+                    if t.len() > 2 {
+                        meaningful.append(t)
+                    }
+                }
+            }
+        }
+        if meaningful.len() > 5 {
+            return meaningful.slice(0, 5)
+        }
+        return meaningful
+    }
+
+    fn _synthesize_from_entities(self, query: string, entities: List[string],
+                                  key_phrases: List[string], domain: string) -> string {
+        if self._knowledge_loader != nil {
+            let global_matches = self._knowledge_loader.query(query, nil, 5)
+            let usable = []
+            for m in global_matches {
+                if m.score > 0.01 {
+                    if m.fact.text.len() > 20 {
+                        usable.append(m.fact.text)
+                    }
+                }
+            }
+            if usable.len() > 0 {
+                let limit = min(3, usable.len())
+                return usable.slice(0, limit).join(" ")
+            }
+        }
+        return ""
+    }
+}
+
+/// ── Logical Lobe ──
+
+class LogicalLobe(LobeProcessor) {
+    fn init(self) {
+        super.init(LobeType.LOGICAL, 1.5)
+    }
+
+    fn process(self, query: string, domain: string) -> LobeResult {
+        self._invocations += 1
+        let ql = query.lower()
+
+        let conditional_kws = [ "if", "then", "therefore", "implies", "because" ]
+        let negation_kws = [ "not", "never", "no", "cannot" ]
+        let comparison_kws = [ "compare", "versus", "vs", "difference", "similar", "unlike", "better", "worse" ]
+        let causal_kws = [ "cause", "effect", "result", "lead", "consequence", "due to" ]
+
+        let conditionals = 0
+        for kw in conditional_kws {
+            if ql.contains(kw) { conditionals += 1 }
+        }
+        let negations = 0
+        for kw in negation_kws {
+            if ql.contains(kw) { negations += 1 }
+        }
+        let comparisons = 0
+        for kw in comparison_kws {
+            if ql.contains(kw) { comparisons += 1 }
+        }
+        let causal = 0
+        for kw in causal_kws {
+            if ql.contains(kw) { causal += 1 }
+        }
+
+        if self._cognitive_bridge != nil {
+            try {
+                let concepts = []
+                for w in query.split(" ") {
+                    if w.len() > 3 {
+                        concepts.append(w)
+                        if concepts.len() >= 4 { break }
+                    }
+                }
+                let seed_concept = query.slice(0, 20)
+                if concepts.len() > 0 {
+                    seed_concept = concepts[0]
+                }
+                let inferences = self._cognitive_bridge._engine.forward_chain(seed_concept, 3)
+                if inferences != nil {
+                    if inferences.len() > 0 {
+                        let lines = []
+                        let max_inf = min(5, inferences.len())
+                        let max_conf = 0.0
+                        for i in range(0, max_inf) {
+                            let inf = inferences[i]
+                            let path_str = ""
+                            if inf.path != nil {
+                                path_str = inf.path.join(" -> ")
+                            }
+                            lines.append(to_string(inf.conclusion) + " (" + path_str +
+                                         ", conf=" + to_string(round(inf.confidence, 2)) + ")")
+                            if inf.confidence > max_conf {
+                                max_conf = inf.confidence
+                            }
+                        }
+                        return LobeResult {
+                            lobe: self.lobe_type,
+                            value: lines.join(". "),
+                            confidence: max_conf,
+                            needs_escalation: false,
+                            metadata: {
+                                "mode": "cognitive_inference",
+                                "inference_count": inferences.len(),
+                                "conditionals": conditionals,
+                                "causal_indicators": causal
+                            }
+                        }
+                    }
+                }
+            } catch(e) {
+                log.debug("Non-critical failure in cognitive inference: " + to_string(e))
+            }
+        }
+
+        let reasoning_chain = self._build_reasoning_chain(query, conditionals, negations, comparisons, causal)
+        let conf = 0.86 + min(to_float(conditionals) * 0.03 + to_float(comparisons) * 0.02 + to_float(causal) * 0.03, 0.12)
+        let needs_esc = conditionals >= 3 || negations >= 2 || (comparisons >= 2 && causal >= 1)
+
+        return LobeResult {
+            lobe: self.lobe_type,
+            value: reasoning_chain,
+            confidence: conf,
+            needs_escalation: needs_esc,
+            metadata: {
+                "conditionals": conditionals,
+                "negations": negations,
+                "comparisons": comparisons,
+                "causal_indicators": causal,
+                "chain_steps": reasoning_chain.split(". ").len()
+            }
+        }
+    }
+
+    fn _build_reasoning_chain(self, query: string, conditionals: int,
+                               negations: int, comparisons: int, causal: int) -> string {
+        let steps = []
+        let ql = query.lower()
+
+        if conditionals > 0 {
+            if ql.contains("if") {
+                if ql.contains("then") {
+                    let parts = ql.split("then")
+                    let premise = parts[0].replace("if", "").strip().strip(",")
+                    let consequent = parts[1].strip().strip("?!.")
+                    steps.append("Starting from the premise that " + premise)
+                    steps.append("We can reason that the consequent follows: " + consequent)
+                    steps.append("This conditional holds when the antecedent conditions are satisfied")
+                } else {
+                    steps.append("This involves conditional reasoning with dependent propositions")
+                    steps.append("Each condition must be evaluated to determine the logical outcome")
+                }
+            } else {
+                steps.append("This involves conditional reasoning with dependent propositions")
+                steps.append("Each condition must be evaluated to determine the logical outcome")
+            }
+        }
+
+        if comparisons > 0 {
+            steps.append("Comparative analysis reveals that the subjects share some properties while differing in others")
+            steps.append("The key distinctions lie in their scope, performance characteristics, and applicable contexts")
+        }
+
+        if causal > 0 {
+            steps.append("Tracing the causal chain, we can identify both proximate causes and underlying systemic factors")
+            steps.append("The effect propagates through interconnected systems, with feedback mechanisms that can amplify or dampen the result")
+        }
+
+        if negations > 0 {
+            steps.append("Accounting for the logical negation, the scope of what is excluded helps define the boundaries of the claim")
+        }
+
+        if steps.len() == 0 {
+            steps.append("Evaluating the logical structure of this query, the core proposition can be decomposed into its constituent claims")
+            steps.append("Each claim can be assessed independently for validity, and the overall argument evaluated for soundness")
+        }
+
+        return steps.join(". ")
+    }
+}
+
+/// ── Mathematical Lobe ──
+
+class MathematicalLobe(LobeProcessor) {
+    fn init(self) {
+        super.init(LobeType.MATHEMATICAL, 1.0)
+    }
+
+    fn process(self, query: string, domain: string) -> LobeResult {
+        self._invocations += 1
+        let digit_count = 0
+        let operator_count = 0
+        for c in query.chars() {
+            if c.is_digit() { digit_count += 1 }
+            if "+-*/=<>^%".contains(to_string(c)) { operator_count += 1 }
+        }
+        let math_kw = { "integral", "derivative", "equation", "matrix", "proof",
+                                      "theorem", "solve", "calculate", "compute", "sum",
+                                      "product", "factor", "simplify" }
+        let kw_hits = 0
+        let ql = query.lower()
+        for kw in math_kw {
+            if ql.contains(kw) { kw_hits += 1 }
+        }
+
+        let result_text = "Mathematical analysis applied to query expressions."
+        let computed = false
+
+        let expr_match = re.findall("(\\d[\\d\\s\\+\\-\\*/\\^\\(\\)\\.]+\\d)", query)
+        if expr_match.len() > 0 {
+            result_text = expr_match[0] + " (expression detected)"
+            computed = true
+        }
+
+        let conf = 0.85 + min(to_float(digit_count) * 0.01 + to_float(operator_count) * 0.02 + to_float(kw_hits) * 0.02, 0.12)
+        if computed { conf = min(conf + 0.05, 0.99) }
+
+        return LobeResult {
+            lobe: self.lobe_type,
+            value: result_text,
+            confidence: conf,
+            needs_escalation: false,
+            metadata: {
+                "digits": digit_count,
+                "operators": operator_count,
+                "kw_hits": kw_hits,
+                "computed": computed
+            }
+        }
+    }
+}
+
+/// ── Spatial Lobe ──
+
+class SpatialLobe(LobeProcessor) {
+    fn init(self) {
+        super.init(LobeType.SPATIAL, 1.5)
+    }
+
+    fn process(self, query: string, domain: string) -> LobeResult {
+        self._invocations += 1
+        let ql = query.lower()
+        let spatial_kw = { "position", "location", "distance", "area", "volume",
+                                         "shape", "coordinate", "dimension", "height", "width",
+                                         "depth", "angle", "map", "route", "near", "far",
+                                         "between", "north", "south", "east", "west",
+                                         "latitude", "longitude", "capital", "country",
+                                         "city", "continent", "ocean", "river", "mountain" }
+        let hits = 0
+        for kw in spatial_kw {
+            if ql.contains(kw) { hits += 1 }
+        }
+
+        let geo_answer = nil
+        if self._knowledge_loader != nil {
+            let matches = self._knowledge_loader.query(query, "geography", 2)
+            if matches.len() > 0 {
+                if matches[0].score > 0.05 {
+                    geo_answer = matches[0].fact.text
+                }
+            }
+        }
+
+        let answer = ""
+        let conf = 0.85
+        if geo_answer != nil {
+            answer = geo_answer
+            conf = 0.96
+        } else if hits > 0 {
+            answer = "This query involves spatial and geographic reasoning. " +
+                     "The spatial indicators point to relationships between locations, distances, or physical features. " +
+                     "Analyzing these spatial dimensions helps establish the geographic context of your question."
+            conf = 0.86 + min(to_float(hits) * 0.03, 0.10)
+        } else {
+            answer = "While this query doesn't have strong spatial signals, geographic and spatial " +
+                     "context can still be relevant. The spatial lobe has processed the query for " +
+                     "any latent location or dimension references."
+        }
+
+        return LobeResult {
+            lobe: self.lobe_type,
+            value: answer,
+            confidence: conf,
+            needs_escalation: false,
+            metadata: {
+                "spatial_signals": hits,
+                "geo_knowledge_used": geo_answer != nil
+            }
+        }
+    }
+}
+
+/// ── Temporal Lobe ──
+
+class TemporalLobe(LobeProcessor) {
+    fn init(self) {
+        super.init(LobeType.TEMPORAL, 1.5)
+    }
+
+    fn process(self, query: string, domain: string) -> LobeResult {
+        self._invocations += 1
+        let ql = query.lower()
+        let temporal_kw = { "when", "before", "after", "during", "timeline",
+                                          "history", "date", "year", "period", "century",
+                                          "sequence", "order", "era", "decade", "month",
+                                          "ancient", "modern", "recent", "first", "last",
+                                          "oldest", "newest", "founded", "invented",
+                                          "discovered", "born", "died", "established", "created" }
+        let hits = 0
+        for kw in temporal_kw {
+            if ql.contains(kw) { hits += 1 }
+        }
+
+        let year_matches = re.findall("\\b(1[0-9]{3}|20[0-2][0-9])\\b", query)
+
+        let history_answer = nil
+        if self._knowledge_loader != nil {
+            if hits > 0 {
+                let matches = self._knowledge_loader.query(query, "history", 2)
+                if matches.len() > 0 {
+                    if matches[0].score > 0.05 {
+                        history_answer = matches[0].fact.text
+                    }
+                }
+            }
+        }
+
+        let answer = ""
+        let conf = 0.85
+        if history_answer != nil {
+            answer = history_answer
+            conf = 0.96
+        } else if year_matches.len() > 0 {
+            let years = year_matches.join(", ")
+            answer = "The time period referenced (" + years + ") is significant in understanding this topic. " +
+                     "Historical analysis requires considering the broader context."
+            conf = 0.90
+        } else if hits > 0 {
+            answer = "This query has a temporal dimension that involves understanding sequences, " +
+                     "chronology, and cause-and-effect relationships over time."
+            conf = 0.86 + min(to_float(hits) * 0.03, 0.10)
+        } else {
+            answer = "While temporal signals are not dominant in this query, " +
+                     "understanding the historical and temporal context can add depth to the analysis."
+        }
+
+        return LobeResult {
+            lobe: self.lobe_type,
+            value: answer,
+            confidence: conf,
+            needs_escalation: false,
+            metadata: {
+                "temporal_signals": hits,
+                "year_references": year_matches,
+                "history_knowledge_used": history_answer != nil
+            }
+        }
+    }
+}
+
+/// ── Creative Lobe Processor ──
+
+class CreativeLobeProcessor(LobeProcessor) {
+    fn init(self) {
+        super.init(LobeType.CREATIVE, 2.5)
+        self._generative_engine = nil
+    }
+
+    fn set_generative_engine(self, engine: any) {
+        self._generative_engine = engine
+    }
+
+    fn process(self, query: string, domain: string) -> LobeResult {
+        self._invocations += 1
+        let ql = query.lower()
+        let kind = self._classify_creative_kind(ql)
+        let subject = self._extract_creative_subject(query)
+        let seed = self._creative_seed(query, subject)
+
+        let answer = ""
+        if kind == "poem" {
+            answer = self._compose_poem(subject, seed)
+        } else if kind == "story" {
+            answer = self._compose_story(subject, seed)
+        } else if kind == "brainstorm" {
+            answer = self._brainstorm(subject, seed)
+        } else {
+            answer = self._general_creative(subject, seed)
+        }
+
+        if self._generative_engine != nil {
+            try {
+                let gen_result = self._generative_engine.generate(query)
+                if gen_result != nil {
+                    if to_string(gen_result).len() > answer.len() {
+                        answer = to_string(gen_result)
+                    }
+                }
+            } catch(e) {
+                pass
+            }
+        }
+
+        return LobeResult {
+            lobe: self.lobe_type,
+            value: answer,
+            confidence: 0.88,
+            needs_escalation: false,
+            metadata: {
+                "kind": kind,
+                "subject": subject,
+                "seed": seed
+            }
+        }
+    }
+
+    fn _creative_seed(query: string, subject: string) -> int {
+        let h = hashlib.sha256(query + "\0" + subject).hexdigest()
+        return to_int(h.slice(0, 8), 16) % 1000000
+    }
+
+    fn _display_subject(subject: string) -> string {
+        let s = subject.strip()
+        if s.len() == 0 { return "this moment" }
+        if s.char_at(0).is_lower() {
+            return s.char_at(0).to_upper() + s.slice(1, s.len())
+        }
+        return s
+    }
+
+    fn _extract_creative_subject(self, query: string) -> string {
+        let q = query.strip()
+        if q.len() == 0 { return "this moment" }
+        let q_low = q.lower()
+        let markers = [ " about ", " on ", " for ", " regarding ", " concerning " ]
+        for marker in markers {
+            let idx = q_low.rfind(marker)
+            if idx >= 0 {
+                let tail = q.slice(idx + marker.len(), q.len()).strip()
+                tail = tail.strip("?.!,;:")
+                if tail.len() > 1 {
+                    if tail.len() > 240 { return tail.slice(0, 240) }
+                    return tail
+                }
+            }
+        }
+        let stop = { "write", "compose", "create", "imagine", "me", "us",
+                                   "a", "an", "the", "about", "poem", "story", "please",
+                                   "give", "tell", "some", "short", "brief", "brainstorm",
+                                   "generate", "draft", "ideas", "idea" }
+        let words = q.split(" ")
+        let meaningful = []
+        for w in words {
+            if !stop.contains(w.lower()) {
+                meaningful.append(w)
+            }
+        }
+        if meaningful.len() > 0 {
+            let limit = min(14, meaningful.len())
+            let result = meaningful.slice(0, limit).join(" ")
+            if result.len() > 240 { return result.slice(0, 240) }
+            return result
+        }
+        if q.len() > 120 { return q.slice(0, 120) }
+        return q
+    }
+
+    fn _classify_creative_kind(ql: string) -> string {
+        let poem_kws = [ "poem", "verse", "haiku", "limerick", "sonnet" ]
+        for kw in poem_kws {
+            if ql.contains(kw) { return "poem" }
+        }
+        let story_kws = [ "story", "tale", "fiction" ]
+        for kw in story_kws {
+            if ql.contains(kw) { return "story" }
+        }
+        if ql.contains("brainstorm") || ql.contains("ideas") { return "brainstorm" }
+        return "general"
+    }
+
+    fn _compose_poem(self, subject: string, seed: int) -> string {
+        let s = CreativeLobeProcessor._display_subject(subject)
+        let adjs = [ "quiet", "ancient", "tender", "wild", "soft", "bright" ]
+        let nouns = [ "shadow", "harbor", "thread", "ember", "river", "light" ]
+        let adj1 = adjs[seed % 6]
+        let noun1 = nouns[(seed / 11) % 6]
+        return s + ", " + adj1 + " as a " + noun1 + ",\n" +
+               "carries the weight of unspoken things.\n" +
+               "In every silence, a story waits —\n" +
+               "and " + s + " gives it wings."
+    }
+
+    fn _compose_story(self, subject: string, seed: int) -> string {
+        let s = CreativeLobeProcessor._display_subject(subject)
+        return "Once, in a world not unlike our own, " + s + " emerged from the ordinary. " +
+               "What began as a whisper grew into something that would change everything. " +
+               "The journey was neither simple nor direct, but every step revealed a deeper truth."
+    }
+
+    fn _brainstorm(self, subject: string, seed: int) -> string {
+        let s = CreativeLobeProcessor._display_subject(subject)
+        return "1. Reimagine " + s + " through a completely different lens.\n" +
+               "2. What if " + s + " were combined with its seeming opposite?\n" +
+               "3. Scale " + s + " up by 100x — what changes, what breaks?\n" +
+               "4. Apply " + s + " to a domain where it has never been tried.\n" +
+               "5. What would " + s + " look like in 50 years?"
+    }
+
+    fn _general_creative(self, subject: string, seed: int) -> string {
+        let s = CreativeLobeProcessor._display_subject(subject)
+        return "Exploring " + s + " through a creative lens reveals unexpected connections. " +
+               "The intersection of imagination and analysis opens pathways that neither alone could discover."
+    }
+}
+
+/// ── Inhibition System ──
+
+enum InhibitionType {
+    CONFIDENCE = "CONFIDENCE",
+    RULE = "RULE",
+    FEEDBACK = "FEEDBACK",
+    LATERAL = "LATERAL"
+}
+
+type InhibitionEvent {
+    rule_name: string,
+    inhibition_type: InhibitionType,
+    source_layer: string,
+    target_layers: List[string],
+    reason: string,
+    trigger_confidence: Optional[float],
+    strength: float,
+    timestamp: float
+}
+
+class InhibitionRule {
+    fn init(self, name: string, condition: any, targets: List[string],
+            inhibition_type: InhibitionType, reason: string, strength: float) {
+        self.name = name
+        self.condition = condition
+        self.targets = targets
+        self.inhibition_type = inhibition_type
+        self.reason_template = reason
+        self.strength = strength
+        self._fires = 0
+        self._checks = 0
+    }
+
+    fn evaluate(self, data: any, context: Optional[Map[string, any]]) -> Optional[InhibitionEvent] {
+        let ctx = context
+        if ctx == nil { ctx = {} }
+        self._checks += 1
+        try {
+            if !self.condition(data, ctx) { return nil }
+        } catch(e) {
+            return nil
+        }
+        self._fires += 1
+
+        let confidence = nil
+        if is_map(data) {
+            confidence = data.get("confidence", nil)
+        }
+
+        return InhibitionEvent {
+            rule_name: self.name,
+            inhibition_type: self.inhibition_type,
+            source_layer: to_string(ctx.get("current_layer", "unknown")),
+            target_layers: self.targets.copy(),
+            reason: self.reason_template,
+            trigger_confidence: confidence,
+            strength: self.strength,
+            timestamp: time.time()
+        }
+    }
+}
+
+class InhibitoryNetwork {
+    fn init(self) {
+        self._rules = []
+        self._events = []
+        self._inhibited_layers = {}
+        self._init_default_rules()
+    }
+
+    fn _init_default_rules(self) {
+        self.add_rule(InhibitionRule(
+            "high_confidence_early_exit",
+            fn(d: any, c: Map[string, any]) -> bool {
+                if is_map(d) { return d.get("confidence", 0) > 0.92 }
+                return false
+            },
+            [ "T2_slm", "T3_llm", "T4_elm" ],
+            InhibitionType.CONFIDENCE,
+            "Confidence exceeds 0.92 — higher tiers suppressed",
+            1.0
+        ))
+        self.add_rule(InhibitionRule(
+            "contradiction_suppression",
+            fn(d: any, c: Map[string, any]) -> bool {
+                if is_map(d) { return d.get("contradictions", 0) > 0 }
+                return false
+            },
+            [ "T3_llm", "T4_elm" ],
+            InhibitionType.RULE,
+            "Contradictions detected — suppressing propagation",
+            1.0
+        ))
+        self.add_rule(InhibitionRule(
+            "low_confidence_kill",
+            fn(d: any, c: Map[string, any]) -> bool {
+                if is_map(d) { return d.get("confidence", 1.0) < 0.20 }
+                return false
+            },
+            [ "T3_llm", "T4_elm" ],
+            InhibitionType.RULE,
+            "Confidence below 0.20 — data quality too low",
+            1.0
+        ))
+    }
+
+    fn add_rule(self, rule: InhibitionRule) -> InhibitoryNetwork {
+        self._rules.append(rule)
+        return self
+    }
+
+    fn evaluate(self, source_layer: string, data: any,
+                context: Optional[Map[string, any]], cycle: int) -> any {
+        let ctx = context
+        if ctx == nil { ctx = {} }
+        ctx["current_layer"] = source_layer
+        let newly_inhibited = set()
+
+        for rule in self._rules {
+            let event = rule.evaluate(data, ctx)
+            if event != nil {
+                event.source_layer = source_layer
+                self._events.append(event)
+                for t in event.target_layers {
+                    newly_inhibited.add(t)
+                }
+            }
+        }
+
+        if self._inhibited_layers.get(cycle, nil) == nil {
+            self._inhibited_layers[cycle] = set()
+        }
+        for t in newly_inhibited {
+            self._inhibited_layers[cycle].add(t)
+        }
+        return newly_inhibited
+    }
+
+    fn is_inhibited(self, layer_name: string, cycle: int) -> bool {
+        let layers = self._inhibited_layers.get(cycle, nil)
+        if layers == nil { return false }
+        return layers.contains(layer_name)
+    }
+
+    fn reset(self) {
+        self._events = []
+        self._inhibited_layers = {}
+    }
+
+    fn events(self) -> List[any] { return self._events.copy() }
+
+    fn stats(self) -> any {
+        let unique_layers = set()
+        for e in self._events {
+            for t in e.target_layers {
+                unique_layers.add(t)
+            }
+        }
+        return {
+            "total_rules": self._rules.len(),
+            "total_events": self._events.len(),
+            "unique_layers_inhibited": unique_layers.to_list()
+        }
+    }
+}
+
+/// ── Tuition System ──
+
+type TuitionRecord {
+    query: string,
+    student_tier: string,
+    teacher_tier: string,
+    correction_type: string,
+    ground_truth_verified: bool,
+    usage_count: int,
+    created_at: float
+}
+
+class TuitionSystem {
+    fn init(self, pvs: Optional[PVS4]) {
+        if pvs != nil {
+            self._pvs = pvs
+        } else {
+            self._pvs = PVS4()
+            self._pvs.init(10000)
+        }
+        self._records = []
+        self._corrections_by_query = {}
+        self._total_corrections = 0
+        self._corrections_applied = 0
+    }
+
+    fn correct(self, query: string, student_tier: string, teacher_tier: string,
+               correction_type: string, ground_truth_verified: bool) -> TuitionRecord {
+        let record = TuitionRecord {
+            query: query,
+            student_tier: student_tier,
+            teacher_tier: teacher_tier,
+            correction_type: correction_type,
+            ground_truth_verified: ground_truth_verified,
+            usage_count: 0,
+            created_at: time.time()
+        }
+        self._records.append(record)
+        self._corrections_by_query[query] = record
+        self._total_corrections += 1
+
+        let conf = 0.9
+        if ground_truth_verified { conf = 1.0 }
+        self._pvs.store(query, teacher_tier, conf, {
+            "correction_from": student_tier,
+            "correction_to": teacher_tier,
+            "correction_type": correction_type,
+            "tuition_record": true
+        })
+        return record
+    }
+
+    fn route(self, query: string, default_tier: string) -> string {
+        let pvs_match = self._pvs.lookup(query)
+        if pvs_match != nil {
+            if pvs_match.data.get("tuition_record", false) {
+                self._corrections_applied += 1
+                return pvs_match.tier
+            }
+        }
+        let record = self._corrections_by_query.get(query, nil)
+        if record != nil {
+            record.usage_count += 1
+            self._corrections_applied += 1
+            return record.teacher_tier
+        }
+        return default_tier
+    }
+
+    fn convergence_rate(self) -> float {
+        if self._total_corrections == 0 { return 0.0 }
+        return to_float(self._corrections_applied) / to_float(self._total_corrections)
+    }
+
+    fn stats(self) -> any {
+        return {
+            "total_corrections": self._total_corrections,
+            "corrections_applied": self._corrections_applied,
+            "unique_patterns": self._corrections_by_query.len(),
+            "convergence_rate": self.convergence_rate(),
+            "pvs_stats": self._pvs.stats()
+        }
+    }
+}
+
+/// ── Symbiotic Mesh ──
+
+type MeshProposal {
+    key: string,
+    value: any,
+    domain: string,
+    source: string,
+    proposal_type: string,
+    confidence_estimate: float,
+    validation_result: Optional[string],
+    validation_checks: Map[string, bool],
+    rejection_reason: Optional[string],
+    created_at: float
+}
+
+fn make_mesh_proposal(key: string, value: any, domain: string, source: string,
+                       proposal_type: string, confidence_estimate: float) -> MeshProposal {
+    return MeshProposal {
+        key: key, value: value, domain: domain, source: source,
+        proposal_type: proposal_type, confidence_estimate: confidence_estimate,
+        validation_result: nil, validation_checks: {},
+        rejection_reason: nil, created_at: time.time()
+    }
+}
+
+fn mesh_proposal_is_validated(p: MeshProposal) -> bool {
+    return p.validation_result == "accepted"
+}
+
+class SymbioticMesh {
+    fn init(self, vlt_recall_fn: Optional[any], auto_validators: Optional[List[any]]) {
+        self._recall = vlt_recall_fn
+        if auto_validators != nil {
+            self._auto_validators = auto_validators
+        } else {
+            self._auto_validators = []
+        }
+        self._proposals = []
+        self._accepted = []
+        self._rejected = []
+        self._total_proposed = 0
+        self._total_accepted = 0
+        self._total_rejected = 0
+    }
+
+    fn propose(self, key: string, value: any, domain: string, source: string,
+               proposal_type: string, confidence_estimate: float) -> MeshProposal {
+        let proposal = make_mesh_proposal(key, value, domain, source,
+                                           proposal_type, confidence_estimate)
+        self._proposals.append(proposal)
+        self._total_proposed += 1
+        return proposal
+    }
+
+    fn validate(self, proposal: MeshProposal,
+                ground_truth_check: Optional[any], consistency_check: Optional[any],
+                source_check: Optional[any], temporal_check: Optional[any]) -> MeshProposal {
+        let checks = {}
+
+        if ground_truth_check != nil {
+            checks["ground_truth"] = ground_truth_check(proposal)
+        } else if self._recall != nil {
+            let existing = self._recall(proposal.key)
+            checks["ground_truth"] = existing == nil
+        } else {
+            checks["ground_truth"] = true
+        }
+
+        if consistency_check != nil {
+            checks["consistency"] = consistency_check(proposal)
+        } else {
+            checks["consistency"] = true
+        }
+
+        if source_check != nil {
+            checks["source_credibility"] = source_check(proposal)
+        } else {
+            checks["source_credibility"] = proposal.source != "unknown"
+        }
+
+        if temporal_check != nil {
+            checks["temporal_coherence"] = temporal_check(proposal)
+        } else {
+            checks["temporal_coherence"] = true
+        }
+
+        for i in range(0, self._auto_validators.len()) {
+            try {
+                checks["auto_validator_" + to_string(i)] = self._auto_validators[i](proposal)
+            } catch(e) {
+                checks["auto_validator_" + to_string(i)] = false
+            }
+        }
+
+        proposal.validation_checks = checks
+
+        let all_passed = true
+        for v in checks.values() {
+            if !v { all_passed = false; break }
+        }
+
+        if all_passed {
+            proposal.validation_result = "accepted"
+            self._accepted.append(proposal)
+            self._total_accepted += 1
+        } else {
+            proposal.validation_result = "rejected"
+            let failed = []
+            for k in checks.keys() {
+                if !checks[k] { failed.append(k) }
+            }
+            proposal.rejection_reason = "Failed: " + failed.join(", ")
+            self._rejected.append(proposal)
+            self._total_rejected += 1
+        }
+
+        return proposal
+    }
+
+    fn acceptance_rate(self) -> float {
+        if self._total_proposed == 0 { return 0.0 }
+        return to_float(self._total_accepted) / to_float(self._total_proposed)
+    }
+
+    fn stats(self) -> any {
+        return {
+            "total_proposed": self._total_proposed,
+            "total_accepted": self._total_accepted,
+            "total_rejected": self._total_rejected,
+            "acceptance_rate": self.acceptance_rate()
+        }
+    }
+}
+
+/// ── Cross-Domain Transfer ──
+
+type UniversalPattern {
+    pattern_id: string,
+    principle: string,
+    source_domains: Set[string],
+    confidence: float,
+    dimensions: Map[string, float],
+    applications: List[string],
+    created_at: float,
+    usage_count: int
+}
+
+class CrossDomainTransfer {
+    fn init(self, similarity_threshold: float) {
+        self.similarity_threshold = similarity_threshold
+        self._domain_patterns = {}
+        self._universals = []
+        self._transfers = 0
+    }
+
+    fn register(self, pattern_id: string, domain: string, description: string,
+                dimensions: Map[string, float]) {
+        if self._domain_patterns.get(domain, nil) == nil {
+            self._domain_patterns[domain] = []
+        }
+        self._domain_patterns[domain].append({
+            "pattern_id": pattern_id,
+            "domain": domain,
+            "description": description,
+            "dimensions": dimensions
+        })
+    }
+
+    fn _similarity(self, dims_a: Map[string, float], dims_b: Map[string, float]) -> float {
+        let shared = set()
+        for k in dims_a.keys() {
+            if dims_b.get(k, nil) != nil {
+                shared.add(k)
+            }
+        }
+        if shared.len() == 0 { return 0.0 }
+        let dot = 0.0
+        let mag_a = 0.0
+        let mag_b = 0.0
+        for k in shared {
+            dot += dims_a[k] * dims_b[k]
+            mag_a += dims_a[k] * dims_a[k]
+            mag_b += dims_b[k] * dims_b[k]
+        }
+        mag_a = pow(mag_a, 0.5)
+        mag_b = pow(mag_b, 0.5)
+        if mag_a == 0.0 || mag_b == 0.0 { return 0.0 }
+        return dot / (mag_a * mag_b)
+    }
+
+    fn discover_universals(self, threshold: Optional[float]) -> List[any] {
+        let thresh = self.similarity_threshold
+        if threshold != nil { thresh = threshold }
+        let domains = self._domain_patterns.keys()
+        let discovered = []
+        for i in range(0, domains.len()) {
+            let da = domains[i]
+            for j in range(i + 1, domains.len()) {
+                let db = domains[j]
+                for pa in self._domain_patterns[da] {
+                    for pb in self._domain_patterns[db] {
+                        let sim = self._similarity(pa["dimensions"], pb["dimensions"])
+                        if sim >= thresh {
+                            let merged = {}
+                            let all_keys = set()
+                            for k in pa["dimensions"].keys() { all_keys.add(k) }
+                            for k in pb["dimensions"].keys() { all_keys.add(k) }
+                            for k in all_keys {
+                                let vals = []
+                                let va = pa["dimensions"].get(k, nil)
+                                let vb = pb["dimensions"].get(k, nil)
+                                if va != nil { vals.append(va) }
+                                if vb != nil { vals.append(vb) }
+                                let sum = 0.0
+                                for v in vals { sum += v }
+                                merged[k] = sum / to_float(vals.len())
+                            }
+                            let source_set = set()
+                            source_set.add(da)
+                            source_set.add(db)
+                            discovered.append(UniversalPattern {
+                                pattern_id: "univ_" + pa["pattern_id"] + "_" + pb["pattern_id"],
+                                principle: "Cross-domain: " + pa["description"] + " <-> " + pb["description"],
+                                source_domains: source_set,
+                                confidence: sim,
+                                dimensions: merged,
+                                applications: [],
+                                created_at: time.time(),
+                                usage_count: 0
+                            })
+                        }
+                    }
+                }
+            }
+        }
+        for d in discovered {
+            self._universals.append(d)
+        }
+        return discovered
+    }
+
+    fn apply_to_domain(self, target_domain: string, pattern: UniversalPattern) -> any {
+        self._transfers += 1
+        pattern.usage_count += 1
+        pattern.applications.append(target_domain)
+        return {
+            "target_domain": target_domain,
+            "universal_pattern": pattern.pattern_id,
+            "principle": pattern.principle,
+            "confidence": pattern.confidence * 0.8,
+            "dimensions": pattern.dimensions,
+            "source_domains": pattern.source_domains.to_list(),
+            "requires_validation": true
+        }
+    }
+
+    fn stats(self) -> any {
+        return {
+            "domains": self._domain_patterns.keys(),
+            "universals_discovered": self._universals.len(),
+            "transfers": self._transfers
+        }
+    }
+}
+
+/// ── Creative Lobe (Mesh-Validated) ──
+
+class CreativeLobe {
+    fn init(self, cross_domain: Optional[CrossDomainTransfer], mesh: Optional[SymbioticMesh]) {
+        if cross_domain != nil {
+            self._cross_domain = cross_domain
+        } else {
+            self._cross_domain = CrossDomainTransfer()
+            self._cross_domain.init(0.80)
+        }
+        self._mesh = mesh
+        self._total_generated = 0
+        self._total_validated = 0
+    }
+
+    fn synthesize(self, inputs: List[string], target_domain: string,
+                  synthesis_type: string, context: Optional[Map[string, any]]) -> MeshProposal {
+        self._total_generated += 1
+        let ctx = context
+        if ctx == nil { ctx = {} }
+        return make_mesh_proposal(
+            "creative_" + synthesis_type + "_" + to_string(self._total_generated),
+            {
+                "synthesis_type": synthesis_type,
+                "inputs": inputs,
+                "context": ctx,
+                "creative_lobe_generated": true
+            },
+            target_domain, "creative_lobe", "inference", 0.3
+        )
+    }
+
+    fn analogize(self, source_domain: string, target_domain: string,
+                 source_pattern: string) -> MeshProposal {
+        self._total_generated += 1
+        return make_mesh_proposal(
+            "analogy_" + source_domain + "_to_" + target_domain + "_" + to_string(self._total_generated),
+            {
+                "synthesis_type": "analogy",
+                "source_domain": source_domain,
+                "target_domain": target_domain,
+                "source_pattern": source_pattern,
+                "creative_lobe_generated": true
+            },
+            target_domain, "creative_lobe", "cross_domain", 0.25
+        )
+    }
+
+    fn validate_synthesis(self, proposal: MeshProposal) -> MeshProposal {
+        if self._mesh == nil {
+            raise "No SymbioticMesh connected. Creative outputs MUST be validated."
+        }
+        let result = self._mesh.validate(proposal, nil, nil, nil, nil)
+        if mesh_proposal_is_validated(result) {
+            self._total_validated += 1
+        }
+        return result
+    }
+
+    fn stats(self) -> any {
+        return {
+            "total_generated": self._total_generated,
+            "total_validated": self._total_validated,
+            "validation_rate": to_float(self._total_validated) / max(to_float(self._total_generated), 1.0)
+        }
+    }
+}
+
+/// ── VLT Memory Hierarchy ──
+
+enum VLTLayer {
+    L1_EPHEMERAL = "L1_EPHEMERAL",
+    L2_SESSION = "L2_SESSION",
+    L3_PERSISTENT = "L3_PERSISTENT",
+    L4_ARCHIVAL = "L4_ARCHIVAL"
+}
+
+enum EvictionPolicy {
+    LRU = "LRU",
+    OLDEST = "OLDEST",
+    WEAKEST = "WEAKEST",
+    COMBINED = "COMBINED"
+}
+
+type VLTItem {
+    key: string,
+    value: any,
+    layer: VLTLayer,
+    confidence: float,
+    domain: Optional[string],
+    source: Optional[string],
+    tags: Set[string],
+    pvs_signature: Optional[bytes],
+    created_at: float,
+    accessed_at: float,
+    ttl: Optional[float],
+    immutable: bool
+}
+
+fn vlt_item_is_expired(item: VLTItem) -> bool {
+    if item.ttl == nil { return false }
+    return (time.time() - item.created_at) > item.ttl
+}
+
+fn vlt_item_touch(item: VLTItem) {
+    item.accessed_at = time.time()
+}
+
+class VLT {
+    fn init(self, l1_capacity: int, l2_capacity: int, l3_capacity: int,
+            l2_ttl: float, l3_ttl: float, pvs_vector_bits: int,
+            eviction: EvictionPolicy) {
+        self._layers = {}
+        self._layers[VLTLayer.L1_EPHEMERAL.value] = {}
+        self._layers[VLTLayer.L2_SESSION.value] = {}
+        self._layers[VLTLayer.L3_PERSISTENT.value] = {}
+        self._layers[VLTLayer.L4_ARCHIVAL.value] = {}
+
+        self._capacities = {}
+        self._capacities[VLTLayer.L1_EPHEMERAL.value] = l1_capacity
+        self._capacities[VLTLayer.L2_SESSION.value] = l2_capacity
+        self._capacities[VLTLayer.L3_PERSISTENT.value] = l3_capacity
+        self._capacities[VLTLayer.L4_ARCHIVAL.value] = nil
+
+        self._ttls = {}
+        self._ttls[VLTLayer.L1_EPHEMERAL.value] = nil
+        self._ttls[VLTLayer.L2_SESSION.value] = l2_ttl
+        self._ttls[VLTLayer.L3_PERSISTENT.value] = l3_ttl
+        self._ttls[VLTLayer.L4_ARCHIVAL.value] = nil
+
+        self.eviction_policy = eviction
+
+        self.pvs = PVS4()
+        self.pvs.init(pvs_vector_bits)
+        self.tuition = TuitionSystem()
+        self.tuition.init(self.pvs)
+        self.mesh = SymbioticMesh()
+        self.mesh.init(fn(key: string) -> Optional[any] { return self.recall(key, nil) }, nil)
+        self.cross_domain = CrossDomainTransfer()
+        self.cross_domain.init(0.80)
+        self.creative = CreativeLobe()
+        self.creative.init(self.cross_domain, self.mesh)
+
+        self._stores = 0
+        self._recalls = 0
+        self._hits = 0
+        self._misses = 0
+        self._promotions = 0
+        self._evictions = 0
+    }
+
+    fn store(self, key: string, value: any, layer: VLTLayer,
+             confidence: float, domain: Optional[string], source: Optional[string],
+             tags: Optional[Set[string]], ttl: Optional[float], immutable: bool) -> VLTItem {
+        self._stores += 1
+        let store = self._layers[layer.value]
+
+        let existing = store.get(key, nil)
+        if existing != nil {
+            if existing.immutable {
+                raise "Cannot overwrite immutable L4 ground truth: '" + key + "'"
+            }
+        }
+
+        let actual_ttl = ttl
+        if actual_ttl == nil {
+            actual_ttl = self._ttls[layer.value]
+        }
+        let actual_immutable = immutable
+        if layer == VLTLayer.L4_ARCHIVAL {
+            actual_immutable = true
+        }
+
+        self._purge_layer(layer)
+        let capacity = self._capacities[layer.value]
+        if capacity != nil {
+            while store.len() >= capacity {
+                if store.get(key, nil) != nil { break }
+                self._evict_from(layer)
+            }
+        }
+
+        let pvs_sig = nil
+        if domain != nil {
+            pvs_sig = self.pvs.signature(key)
+        }
+
+        let actual_tags = tags
+        if actual_tags == nil { actual_tags = set() }
+
+        let item = VLTItem {
+            key: key, value: value, layer: layer,
+            confidence: confidence, domain: domain, source: source,
+            tags: actual_tags, pvs_signature: pvs_sig,
+            created_at: time.time(), accessed_at: time.time(),
+            ttl: actual_ttl, immutable: actual_immutable
+        }
+        store[key] = item
+        return item
+    }
+
+    fn recall(self, key: string, layer: Optional[VLTLayer]) -> Optional[any] {
+        self._recalls += 1
+        if layer != nil {
+            let result = self._recall_from(key, layer)
+            if result != nil { self._hits += 1 } else { self._misses += 1 }
+            return result
+        }
+        let all_layers = [ VLTLayer.L1_EPHEMERAL, VLTLayer.L2_SESSION,
+                                           VLTLayer.L3_PERSISTENT, VLTLayer.L4_ARCHIVAL ]
+        for lyr in all_layers {
+            let result = self._recall_from(key, lyr)
+            if result != nil {
+                self._hits += 1
+                return result
+            }
+        }
+        self._misses += 1
+        return nil
+    }
+
+    fn _recall_from(self, key: string, layer: VLTLayer) -> Optional[any] {
+        let store = self._layers[layer.value]
+        let item = store.get(key, nil)
+        if item == nil { return nil }
+        if vlt_item_is_expired(item) {
+            store.remove(key)
+            return nil
+        }
+        vlt_item_touch(item)
+        return item.value
+    }
+
+    fn promote(self, key: string, from_layer: VLTLayer, to_layer: VLTLayer) -> Optional[VLTItem] {
+        let source = self._layers[from_layer.value]
+        let item = source.get(key, nil)
+        if item == nil { return nil }
+
+        let new_item = self.store(
+            item.key, item.value, to_layer, item.confidence,
+            item.domain, item.source, item.tags, nil,
+            to_layer == VLTLayer.L4_ARCHIVAL
+        )
+        source.remove(key)
+        self._promotions += 1
+        return new_item
+    }
+
+    fn search(self, domain: Optional[string], tags: Optional[Set[string]],
+              min_confidence: float, layer: Optional[VLTLayer]) -> List[any] {
+        let results = []
+        let layers_to_search = []
+        if layer != nil {
+            layers_to_search.append(layer)
+        } else {
+            layers_to_search = [ VLTLayer.L1_EPHEMERAL, VLTLayer.L2_SESSION,
+                                                  VLTLayer.L3_PERSISTENT, VLTLayer.L4_ARCHIVAL ]
+        }
+        for lyr in layers_to_search {
+            self._purge_layer(lyr)
+            for item in self._layers[lyr.value].values() {
+                if domain != nil {
+                    if item.domain != domain { continue }
+                }
+                if tags != nil {
+                    let has_overlap = false
+                    for t in tags {
+                        if item.tags.contains(t) { has_overlap = true; break }
+                    }
+                    if !has_overlap { continue }
+                }
+                if item.confidence < min_confidence { continue }
+                results.append(item)
+            }
+        }
+        results.sort_by(fn(x: VLTItem) -> float { return -x.confidence })
+        return results
+    }
+
+    fn clear_ephemeral(self) -> int {
+        let count = self._layers[VLTLayer.L1_EPHEMERAL.value].len()
+        self._layers[VLTLayer.L1_EPHEMERAL.value] = {}
+        return count
+    }
+
+    fn _evict_from(self, layer: VLTLayer) -> Optional[string] {
+        let store = self._layers[layer.value]
+        if store.len() == 0 { return nil }
+        let victim_key = self._select_victim(layer)
+        if victim_key != nil {
+            let v = store.get(victim_key, nil)
+            if v != nil {
+                if !v.immutable {
+                    store.remove(victim_key)
+                    self._evictions += 1
+                    return victim_key
+                }
+            }
+        }
+        return nil
+    }
+
+    fn _select_victim(self, layer: VLTLayer) -> Optional[string] {
+        let store = self._layers[layer.value]
+        if store.len() == 0 { return nil }
+        let candidates = {}
+        for k in store.keys() {
+            if !store[k].immutable {
+                candidates[k] = store[k]
+            }
+        }
+        if candidates.len() == 0 { return nil }
+
+        if self.eviction_policy == EvictionPolicy.LRU {
+            let best_key = nil
+            let best_time = time.time() + 1.0
+            for k in candidates.keys() {
+                if candidates[k].accessed_at < best_time {
+                    best_time = candidates[k].accessed_at
+                    best_key = k
+                }
+            }
+            return best_key
+        } else if self.eviction_policy == EvictionPolicy.OLDEST {
+            let best_key = nil
+            let best_time = time.time() + 1.0
+            for k in candidates.keys() {
+                if candidates[k].created_at < best_time {
+                    best_time = candidates[k].created_at
+                    best_key = k
+                }
+            }
+            return best_key
+        } else if self.eviction_policy == EvictionPolicy.WEAKEST {
+            let best_key = nil
+            let best_conf = 2.0
+            for k in candidates.keys() {
+                if candidates[k].confidence < best_conf {
+                    best_conf = candidates[k].confidence
+                    best_key = k
+                }
+            }
+            return best_key
+        } else {
+            let now = time.time()
+            let best_key = nil
+            let best_score = 999999.0
+            for k in candidates.keys() {
+                let item = candidates[k]
+                let recency = 1.0 / (1.0 + (now - item.accessed_at))
+                let score = item.confidence * recency
+                if score < best_score {
+                    best_score = score
+                    best_key = k
+                }
+            }
+            return best_key
+        }
+    }
+
+    fn _purge_layer(self, layer: VLTLayer) -> int {
+        let store = self._layers[layer.value]
+        let expired = []
+        for k in store.keys() {
+            if vlt_item_is_expired(store[k]) {
+                expired.append(k)
+            }
+        }
+        for k in expired {
+            store.remove(k)
+        }
+        return expired.len()
+    }
+
+    fn layer_size(self, layer: VLTLayer) -> int {
+        self._purge_layer(layer)
+        return self._layers[layer.value].len()
+    }
+
+    fn total_items(self) -> int {
+        let total = 0
+        let all_layers = [ VLTLayer.L1_EPHEMERAL, VLTLayer.L2_SESSION,
+                                           VLTLayer.L3_PERSISTENT, VLTLayer.L4_ARCHIVAL ]
+        for l in all_layers {
+            total += self.layer_size(l)
+        }
+        return total
+    }
+
+    fn save_to_redis(self, redis_client: Optional[any]) -> any {
+        try {
+            let saved = 0
+            let layers = [ VLTLayer.L2_SESSION, VLTLayer.L3_PERSISTENT ]
+            for layer in layers {
+                let store = self._layers[layer.value]
+                for key in store.keys() {
+                    let item = store[key]
+                    let redis_key = "nrs:vlt:" + layer.value + ":" + key
+                    let data = {
+                        "value": json.dumps(item.value, false),
+                        "confidence": to_string(item.confidence),
+                        "domain": to_string(item.domain),
+                        "source": to_string(item.source),
+                        "tags": json.dumps(item.tags.to_list(), false),
+                        "created_at": to_string(item.created_at),
+                        "accessed_at": to_string(item.accessed_at),
+                        "immutable": "0"
+                    }
+                    if item.immutable { data["immutable"] = "1" }
+                    if redis_client != nil {
+                        redis_client.hset(redis_key, data)
+                        let ttl_secs = 86400 * 7
+                        if item.ttl != nil { ttl_secs = to_int(item.ttl) }
+                        redis_client.expire(redis_key, ttl_secs)
+                    }
+                    saved += 1
+                }
+            }
+            log.info("VLT saved " + to_string(saved) + " items to Redis")
+            return { "saved": saved }
+        } catch(e) {
+            log.warn("VLT Redis save failed: " + to_string(e))
+            return { "saved": 0, "error": to_string(e) }
+        }
+    }
+
+    fn load_from_redis(self, redis_client: Optional[any]) -> any {
+        try {
+            let loaded = 0
+            let layers = [ VLTLayer.L2_SESSION, VLTLayer.L3_PERSISTENT ]
+            for layer in layers {
+                if redis_client == nil { continue }
+                let pattern = "nrs:vlt:" + layer.value + ":*"
+                let prefix_len = ("nrs:vlt:" + layer.value + ":").len()
+                let cursor = 0
+                while true {
+                    let result = redis_client.scan(cursor, pattern, 200)
+                    cursor = result[0]
+                    for redis_key in result[1] {
+                        let key = to_string(redis_key).slice(prefix_len, to_string(redis_key).len())
+                        if self._layers[layer.value].get(key, nil) != nil { continue }
+                        let data = redis_client.hgetall(redis_key)
+                        if data == nil { continue }
+                        if data.len() == 0 { continue }
+                        let value = nil
+                        try { value = json.loads(data.get("value", "null")) }
+                        catch(e) { value = data.get("value", "") }
+                        let tags = set()
+                        try { tags = Set[string].from_list(json.loads(data.get("tags", "[]"))) }
+                        catch(e) { pass }
+                        self.store(key, value, layer,
+                                   to_float(data.get("confidence", "0.5")),
+                                   data.get("domain", nil),
+                                   data.get("source", "redis_restore"),
+                                   tags, nil, data.get("immutable", "0") == "1")
+                        loaded += 1
+                    }
+                    if cursor == 0 { break }
+                }
+            }
+            log.info("VLT loaded " + to_string(loaded) + " items from Redis")
+            return { "loaded": loaded }
+        } catch(e) {
+            log.warn("VLT Redis load failed: " + to_string(e))
+            return { "loaded": 0, "error": to_string(e) }
+        }
+    }
+
+    fn stats(self) -> any {
+        let layer_sizes = {}
+        let all_layers = [ VLTLayer.L1_EPHEMERAL, VLTLayer.L2_SESSION,
+                                           VLTLayer.L3_PERSISTENT, VLTLayer.L4_ARCHIVAL ]
+        for l in all_layers {
+            layer_sizes[l.value] = self.layer_size(l)
+        }
+        let hit_rate = 0.0
+        if self._recalls > 0 {
+            hit_rate = to_float(self._hits) / to_float(self._recalls)
+        }
+        return {
+            "layers": layer_sizes,
+            "total_items": self.total_items(),
+            "stores": self._stores, "recalls": self._recalls,
+            "hit_rate": hit_rate,
+            "promotions": self._promotions, "evictions": self._evictions,
+            "pvs": self.pvs.stats(), "tuition": self.tuition.stats(),
+            "mesh": self.mesh.stats(), "cross_domain": self.cross_domain.stats(),
+            "creative": self.creative.stats()
+        }
+    }
+}
+
+/// ── NRS Processing Result ──
+
+type NRSProcessingResult {
+    request_id: string,
+    mode: ProcessingMode,
+    tier: string,
+    domain: string,
+    answer: string,
+    confidence: float,
+    h_score: HScoreResult,
+    complexity: ComplexityScore,
+    lobes_activated: List[string],
+    neurons_fired: int,
+    activation_signature: string,
+    processing_time_ms: float,
+    provenance: Map[string, any],
+    guardrails: Map[string, any],
+    section_labels: List[Map[string, string]],
+    inhibition_events: List[Map[string, any]],
+    tuition_applied: bool,
+    pvs_cache_hit: bool,
+    tvs_score: float,
+    tvs_verdict: string,
+    cognitive_augmentation: Optional[Map[string, any]]
+}
+
+/// ── Language Detector ──
+
+class LanguageDetector {
+    fn detect(text: string) -> Tuple[string, string, float] {
+        if text.strip().len() == 0 {
+            return Tuple("en", "en", 0.1)
+        }
+        let clean = text.strip()
+
+        let script_result = LanguageDetector._detect_by_script(clean)
+        if script_result[0] != "" {
+            if script_result[1] > 0.6 {
+                let dialect = LanguageDetector._detect_dialect(clean, script_result[0])
+                return Tuple(script_result[0], dialect, script_result[1])
+            }
+        }
+
+        let trigram_result = LanguageDetector._detect_by_trigrams(clean)
+        if trigram_result[0] != "" {
+            if trigram_result[1] > 0.3 {
+                let dialect = LanguageDetector._detect_dialect(clean, trigram_result[0])
+                return Tuple(trigram_result[0], dialect, trigram_result[1])
+            }
+        }
+
+        return Tuple("en", "en", 0.3)
+    }
+
+    fn _detect_by_script(text: string) -> Tuple[string, float] {
+        let script_ranges = {
+            "ar": [ Tuple(1536, 1791), Tuple(1872, 1919) ],
+            "zh": [ Tuple(19968, 40959), Tuple(13312, 19903) ],
+            "ja": [ Tuple(12352, 12447), Tuple(12448, 12543) ],
+            "ko": [ Tuple(44032, 55215), Tuple(4352, 4607) ],
+            "hi": [ Tuple(2304, 2431) ],
+            "ru": [ Tuple(1024, 1279) ],
+            "th": [ Tuple(3584, 3711) ],
+            "he": [ Tuple(1424, 1535) ],
+            "el": [ Tuple(880, 1023) ]
+        }
+
+        let script_counts = {}
+        let total_non_ascii = 0
+
+        for ch in text.chars() {
+            let cp = ch.codepoint()
+            if cp < 128 { continue }
+            total_non_ascii += 1
+            for lang in script_ranges.keys() {
+                for range_pair in script_ranges[lang] {
+                    if cp >= range_pair[0] {
+                        if cp <= range_pair[1] {
+                            script_counts[lang] = script_counts.get(lang, 0) + 1
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
+        if script_counts.len() == 0 || total_non_ascii < 2 {
+            return Tuple("", 0.0)
+        }
+
+        let best_lang = ""
+        let best_count = 0
+        for lang in script_counts.keys() {
+            if script_counts[lang] > best_count {
+                best_count = script_counts[lang]
+                best_lang = lang
+            }
+        }
+        let confidence = min(to_float(best_count) / max(to_float(total_non_ascii), 1.0), 1.0)
+        return Tuple(best_lang, confidence * 0.95)
+    }
+
+    fn _detect_by_trigrams(text: string) -> Tuple[string, float] {
+        let lower = text.lower()
+        let text_trigrams = set()
+        let words = lower.split(" ")
+        for word in words {
+            for i in range(0, word.len() - 2) {
+                text_trigrams.add(word.slice(i, i + 3))
+            }
+        }
+        if text_trigrams.len() == 0 {
+            return Tuple("", 0.0)
+        }
+
+        let latin_trigrams = {
+            "en": { "the", "ing", "and", "tion", "her", "for", "tha", "ere", "ent", "ion" },
+            "es": { "los", "las", "que", "cion", "ado", "nte", "por", "ent", "con", "una" },
+            "fr": { "les", "des", "ent", "que", "ait", "ion", "est", "ous", "par", "our" },
+            "de": { "ein", "sch", "ich", "die", "der", "den", "und", "ung", "cht", "ber" }
+        }
+
+        let best_lang = ""
+        let best_score = 0.0
+        for lang in latin_trigrams.keys() {
+            let lang_set = latin_trigrams[lang]
+            let overlap = 0
+            for tg in text_trigrams {
+                if lang_set.contains(tg) { overlap += 1 }
+            }
+            let score = to_float(overlap) / max(to_float(lang_set.len()), 1.0)
+            if score > best_score {
+                best_score = score
+                best_lang = lang
+            }
+        }
+
+        return Tuple(best_lang, min(best_score * 2.5, 0.95))
+    }
+
+    fn _detect_dialect(text: string, lang: string) -> string {
+        let dialect_markers = {
+            "en": {
+                "en-US": [ "color", "favorite", "realize", "center", "defense" ],
+                "en-GB": [ "colour", "favourite", "realise", "centre", "defence" ]
+            },
+            "es": {
+                "es-MX": [ "ahorita", "chido", "padre" ],
+                "es-ES": [ "vale", "mola", "flipar" ]
+            }
+        }
+        let markers = dialect_markers.get(lang, nil)
+        if markers == nil { return lang }
+        let lower = text.lower()
+        let best_dialect = lang
+        let best_hits = 0
+        for dialect in markers.keys() {
+            let hits = 0
+            for m in markers[dialect] {
+                if lower.contains(m) { hits += 1 }
+            }
+            if hits > best_hits {
+                best_hits = hits
+                best_dialect = dialect
+            }
+        }
+        return best_dialect
+    }
+
+    fn get_language_name(code: string) -> string {
+        let lang_names = {
+            "en": "English", "es": "Spanish", "fr": "French", "de": "German",
+            "pt": "Portuguese", "it": "Italian", "nl": "Dutch", "ru": "Russian",
+            "ar": "Arabic", "zh": "Chinese", "ja": "Japanese", "ko": "Korean",
+            "hi": "Hindi", "th": "Thai", "he": "Hebrew", "el": "Greek"
+        }
+        let base = code.split("-")[0]
+        return lang_names.get(base, "English")
+    }
+}
+
+/// ── NRS Processing Pipeline ──
+
+let CREATIVE_SIGNALS = { "creative", "brainstorm", "imagine", "explore", "generate", "poem", "story" }
+let FACTUAL_SIGNALS = { "fact", "verify", "calculate", "prove", "lookup", "exact", "deterministic" }
+let HIGH_RISK_DOMAINS = [ "medical", "legal", "financial", "safety" ]
+
+class NRSProcessingPipeline {
+    fn init(self, total_neurons: int, active_k: int) {
+        self._total_neurons = total_neurons
+        self._active_k = min(active_k, total_neurons)
+        self._redis_client = nil
+
+        // Attempt to connect to Redis for VLT persistence
+        try {
+            let redis_mod = __import__("redis")
+            let redis_url = os.environ.get("NRS_REDIS_URL", "redis://localhost:6379/0")
+            self._redis_client = redis_mod.from_url(
+                redis_url,
+                decode_responses: true,
+                socket_connect_timeout: 3,
+                socket_timeout: 5,
+                retry_on_timeout: true
+            )
+            self._redis_client.ping()
+            log.info("VLT Redis connected: %s", redis_url)
+        } catch(e) {
+            log.warn("VLT Redis unavailable, running in-memory only: %s", to_string(e))
+            self._redis_client = nil
+        }
+
+        self.vlt = VLT()
+        self.vlt.init(64, 512, 10000, 86400.0, 7776000.0, 10000, EvictionPolicy.COMBINED)
+        try { self.vlt.load_from_redis(self._redis_client) }
+        catch(e) { log.warn("VLT Redis restore failed: " + to_string(e)) }
+
+        self.axioms = AxiomStore()
+        self.axioms.init()
+        self.inhibitory = InhibitoryNetwork()
+        self.inhibitory.init()
+        self.complexity_analyzer = ComplexityAnalyzer()
+        self.complexity_analyzer.init()
+        self.h_score_calc = HScoreCalculator()
+        self.h_score_calc.init()
+        self.hierarchy = HierarchicalPipeline()
+        self.hierarchy.init(nil, "nrs-main")
+        self.knowledge_base = KnowledgeBase("nrs-global")
+        self.knowledge_base.init("nrs-global")
+
+        self._flow_records = []
+        self._query_counter = 0
+        self._redis_save_interval = 50
+
+        self._init_hierarchy()
+        self._init_knowledge()
+    }
+
+    fn _init_hierarchy(self) {
+        self.hierarchy.add_layer(Layer("sensory", 0, nil, nil, nil, "Input normalization"))
+        self.hierarchy.add_layer(Layer("pattern", 1, nil, nil, nil, "PVS-4 pattern matching"))
+        self.hierarchy.add_layer(Layer("reasoning", 2, nil, nil, nil, "Lobe processing"))
+        self.hierarchy.add_layer(Layer("validation", 3, nil, nil, nil, "H_score + axiom gate"))
+    }
+
+    fn _init_knowledge(self) {
+        let domains = [ "medical", "financial", "legal", "engineering", "physics", "general" ]
+        for domain in domains {
+            let pattern = KnowledgePattern()
+            pattern.init(domain, "1.0.0", true, nil, nil)
+            pattern.register(domain + "_bootstrap", domain + " domain", 1.0, "system", nil, nil)
+            self.knowledge_base.add(pattern)
+        }
+    }
+
+    fn _classify_mode(self, query: string, domain: string) -> Tuple[ProcessingMode, string] {
+        let tokens = set()
+        for w in query.lower().split(" ") {
+            tokens.add(w)
+        }
+        let has_creative = false
+        for s in CREATIVE_SIGNALS {
+            if tokens.contains(s) { has_creative = true; break }
+        }
+        let has_factual = false
+        for s in FACTUAL_SIGNALS {
+            if tokens.contains(s) { has_factual = true; break }
+        }
+        let is_high_risk = false
+        let domain_lower = domain.lower()
+        for hr in HIGH_RISK_DOMAINS {
+            if domain_lower == hr { is_high_risk = true; break }
+        }
+
+        if is_high_risk {
+            return Tuple(ProcessingMode.DETERMINISTIC, "high_risk_deterministic")
+        }
+        if has_creative {
+            if !has_factual {
+                return Tuple(ProcessingMode.PROBABILISTIC, "creative_signal")
+            }
+        }
+        if has_factual {
+            if !has_creative {
+                return Tuple(ProcessingMode.DETERMINISTIC, "factual_signal")
+            }
+        }
+        if has_creative {
+            if has_factual {
+                return Tuple(ProcessingMode.HYBRID, "mixed_signals")
+            }
+        }
+        return Tuple(ProcessingMode.HYBRID, "default_hybrid")
+    }
+
+    fn process(self, query: string, domain: string, mode_override: string,
+               instance_id: string) -> NRSProcessingResult {
+        self._query_counter += 1
+        if self._query_counter % self._redis_save_interval == 0 {
+            try { self.vlt.save_to_redis(self._redis_client) }
+            catch(e) { log.debug("Periodic VLT Redis save skipped: " + to_string(e)) }
+        }
+
+        let start_ms = time.monotonic() * 1000.0
+        let prov = ProvenanceBuilder()
+        prov.init(query, instance_id)
+        let pvs = self.vlt.pvs
+
+        let detected_lang_result = LanguageDetector.detect(query)
+        let detected_lang = detected_lang_result[0]
+        let detected_dialect = detected_lang_result[1]
+        let lang_confidence = detected_lang_result[2]
+        prov.add_memory_access("lang_detect", detected_dialect, true, lang_confidence)
+
+        let pvs_match = pvs.lookup(query)
+        if pvs_match != nil {
+            if pvs_match.data.get("tuition_record", false) == false {
+                prov.add_memory_access("PVS4", query.slice(0, min(32, query.len())), true, 0.5)
+                let elapsed_ms = time.monotonic() * 1000.0 - start_ms
+                let cached = pvs_match.data
+                let request_id = hashlib.sha256(query + ":" + to_string(time.time())).hexdigest().slice(0, 16)
+                return NRSProcessingResult {
+                    request_id: request_id,
+                    mode: ProcessingMode.HYBRID,
+                    tier: pvs_match.tier,
+                    domain: to_string(cached.get("domain", domain)),
+                    answer: to_string(cached.get("answer", "")),
+                    confidence: pvs_match.confidence,
+                    h_score: HScoreResult { score: 0.0, verdict: "cached",
+                                             components: {},
+                                             claims_unconfirmed: nil },
+                    complexity: default_complexity_score(),
+                    lobes_activated: [],
+                    neurons_fired: 0,
+                    activation_signature: "",
+                    processing_time_ms: round(elapsed_ms, 2),
+                    provenance: prov.finalize(to_string(cached.get("answer", "")), nil).to_dict(),
+                    guardrails: {},
+                    section_labels: [],
+                    inhibition_events: [],
+                    tuition_applied: false,
+                    pvs_cache_hit: true,
+                    tvs_score: 0.0,
+                    tvs_verdict: "cached",
+                    cognitive_augmentation: nil
+                }
+            }
+        }
+
+        let tuition_tier = self.vlt.tuition.route(query, "")
+        let tuition_applied = tuition_tier != ""
+
+        let complexity = self.complexity_analyzer.analyze(query, false, 0.0)
+
+        let tier_str = "T2"
+        if tuition_applied {
+            tier_str = tuition_tier
+        } else if complexity.tier != nil {
+            tier_str = complexity.tier.value
+        }
+
+        let detected_domain = domain
+        if complexity.domain_hint != nil {
+            detected_domain = complexity.domain_hint
+        }
+
+        let mode = ProcessingMode.HYBRID
+        let mode_reason = "default_hybrid"
+        if mode_override != "" {
+            mode = ProcessingMode.HYBRID
+            if mode_override.upper() == "DETERMINISTIC" { mode = ProcessingMode.DETERMINISTIC }
+            else if mode_override.upper() == "PROBABILISTIC" { mode = ProcessingMode.PROBABILISTIC }
+            mode_reason = "explicit_override"
+        } else {
+            let classified = self._classify_mode(query, detected_domain)
+            mode = classified[0]
+            mode_reason = classified[1]
+        }
+        prov.set_mode(mode.value, tier_str, detected_domain)
+
+        let lobes_to_run = [ "linguistic" ]
+        let ql = query.lower()
+        if ql.contains("logic") || ql.contains("reason") || ql.contains("if") {
+            lobes_to_run.append("logical")
+        }
+        if ql.contains("math") || ql.contains("calculate") || ql.contains("equation") {
+            lobes_to_run.append("mathematical")
+        }
+        if ql.contains("where") || ql.contains("location") || ql.contains("map") {
+            lobes_to_run.append("spatial")
+        }
+        if ql.contains("when") || ql.contains("history") || ql.contains("date") {
+            lobes_to_run.append("temporal")
+        }
+        if mode == ProcessingMode.PROBABILISTIC || ql.contains("creative") || ql.contains("poem") {
+            lobes_to_run.append("creative")
+        }
+
+        let linguistic_lobe = LinguisticLobe()
+        linguistic_lobe.init()
+        let lobe_result = linguistic_lobe.process(query, detected_domain)
+        let answer = lobe_result.value
+        let confidence = lobe_result.confidence
+
+        for lobe_name in lobes_to_run {
+            prov.add_lobe(lobe_name, 1.0, confidence, nil, false)
+        }
+
+        let axioms_matched = 0
+        try {
+            let ax_results = self.axioms.query(detected_domain, nil, 10)
+            axioms_matched = ax_results.len()
+            if self.knowledge_base != nil {
+                let kb_hits = self.knowledge_base.search(query, 5)
+                if kb_hits != nil { axioms_matched = axioms_matched + kb_hits.len() }
+            }
+        } catch(_ax_err) {
+            axioms_matched = 0
+        }
+
+        let h_result = self.h_score_calc.evaluate(answer, detected_domain, confidence, axioms_matched, mode.value)
+
+        let guardrails = {
+            "mode": mode.value,
+            "tier": tier_str,
+            "h_score": h_result.score,
+            "h_verdict": h_result.verdict
+        }
+
+        self.inhibitory.reset()
+        let inhibited = self.inhibitory.evaluate(
+            tier_str, { "confidence": confidence }, nil, 0
+        )
+        let inhibition_events_raw = []
+        for event in self.inhibitory.events() {
+            inhibition_events_raw.append({
+                "rule": event.rule_name,
+                "type": event.inhibition_type.value,
+                "reason": event.reason,
+                "targets": event.target_layers
+            })
+        }
+
+        let section_labels = []
+        let primary_lobe = "linguistic"
+        if lobes_to_run.len() > 0 { primary_lobe = lobes_to_run[0] }
+        if mode == ProcessingMode.HYBRID {
+            section_labels.append({ "section": "0", "label": "VALIDATED", "source": "deterministic" })
+            section_labels.append({ "section": "1", "label": "CREATIVE", "source": "probabilistic" })
+            prov.add_section(0, answer, SectionLabel.VALIDATED, confidence, h_result.score, primary_lobe, nil)
+        } else if mode == ProcessingMode.DETERMINISTIC {
+            section_labels.append({ "section": "0", "label": "VALIDATED", "source": "deterministic" })
+            prov.add_section(0, answer, SectionLabel.VALIDATED, confidence, h_result.score, primary_lobe, nil)
+        } else {
+            section_labels.append({ "section": "0", "label": "CREATIVE", "source": "probabilistic" })
+            prov.add_section(0, answer, SectionLabel.CREATIVE, confidence, h_result.score, primary_lobe, nil)
+        }
+
+        let hierarchy_result = self.hierarchy.process(
+            {
+                "query": query.slice(0, min(64, query.len())),
+                "tier": tier_str, "answer": answer,
+                "confidence": confidence, "h_score": h_result.score,
+                "verdict": h_result.verdict, "lobes": lobes_to_run
+            }, nil, "cycle", 1, nil
+        )
+
+        pvs.store(query, tier_str, confidence, {
+            "answer": answer, "mode": mode.value, "domain": detected_domain,
+            "h_score": h_result, "complexity": complexity, "lobes": lobes_to_run,
+            "guardrails": guardrails, "section_labels": section_labels
+        })
+
+        let elapsed_ms = time.monotonic() * 1000.0 - start_ms
+        let provenance_chain = prov.finalize(answer, nil)
+        let request_id = hashlib.sha256(query + ":" + to_string(time.time())).hexdigest().slice(0, 16)
+
+        let prov_dict = provenance_chain.to_dict()
+        prov_dict["mode_reason"] = mode_reason
+
+        return NRSProcessingResult {
+            request_id: request_id,
+            mode: mode,
+            tier: tier_str,
+            domain: detected_domain,
+            answer: answer,
+            confidence: confidence,
+            h_score: h_result,
+            complexity: complexity,
+            lobes_activated: lobes_to_run,
+            neurons_fired: 0,
+            activation_signature: "",
+            processing_time_ms: round(elapsed_ms, 2),
+            provenance: prov_dict,
+            guardrails: guardrails,
+            section_labels: section_labels,
+            inhibition_events: inhibition_events_raw,
+            tuition_applied: tuition_applied,
+            pvs_cache_hit: false,
+            tvs_score: 0.0,
+            tvs_verdict: "validated",
+            cognitive_augmentation: nil
+        }
+    }
+
+    fn process_media(self, media_bytes: bytes, modality: string, domain: string,
+                     instance_id: string) -> NRSProcessingResult {
+        let query = "media:" + modality + ":hash=" + hashlib.sha256(media_bytes).hexdigest().slice(0, 16)
+        let result = self.process(query, domain, "", instance_id)
+        result.provenance["media"] = {
+            "modality": modality,
+            "content_hash": hashlib.sha256(media_bytes).hexdigest().slice(0, 16)
+        }
+        return result
+    }
+
+    fn process_stream(self, segment_bytes: bytes, stream_id: string,
+                      segment_index: int, modality: string, domain: string,
+                      instance_id: string) -> NRSProcessingResult {
+        let result = self.process_media(segment_bytes, modality, domain, instance_id)
+        result.provenance["stream"] = {
+            "stream_id": stream_id,
+            "segment_index": segment_index
+        }
+        return result
+    }
+
+    fn stats(self) -> any {
+        return {
+            "query_counter": self._query_counter,
+            "vlt": self.vlt.stats(),
+            "axioms": self.axioms.count(),
+            "inhibitory": self.inhibitory.stats(),
+            "complexity_analyses": self.complexity_analyzer._analyses,
+            "h_score_evaluations": self.h_score_calc._evaluations
+        }
+    }
+}
+
+export ProcessingMode, AxiomTier, Axiom, AxiomStore
+export PVSMatch, PVS4
+export HScoreResult, TRUTH_FLOOR, HScoreCalculator
+export Tier, ComplexityScore, default_complexity_score, ComplexityAnalyzer
+export LobeType, LobeResult, default_lobe_result, LobeProcessor
+export LinguisticLobe, LogicalLobe, MathematicalLobe
+export SpatialLobe, TemporalLobe, CreativeLobeProcessor
+export InhibitionType, InhibitionEvent, InhibitionRule, InhibitoryNetwork
+export TuitionRecord, TuitionSystem
+export MeshProposal, make_mesh_proposal, mesh_proposal_is_validated, SymbioticMesh
+export UniversalPattern, CrossDomainTransfer
+export CreativeLobe
+export VLTLayer, EvictionPolicy, VLTItem, vlt_item_is_expired, vlt_item_touch, VLT
+export NRSProcessingResult
+export LanguageDetector
+export NRSProcessingPipeline
+/// ── Lobe Instance Registry ──
+
+let LOBE_INSTANCES = {}
+
+fn _init_lobe_instances() {
+    let ling = LinguisticLobe()
+    ling.init()
+    let logical = LogicalLobe()
+    logical.init()
+    let math = MathematicalLobe()
+    math.init()
+    let spatial = SpatialLobe()
+    spatial.init()
+    let temporal = TemporalLobe()
+    temporal.init()
+    let creative = CreativeLobeProcessor()
+    creative.init()
+
+    LOBE_INSTANCES["linguistic"] = ling
+    LOBE_INSTANCES["logical"] = logical
+    LOBE_INSTANCES["mathematical"] = math
+    LOBE_INSTANCES["spatial"] = spatial
+    LOBE_INSTANCES["temporal"] = temporal
+    LOBE_INSTANCES["creative"] = creative
+}
+
+_init_lobe_instances()
+
+export CREATIVE_SIGNALS, FACTUAL_SIGNALS, HIGH_RISK_DOMAINS
+export LOBE_INSTANCES

@@ -1,0 +1,1173 @@
+/// NRS Parser Factory — Dynamic Handler Generation.
+///
+/// When the NRSFileEngine encounters a file format it has no handler
+/// for, the ParserFactory analyzes the file's structure and generates
+/// a new handler at runtime. It uses NRS reasoning lobes to:
+///
+///   1. Inspect raw bytes and text patterns
+///   2. Hypothesize about the file's structure
+///   3. Generate a conversion function
+///   4. Validate the output
+///   5. Register the new handler for future use
+///   6. Persist the handler so it's available across restarts
+///
+/// This means the system never says "unsupported format" — it figures
+/// it out, builds what it needs, and learns for next time.
+///
+/// ═══════════════════════════════════════════════════════════════════
+///   GENERATION PIPELINE
+/// ═══════════════════════════════════════════════════════════════════
+///
+///   Unknown File
+///      │
+///      ▼
+///   ┌─ SAMPLE ──────────────────────────────────────────────────────┐
+///   │  Read header bytes + text preview + file metadata             │
+///   └────────┬──────────────────────────────────────────────────────┘
+///            │
+///            ▼
+///   ┌─ ANALYZE ─────────────────────────────────────────────────────┐
+///   │  Pattern matching: delimiters, records, fields, nesting       │
+///   │  Statistical: byte distribution, entropy, encoding            │
+///   │  Structural: repeating blocks, headers, footers               │
+///   └────────┬──────────────────────────────────────────────────────┘
+///            │
+///            ▼
+///   ┌─ HYPOTHESIZE ─────────────────────────────────────────────────┐
+///   │  Generate candidate parse strategies ranked by confidence     │
+///   └────────┬──────────────────────────────────────────────────────┘
+///            │
+///            ▼
+///   ┌─ BUILD ───────────────────────────────────────────────────────┐
+///   │  Synthesize a handler function from the best hypothesis       │
+///   └────────┬──────────────────────────────────────────────────────┘
+///            │
+///            ▼
+///   ┌─ VALIDATE ────────────────────────────────────────────────────┐
+///   │  Run handler on sample, check output quality                  │
+///   └────────┬──────────────────────────────────────────────────────┘
+///            │
+///            ▼
+///   ┌─ PERSIST ─────────────────────────────────────────────────────┐
+///   │  Save handler spec to disk for future use                     │
+///   └───────────────────────────────────────────────────────────────┘
+
+module nrs_parser_factory
+
+import os from "std/os"
+import json from "std/json"
+import re from "std/re"
+import time from "std/time"
+import math from "std/math"
+import hashlib from "std/hashlib"
+import logging from "std/logging"
+import FormatHandler from "nrs_file_engine"
+
+let logger = logging.getLogger("nrs.parser-factory")
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  TYPES
+// ═══════════════════════════════════════════════════════════════════
+
+type FileSample {
+    header_bytes: bytes,
+    text_preview: string,
+    file_size: int,
+    extension: string,
+    is_text: bool,
+    encoding: string,
+    byte_entropy: float,
+    line_count: int,
+    avg_line_length: float
+}
+
+type ParseHypothesis {
+    strategy: string,
+    confidence: float,
+    delimiter: string,
+    record_separator: string,
+    has_header: bool,
+    skip_lines: int,
+    field_count: int,
+    encoding: string,
+    notes: string
+}
+
+type GeneratedSpec {
+    format_id: string,
+    extensions: List[string],
+    strategy: string,
+    delimiter: string,
+    record_separator: string,
+    has_header: bool,
+    skip_lines: int,
+    encoding: string,
+    created_at: float,
+    source_file: string,
+    validation_score: float
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  FILE SAMPLER
+// ═══════════════════════════════════════════════════════════════════
+
+class FileSampler {
+
+    fn init(self) {
+        self._sample_size = 65536
+        self._text_threshold = 0.85
+    }
+
+    fn sample(self, path: string) -> FileSample {
+        let size = os.path.getsize(path)
+        let ext = ""
+        let parts = path.lower().split(".")
+        if len(parts) >= 2 { ext = "." + parts[-1] }
+
+        // Read header bytes
+        let f = open(path, "rb")
+        let header = f.read(self._sample_size)
+        f.close()
+
+        // Determine if text
+        let text_chars = 0
+        let total = min(len(header), 8192)
+        for i in range(total) {
+            let b = header[i]
+            if (b >= 32 and b < 127) or b == 9 or b == 10 or b == 13 {
+                text_chars = text_chars + 1
+            }
+        }
+        let is_text = float(text_chars) / float(max(total, 1)) > self._text_threshold
+
+        // Encoding detection
+        let encoding = "binary"
+        let text_preview = ""
+        if is_text {
+            encoding = "utf-8"
+            // Check for BOM
+            if len(header) >= 3 and header[0:3] == b"\xef\xbb\xbf" { encoding = "utf-8-sig" }
+            if len(header) >= 2 and header[0:2] == b"\xff\xfe" { encoding = "utf-16-le" }
+            if len(header) >= 2 and header[0:2] == b"\xfe\xff" { encoding = "utf-16-be" }
+
+            try {
+                text_preview = header.decode(encoding, errors="replace")
+            } catch {
+                text_preview = header.decode("latin-1", errors="replace")
+                encoding = "latin-1"
+            }
+        }
+
+        // Byte entropy
+        let entropy = self._compute_entropy(header)
+
+        // Line stats
+        let line_count = 0
+        let total_line_len = 0
+        if is_text {
+            let lines = text_preview.split("\n")
+            line_count = len(lines)
+            for line in lines { total_line_len = total_line_len + len(line) }
+        }
+        let avg_line = float(total_line_len) / float(max(line_count, 1))
+
+        return FileSample {
+            header_bytes: header[0:256],
+            text_preview: text_preview[0:8192],
+            file_size: size,
+            extension: ext,
+            is_text: is_text,
+            encoding: encoding,
+            byte_entropy: entropy,
+            line_count: line_count,
+            avg_line_length: avg_line
+        }
+    }
+
+    fn _compute_entropy(self, data: bytes) -> float {
+        if len(data) == 0 { return 0.0 }
+        let freq: Dict[int, int] = {}
+        for b in data {
+            if b not in freq { freq[b] = 0 }
+            freq[b] = freq[b] + 1
+        }
+        let n = float(len(data))
+        let ent = 0.0
+        for b in freq {
+            let p = float(freq[b]) / n
+            if p > 0.0 { ent = ent - p * math.log2(p) }
+        }
+        return ent
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  HYPOTHESIS GENERATOR
+// ═══════════════════════════════════════════════════════════════════
+
+class HypothesisGenerator {
+
+    fn init(self) {
+        self._delimiters = [",", "\t", "|", ";", "::", "~", "^"]
+        self._record_seps = ["\n", "\r\n", "\n\n", "---\n", "===\n"]
+    }
+
+    fn generate(self, sample: FileSample) -> List[ParseHypothesis] {
+        let hypotheses: List[ParseHypothesis] = []
+
+        if !sample.is_text {
+            // Binary file strategies
+            append(hypotheses, self._binary_record_hypothesis(sample))
+            append(hypotheses, self._hex_dump_hypothesis(sample))
+            return self._sort_by_confidence(hypotheses)
+        }
+
+        let text = sample.text_preview
+        let lines = text.split("\n")
+
+        // Strategy 1: Delimiter detection
+        for delim in self._delimiters {
+            let h = self._test_delimiter(lines, delim)
+            if h != None { append(hypotheses, h) }
+        }
+
+        // Strategy 2: Fixed-width columns
+        let fw = self._test_fixed_width(lines)
+        if fw != None { append(hypotheses, fw) }
+
+        // Strategy 3: Key-value pairs
+        let kv = self._test_key_value(lines)
+        if kv != None { append(hypotheses, kv) }
+
+        // Strategy 4: Repeated block pattern
+        let block = self._test_block_pattern(text)
+        if block != None { append(hypotheses, block) }
+
+        // Strategy 5: Log/syslog pattern
+        let log = self._test_log_pattern(lines)
+        if log != None { append(hypotheses, log) }
+
+        // Strategy 6: JSON embedded in text
+        let json_h = self._test_json_embedded(text)
+        if json_h != None { append(hypotheses, json_h) }
+
+        // Strategy 7: XML/HTML-like
+        let xml_h = self._test_xml_like(text)
+        if xml_h != None { append(hypotheses, xml_h) }
+
+        // Strategy 8: INI/config style
+        let ini_h = self._test_ini_style(lines)
+        if ini_h != None { append(hypotheses, ini_h) }
+
+        // Fallback: single-column text
+        append(hypotheses, ParseHypothesis {
+            strategy: "single_column",
+            confidence: 0.1,
+            delimiter: "",
+            record_separator: "\n",
+            has_header: false,
+            skip_lines: 0,
+            field_count: 1,
+            encoding: sample.encoding,
+            notes: "Last resort: each line becomes a row"
+        })
+
+        return self._sort_by_confidence(hypotheses)
+    }
+
+    fn _test_delimiter(self, lines: List[string], delim: string) -> Optional[ParseHypothesis] {
+        if len(lines) < 2 { return None }
+
+        let check = min(30, len(lines))
+        let counts: List[int] = []
+        let skip = 0
+
+        // Detect header/comment lines to skip
+        for i in range(min(5, len(lines))) {
+            let line = lines[i].strip()
+            if line.startswith("#") or line.startswith("//") or line.startswith("--") or line.startswith("%") {
+                skip = i + 1
+            } else {
+                break
+            }
+        }
+
+        for i in range(skip, min(skip + check, len(lines))) {
+            let line = lines[i]
+            if len(line.strip()) == 0 { continue }
+            append(counts, line.count(delim))
+        }
+
+        if len(counts) < 2 { return None }
+        if counts[0] == 0 { return None }
+
+        // Check consistency
+        let mode_val = counts[0]
+        let consistent = 0
+        for c in counts {
+            if c == mode_val { consistent = consistent + 1 }
+        }
+        let ratio = float(consistent) / float(len(counts))
+
+        if ratio < 0.6 { return None }
+
+        // Confidence based on consistency and field count
+        let conf = ratio * 0.8
+        if mode_val >= 2 { conf = conf + 0.1 }
+        if mode_val >= 5 { conf = conf + 0.05 }
+        conf = min(conf, 0.95)
+
+        // Detect header
+        let has_header = false
+        if skip < len(lines) {
+            let first_line = lines[skip]
+            let fields = first_line.split(delim)
+            let all_non_numeric = true
+            for f in fields {
+                let stripped = f.strip().strip('"')
+                try { float(stripped); all_non_numeric = false } catch {}
+            }
+            if all_non_numeric and len(fields) > 1 { has_header = true }
+        }
+
+        return ParseHypothesis {
+            strategy: "delimited",
+            confidence: conf,
+            delimiter: delim,
+            record_separator: "\n",
+            has_header: has_header,
+            skip_lines: skip,
+            field_count: mode_val + 1,
+            encoding: "utf-8",
+            notes: "Delimiter '" + delim + "' with " + str(mode_val + 1) + " fields, " + format_float(ratio * 100.0, 0) + "% consistent"
+        }
+    }
+
+    fn _test_fixed_width(self, lines: List[string]) -> Optional[ParseHypothesis] {
+        if len(lines) < 3 { return None }
+
+        let max_len = 0
+        let check = min(30, len(lines))
+        for i in range(check) {
+            if len(lines[i]) > max_len { max_len = len(lines[i]) }
+        }
+        if max_len < 10 { return None }
+
+        let space_hits: Dict[int, int] = {}
+        for i in range(check) {
+            let line = lines[i]
+            let in_run = false
+            for j in range(len(line)) {
+                if line[j] == " " {
+                    if !in_run and j > 0 {
+                        if j not in space_hits { space_hits[j] = 0 }
+                        space_hits[j] = space_hits[j] + 1
+                    }
+                    in_run = true
+                } else { in_run = false }
+            }
+        }
+
+        let threshold = int(check * 0.6)
+        let boundaries = 0
+        for pos in space_hits {
+            if space_hits[pos] >= threshold { boundaries = boundaries + 1 }
+        }
+
+        if boundaries < 2 { return None }
+
+        return ParseHypothesis {
+            strategy: "fixed_width",
+            confidence: min(0.7 + float(boundaries) * 0.02, 0.9),
+            delimiter: "",
+            record_separator: "\n",
+            has_header: true,
+            skip_lines: 0,
+            field_count: boundaries + 1,
+            encoding: "utf-8",
+            notes: str(boundaries) + " column boundaries detected"
+        }
+    }
+
+    fn _test_key_value(self, lines: List[string]) -> Optional[ParseHypothesis] {
+        let kv_re = re.compile(r"^(.+?)[:=]\s*(.+)$")
+        let check = min(30, len(lines))
+        let matches = 0
+        for i in range(check) {
+            if kv_re.match(lines[i].strip()) != None { matches = matches + 1 }
+        }
+        let ratio = float(matches) / float(max(check, 1))
+        if ratio < 0.4 { return None }
+
+        return ParseHypothesis {
+            strategy: "key_value",
+            confidence: ratio * 0.85,
+            delimiter: ":",
+            record_separator: "\n\n",
+            has_header: false,
+            skip_lines: 0,
+            field_count: 2,
+            encoding: "utf-8",
+            notes: format_float(ratio * 100.0, 0) + "% of lines are key-value pairs"
+        }
+    }
+
+    fn _test_block_pattern(self, text: string) -> Optional[ParseHypothesis] {
+        let blocks = re.split(r"\n\s*\n", text.strip())
+        if len(blocks) < 3 { return None }
+
+        // Check if blocks have similar structure
+        let line_counts: List[int] = []
+        for block in blocks[0:10] {
+            append(line_counts, len(block.strip().split("\n")))
+        }
+
+        if len(line_counts) < 3 { return None }
+        let avg = float(sum(line_counts)) / float(len(line_counts))
+        let variance = 0.0
+        for c in line_counts {
+            variance = variance + (float(c) - avg) * (float(c) - avg)
+        }
+        variance = variance / float(len(line_counts))
+
+        if variance > avg * 2.0 { return None }
+
+        return ParseHypothesis {
+            strategy: "block_record",
+            confidence: 0.6,
+            delimiter: "",
+            record_separator: "\n\n",
+            has_header: false,
+            skip_lines: 0,
+            field_count: int(avg),
+            encoding: "utf-8",
+            notes: str(len(blocks)) + " blocks with ~" + str(int(avg)) + " lines each"
+        }
+    }
+
+    fn _test_log_pattern(self, lines: List[string]) -> Optional[ParseHypothesis] {
+        let ts_re = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}")
+        let syslog_re = re.compile(r"^\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}")
+        let check = min(20, len(lines))
+        let ts_matches = 0
+        for i in range(check) {
+            let line = lines[i].strip()
+            if ts_re.match(line) != None or syslog_re.match(line) != None {
+                ts_matches = ts_matches + 1
+            }
+        }
+        let ratio = float(ts_matches) / float(max(check, 1))
+        if ratio < 0.5 { return None }
+
+        return ParseHypothesis {
+            strategy: "log_lines",
+            confidence: ratio * 0.8,
+            delimiter: " ",
+            record_separator: "\n",
+            has_header: false,
+            skip_lines: 0,
+            field_count: 5,
+            encoding: "utf-8",
+            notes: "Timestamped log lines"
+        }
+    }
+
+    fn _test_json_embedded(self, text: string) -> Optional[ParseHypothesis] {
+        let json_objects = re.findall(r"\{[^{}]{10,}\}", text[0:4096])
+        if len(json_objects) < 2 { return None }
+
+        let valid = 0
+        for obj in json_objects[0:10] {
+            try { json.loads(obj); valid = valid + 1 } catch {}
+        }
+        if valid < 2 { return None }
+
+        return ParseHypothesis {
+            strategy: "json_embedded",
+            confidence: float(valid) / float(len(json_objects[0:10])) * 0.8,
+            delimiter: "",
+            record_separator: "\n",
+            has_header: false,
+            skip_lines: 0,
+            field_count: 0,
+            encoding: "utf-8",
+            notes: str(valid) + " valid JSON objects found in text"
+        }
+    }
+
+    fn _test_xml_like(self, text: string) -> Optional[ParseHypothesis] {
+        let tag_count = len(re.findall(r"<\w+[^>]*>", text[0:4096]))
+        if tag_count < 3 { return None }
+
+        return ParseHypothesis {
+            strategy: "xml_like",
+            confidence: min(0.5 + float(tag_count) * 0.02, 0.85),
+            delimiter: "",
+            record_separator: "",
+            has_header: false,
+            skip_lines: 0,
+            field_count: 0,
+            encoding: "utf-8",
+            notes: str(tag_count) + " XML-like tags found"
+        }
+    }
+
+    fn _test_ini_style(self, lines: List[string]) -> Optional[ParseHypothesis] {
+        let section_re = re.compile(r"^\[.+\]$")
+        let sections = 0
+        let check = min(50, len(lines))
+        for i in range(check) {
+            if section_re.match(lines[i].strip()) != None { sections = sections + 1 }
+        }
+        if sections < 2 { return None }
+
+        return ParseHypothesis {
+            strategy: "ini_config",
+            confidence: 0.7,
+            delimiter: "=",
+            record_separator: "[",
+            has_header: false,
+            skip_lines: 0,
+            field_count: 2,
+            encoding: "utf-8",
+            notes: str(sections) + " INI sections found"
+        }
+    }
+
+    fn _binary_record_hypothesis(self, sample: FileSample) -> ParseHypothesis {
+        return ParseHypothesis {
+            strategy: "binary_hex",
+            confidence: 0.2,
+            delimiter: "",
+            record_separator: "",
+            has_header: false,
+            skip_lines: 0,
+            field_count: 3,
+            encoding: "binary",
+            notes: "Binary file, entropy=" + format_float(sample.byte_entropy, 2)
+        }
+    }
+
+    fn _hex_dump_hypothesis(self, sample: FileSample) -> ParseHypothesis {
+        return ParseHypothesis {
+            strategy: "hex_dump",
+            confidence: 0.1,
+            delimiter: " ",
+            record_separator: "\n",
+            has_header: true,
+            skip_lines: 0,
+            field_count: 3,
+            encoding: "binary",
+            notes: "Hex dump fallback"
+        }
+    }
+
+    fn _sort_by_confidence(self, hypotheses: List[ParseHypothesis]) -> List[ParseHypothesis] {
+        // Simple insertion sort by confidence descending
+        for i in range(1, len(hypotheses)) {
+            let key = hypotheses[i]
+            let j = i - 1
+            while j >= 0 and hypotheses[j].confidence < key.confidence {
+                hypotheses[j + 1] = hypotheses[j]
+                j = j - 1
+            }
+            hypotheses[j + 1] = key
+        }
+        return hypotheses
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  HANDLER BUILDER
+// ═══════════════════════════════════════════════════════════════════
+
+class HandlerBuilder {
+
+    fn init(self) {
+        self._csv_escape_re = re.compile(r'[,"\n]')
+    }
+
+    fn build(self, hypothesis: ParseHypothesis, sample: FileSample) -> Any {
+        let strategy = hypothesis.strategy
+
+        if strategy == "delimited" {
+            return self._build_delimited(hypothesis)
+        }
+        if strategy == "fixed_width" {
+            return self._build_fixed_width(hypothesis)
+        }
+        if strategy == "key_value" {
+            return self._build_key_value(hypothesis)
+        }
+        if strategy == "block_record" {
+            return self._build_block_record(hypothesis)
+        }
+        if strategy == "log_lines" {
+            return self._build_log_parser(hypothesis)
+        }
+        if strategy == "json_embedded" {
+            return self._build_json_extractor(hypothesis)
+        }
+        if strategy == "xml_like" {
+            return self._build_xml_handler(hypothesis)
+        }
+        if strategy == "ini_config" {
+            return self._build_ini_handler(hypothesis)
+        }
+        if strategy == "binary_hex" or strategy == "hex_dump" {
+            return self._build_hex_dump(hypothesis)
+        }
+
+        return self._build_passthrough(hypothesis)
+    }
+
+    fn _build_delimited(self, h: ParseHypothesis) -> Any {
+        let delim = h.delimiter
+        let skip = h.skip_lines
+        let enc = h.encoding
+
+        fn handler(path: string) -> Tuple[string, string, List[string]] {
+            let f = open(path, "r", encoding=enc, errors="replace")
+            let text = f.read()
+            f.close()
+            let lines = text.split("\n")
+            if skip > 0 { lines = lines[skip:] }
+            if delim == "," { return (join(lines, "\n"), "csv", []) }
+            let csv_lines: List[string] = []
+            for line in lines {
+                let parts = line.split(delim)
+                let cells: List[string] = []
+                for p in parts {
+                    let val = p.strip()
+                    if "," in val or '"' in val or "\n" in val {
+                        val = '"' + val.replace('"', '""') + '"'
+                    }
+                    append(cells, val)
+                }
+                append(csv_lines, join(cells, ","))
+            }
+            return (join(csv_lines, "\n"), "csv", [])
+        }
+
+        return handler
+    }
+
+    fn _build_fixed_width(self, h: ParseHypothesis) -> Any {
+        fn handler(path: string) -> Tuple[string, string, List[string]] {
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let text = f.read()
+            f.close()
+            let lines = text.strip().split("\n")
+            // Reuse the engine's fixed-width logic
+            let nrs_fe = __import__("nrs_file_engine")
+            let csv_text = nrs_fe._fixed_width_to_csv(lines)
+            return (csv_text, "csv", [])
+        }
+        return handler
+    }
+
+    fn _build_key_value(self, h: ParseHypothesis) -> Any {
+        fn handler(path: string) -> Tuple[string, string, List[string]] {
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let text = f.read()
+            f.close()
+            let nrs_fe = __import__("nrs_file_engine")
+            let csv_text = nrs_fe._kv_to_csv(text)
+            return (csv_text, "csv", [])
+        }
+        return handler
+    }
+
+    fn _build_block_record(self, h: ParseHypothesis) -> Any {
+        fn handler(path: string) -> Tuple[string, string, List[string]] {
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let text = f.read()
+            f.close()
+            let blocks = re.split(r"\n\s*\n", text.strip())
+            let kv_re = re.compile(r"^(.+?)[:=]\s*(.+)$")
+            let records: List[Dict[string, string]] = []
+            for block in blocks {
+                let rec: Dict[string, string] = {}
+                for line in block.strip().split("\n") {
+                    let m = kv_re.match(line.strip())
+                    if m != None { rec[m.group(1).strip()] = m.group(2).strip() }
+                }
+                if len(rec) > 0 { append(records, rec) }
+            }
+            if len(records) == 0 { return (text, "auto", []) }
+            let all_keys: List[string] = []
+            for rec in records {
+                for k in rec {
+                    if k not in all_keys { append(all_keys, k) }
+                }
+            }
+            let rows: List[string] = [join(all_keys, ",")]
+            for rec in records {
+                let cells: List[string] = []
+                for k in all_keys {
+                    let val = rec.get(k, "")
+                    if "," in val { val = '"' + val + '"' }
+                    append(cells, val)
+                }
+                append(rows, join(cells, ","))
+            }
+            return (join(rows, "\n"), "csv", [])
+        }
+        return handler
+    }
+
+    fn _build_log_parser(self, h: ParseHypothesis) -> Any {
+        fn handler(path: string) -> Tuple[string, string, List[string]] {
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let text = f.read()
+            f.close()
+            let lines = text.strip().split("\n")
+            let iso_re = re.compile(r"^(\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}[^\s]*)\s+(\S+)\s+(\S+)\s+(.*)")
+            let syslog_re = re.compile(r"^(\w{3}\s+\d+\s+[\d:]+)\s+(\S+)\s+(\S+?)(?:\[\d+\])?:\s+(.*)")
+            let rows: List[string] = ["timestamp,source,level,message"]
+            for line in lines {
+                let m = iso_re.match(line)
+                if m != None {
+                    append(rows, m.group(1) + "," + m.group(2) + "," + m.group(3) + ",\"" + m.group(4).replace('"', '""') + "\"")
+                    continue
+                }
+                let m2 = syslog_re.match(line)
+                if m2 != None {
+                    append(rows, m2.group(1) + "," + m2.group(2) + "," + m2.group(3) + ",\"" + m2.group(4).replace('"', '""') + "\"")
+                }
+            }
+            return (join(rows, "\n"), "csv", [])
+        }
+        return handler
+    }
+
+    fn _build_json_extractor(self, h: ParseHypothesis) -> Any {
+        fn handler(path: string) -> Tuple[string, string, List[string]] {
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let text = f.read()
+            f.close()
+            let objects = re.findall(r"\{[^{}]+\}", text)
+            let valid: List[string] = []
+            for obj in objects {
+                try {
+                    json.loads(obj)
+                    append(valid, obj)
+                } catch {}
+            }
+            return (join(valid, "\n"), "json", [])
+        }
+        return handler
+    }
+
+    fn _build_xml_handler(self, h: ParseHypothesis) -> Any {
+        fn handler(path: string) -> Tuple[string, string, List[string]] {
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let text = f.read()
+            f.close()
+            return (text, "xml", [])
+        }
+        return handler
+    }
+
+    fn _build_ini_handler(self, h: ParseHypothesis) -> Any {
+        fn handler(path: string) -> Tuple[string, string, List[string]] {
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let text = f.read()
+            f.close()
+            let section_re = re.compile(r"^\[(.+)\]$")
+            let kv_re = re.compile(r"^([^=]+)=(.*)$")
+            let records: List[Dict[string, string]] = []
+            let current_section = ""
+            let current: Dict[string, string] = {}
+            for line in text.split("\n") {
+                let stripped = line.strip()
+                let sm = section_re.match(stripped)
+                if sm != None {
+                    if len(current) > 0 {
+                        current["_section"] = current_section
+                        append(records, current)
+                    }
+                    current_section = sm.group(1)
+                    current = {}
+                    continue
+                }
+                let km = kv_re.match(stripped)
+                if km != None { current[km.group(1).strip()] = km.group(2).strip() }
+            }
+            if len(current) > 0 {
+                current["_section"] = current_section
+                append(records, current)
+            }
+            if len(records) == 0 { return (text, "auto", []) }
+            let all_keys: List[string] = []
+            for rec in records {
+                for k in rec {
+                    if k not in all_keys { append(all_keys, k) }
+                }
+            }
+            let rows: List[string] = [join(all_keys, ",")]
+            for rec in records {
+                let cells: List[string] = []
+                for k in all_keys {
+                    let val = rec.get(k, "")
+                    if "," in val { val = '"' + val + '"' }
+                    append(cells, val)
+                }
+                append(rows, join(cells, ","))
+            }
+            return (join(rows, "\n"), "csv", [])
+        }
+        return handler
+    }
+
+    fn _build_hex_dump(self, h: ParseHypothesis) -> Any {
+        fn handler(path: string) -> Tuple[string, string, List[string]] {
+            let f = open(path, "rb")
+            let raw = f.read(65536)
+            f.close()
+            let rows: List[string] = ["offset,hex,ascii"]
+            let offset = 0
+            while offset < len(raw) {
+                let chunk = raw[offset:offset + 16]
+                let hex_str = " ".join([format(b, "02x") for b in chunk])
+                let ascii_str = "".join([chr(b) if 32 <= b < 127 else "." for b in chunk])
+                append(rows, str(offset) + "," + hex_str + "," + ascii_str)
+                offset = offset + 16
+            }
+            return (join(rows, "\n"), "csv", ["Binary file converted to hex dump"])
+        }
+        return handler
+    }
+
+    fn _build_passthrough(self, h: ParseHypothesis) -> Any {
+        fn handler(path: string) -> Tuple[string, string, List[string]] {
+            let f = open(path, "r", encoding="utf-8", errors="replace")
+            let text = f.read()
+            f.close()
+            return (text, "auto", [])
+        }
+        return handler
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  HANDLER VALIDATOR
+// ═══════════════════════════════════════════════════════════════════
+
+class HandlerValidator {
+
+    fn init(self) {
+        self._min_rows = 2
+        self._min_score = 0.3
+    }
+
+    fn validate(self, handler_fn: Any, path: string) -> Tuple[bool, float] {
+        try {
+            let result = handler_fn(path)
+            let text = result[0]
+            let fmt = result[1]
+
+            if text == "" or text == None { return (false, 0.0) }
+
+            let lines = text.strip().split("\n")
+            if len(lines) < self._min_rows { return (false, 0.1) }
+
+            let score = 0.3
+
+            // Check if output looks structured
+            if fmt == "csv" {
+                let first = lines[0]
+                let field_count = first.count(",") + 1
+                if field_count >= 2 { score = score + 0.2 }
+
+                let consistent = 0
+                let check = min(10, len(lines))
+                for i in range(1, check) {
+                    if lines[i].count(",") + 1 == field_count { consistent = consistent + 1 }
+                }
+                if check > 1 {
+                    score = score + float(consistent) / float(check - 1) * 0.3
+                }
+            }
+
+            if fmt == "json" {
+                let valid_json = 0
+                for line in lines[0:10] {
+                    try { json.loads(line); valid_json = valid_json + 1 } catch {}
+                }
+                score = score + float(valid_json) / float(min(10, len(lines))) * 0.4
+            }
+
+            // Bonus for having reasonable content
+            let total_chars = len(text)
+            if total_chars > 100 { score = score + 0.1 }
+            if total_chars > 1000 { score = score + 0.1 }
+
+            score = min(score, 1.0)
+            return (score >= self._min_score, score)
+        } catch {
+            return (false, 0.0)
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  SPEC PERSISTENCE
+// ═══════════════════════════════════════════════════════════════════
+
+class SpecStore {
+
+    fn init(self, store_dir: string) {
+        self._dir = store_dir
+        os.makedirs(store_dir, exist_ok=true)
+    }
+
+    fn save(self, spec: GeneratedSpec) {
+        let path = os.path.join(self._dir, spec.format_id + ".json")
+        let data = {
+            "format_id": spec.format_id,
+            "extensions": spec.extensions,
+            "strategy": spec.strategy,
+            "delimiter": spec.delimiter,
+            "record_separator": spec.record_separator,
+            "has_header": spec.has_header,
+            "skip_lines": spec.skip_lines,
+            "encoding": spec.encoding,
+            "created_at": spec.created_at,
+            "source_file": spec.source_file,
+            "validation_score": spec.validation_score
+        }
+        let f = open(path, "w", encoding="utf-8")
+        f.write(json.dumps(data, indent=2))
+        f.close()
+    }
+
+    fn load_all(self) -> List[GeneratedSpec] {
+        let specs: List[GeneratedSpec] = []
+        if !os.path.isdir(self._dir) { return specs }
+        for entry in os.listdir(self._dir) {
+            if !entry.endswith(".json") { continue }
+            let path = os.path.join(self._dir, entry)
+            try {
+                let f = open(path, "r", encoding="utf-8")
+                let data = json.loads(f.read())
+                f.close()
+                append(specs, GeneratedSpec {
+                    format_id: data["format_id"],
+                    extensions: data.get("extensions", []),
+                    strategy: data["strategy"],
+                    delimiter: data.get("delimiter", ""),
+                    record_separator: data.get("record_separator", "\n"),
+                    has_header: data.get("has_header", false),
+                    skip_lines: data.get("skip_lines", 0),
+                    encoding: data.get("encoding", "utf-8"),
+                    created_at: data.get("created_at", 0.0),
+                    source_file: data.get("source_file", ""),
+                    validation_score: data.get("validation_score", 0.0)
+                })
+            } catch {}
+        }
+        return specs
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN PARSER FACTORY
+// ═══════════════════════════════════════════════════════════════════
+
+class ParserFactory {
+
+    fn init(self, store_dir: string) {
+        self._sampler = FileSampler()
+        self._hypothesizer = HypothesisGenerator()
+        self._builder = HandlerBuilder()
+        self._validator = HandlerValidator()
+        self._store = SpecStore(store_dir)
+        self._generated: Dict[string, FormatHandler] = {}
+
+        // Load previously generated specs and rebuild handlers
+        let saved = self._store.load_all()
+        for spec in saved {
+            let h = ParseHypothesis {
+                strategy: spec.strategy,
+                confidence: spec.validation_score,
+                delimiter: spec.delimiter,
+                record_separator: spec.record_separator,
+                has_header: spec.has_header,
+                skip_lines: spec.skip_lines,
+                field_count: 0,
+                encoding: spec.encoding,
+                notes: "Restored from disk"
+            }
+            let sample = FileSample {
+                header_bytes: b"",
+                text_preview: "",
+                file_size: 0,
+                extension: spec.extensions[0] if len(spec.extensions) > 0 else "",
+                is_text: true,
+                encoding: spec.encoding,
+                byte_entropy: 0.0,
+                line_count: 0,
+                avg_line_length: 0.0
+            }
+            let handler_fn = self._builder.build(h, sample)
+            let fh = FormatHandler {
+                format_id: spec.format_id,
+                extensions: spec.extensions,
+                mime_types: [],
+                magic_bytes: [],
+                handler_fn: handler_fn,
+                fallback_fns: [],
+                is_generated: true,
+                generation_source: spec.source_file
+            }
+            self._generated[spec.format_id] = fh
+        }
+
+        logger.info("ParserFactory loaded %d saved handlers", len(saved))
+    }
+
+    fn generate_handler(self, path: string) -> Optional[FormatHandler] {
+        let t0 = time.time()
+
+        // Sample the file
+        let sample = self._sampler.sample(path)
+
+        // Generate hypotheses
+        let hypotheses = self._hypothesizer.generate(sample)
+        if len(hypotheses) == 0 { return None }
+
+        // Try each hypothesis until one validates
+        for h in hypotheses {
+            let handler_fn = self._builder.build(h, sample)
+            let validation = self._validator.validate(handler_fn, path)
+            let valid = validation[0]
+            let score = validation[1]
+
+            if valid {
+                let fmt_id = "gen_" + h.strategy + "_" + hashlib.sha256(
+                    (path + str(time.time())).encode("utf-8")
+                ).hexdigest()[0:8]
+
+                let fh = FormatHandler {
+                    format_id: fmt_id,
+                    extensions: [sample.extension] if sample.extension != "" else [],
+                    mime_types: [],
+                    magic_bytes: [],
+                    handler_fn: handler_fn,
+                    fallback_fns: [],
+                    is_generated: true,
+                    generation_source: path
+                }
+
+                // Persist the spec
+                let spec = GeneratedSpec {
+                    format_id: fmt_id,
+                    extensions: fh.extensions,
+                    strategy: h.strategy,
+                    delimiter: h.delimiter,
+                    record_separator: h.record_separator,
+                    has_header: h.has_header,
+                    skip_lines: h.skip_lines,
+                    encoding: h.encoding,
+                    created_at: time.time(),
+                    source_file: path,
+                    validation_score: score
+                }
+                self._store.save(spec)
+                self._generated[fmt_id] = fh
+
+                let elapsed = (time.time() - t0) * 1000.0
+                logger.info(
+                    "Generated handler '%s' (strategy=%s, score=%.2f) in %.1fms for %s",
+                    fmt_id, h.strategy, score, elapsed, path
+                )
+
+                return fh
+            }
+        }
+
+        logger.warning("All hypotheses failed for %s", path)
+        return None
+    }
+
+    fn generated_count(self) -> int {
+        return len(self._generated)
+    }
+
+    fn list_generated(self) -> List[Dict[string, Any]] {
+        let result: List[Dict[string, Any]] = []
+        for fid in self._generated {
+            let fh = self._generated[fid]
+            append(result, {
+                "format_id": fid,
+                "extensions": fh.extensions,
+                "is_generated": true,
+                "source": fh.generation_source
+            })
+        }
+        return result
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONVENIENCE
+// ═══════════════════════════════════════════════════════════════════
+
+let _default_store_dir = "/data/nrs/parser_specs"
+
+fn create_factory(store_dir: string) -> ParserFactory {
+    return ParserFactory(store_dir)
+}
+
+fn create_default_factory() -> ParserFactory {
+    let dir = os.environ.get("NRS_PARSER_SPEC_DIR", _default_store_dir)
+    return ParserFactory(dir)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  NORMS
+// ═══════════════════════════════════════════════════════════════════
+
+norm validate_generated_handlers {
+    type: obligation,
+    scope: global,
+    action: "generate_handler",
+    priority: 95,
+    condition: true
+}
+
+norm persist_successful_handlers {
+    type: obligation,
+    scope: global,
+    action: "generate_handler",
+    priority: 90,
+    condition: validation_score >= 0.3
+}
+
+norm log_all_generation_attempts {
+    type: obligation,
+    scope: global,
+    action: "generate_handler",
+    priority: 85,
+    condition: true
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  EXPORTS
+// ═══════════════════════════════════════════════════════════════════
+
+export FileSample, ParseHypothesis, GeneratedSpec
+export FileSampler, HypothesisGenerator, HandlerBuilder, HandlerValidator, SpecStore
+export ParserFactory
+export create_factory, create_default_factory

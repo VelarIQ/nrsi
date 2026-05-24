@@ -1,0 +1,279 @@
+/// PRISM Gate — Probabilistic Risk-Informed Safety Monitor for VLT writes.
+///
+/// Every write to VLT must pass through PRISM, which evaluates:
+///   1. Confidence threshold per layer (L1=0.3, L2=0.5, L3=0.8, L4=0.95)
+///   2. Source trust verification
+///   3. Domain consistency check
+///   4. Content hash deduplication
+///   5. Rate limiting per source
+///
+/// Patent-covered: PRISM gate, VLT write validation.
+/// Ported from nrsip/prism_gate.py.
+
+module prism_gate
+
+
+import time from "std/time"
+import hashlib from "std/hashlib"
+/// ── Layer Thresholds ──
+
+let L1_EPHEMERAL = 0.3
+let L2_SESSION = 0.5
+let L3_PERSISTENT = 0.8
+let L4_ARCHIVAL = 0.95
+
+let LAYER_THRESHOLDS = {
+    "L1": L1_EPHEMERAL,
+    "L2": L2_SESSION,
+    "L3": L3_PERSISTENT,
+    "L4": L4_ARCHIVAL
+}
+
+/// ── Verdict ──
+
+type PRISMVerdict {
+    passed: bool,
+    layer: string,
+    confidence: float,
+    source: string,
+    reason: string,
+    timestamp_ns: int,
+    checks_passed: int,
+    checks_total: int
+}
+
+fn verdict_to_dict(v: PRISMVerdict) -> any {
+    return {
+        "passed": v.passed,
+        "layer": v.layer,
+        "confidence": v.confidence,
+        "source": v.source,
+        "reason": v.reason,
+        "timestamp_ns": v.timestamp_ns,
+        "checks_passed": v.checks_passed,
+        "checks_total": v.checks_total
+    }
+}
+
+/// ── Config ──
+
+type PRISMConfig {
+    layer_thresholds: Map[string, float],
+    rate_limit_per_minute: int,
+    dedup_window_seconds: int,
+    trusted_sources: Set[string],
+    valid_domains: Set[string]
+}
+
+fn default_prism_config() -> PRISMConfig {
+    return PRISMConfig {
+        layer_thresholds: {
+            "L1": L1_EPHEMERAL, "L2": L2_SESSION,
+            "L3": L3_PERSISTENT, "L4": L4_ARCHIVAL
+        },
+        rate_limit_per_minute: 60,
+        dedup_window_seconds: 300,
+        trusted_sources: set(),
+        valid_domains: set()
+    }
+}
+
+/// ── PRISM Gate ──
+
+class PRISMGate {
+    fn init(self, config: Optional[PRISMConfig]) {
+        if config != nil {
+            self._config = config
+        } else {
+            self._config = default_prism_config()
+        }
+        self._content_hashes = {}
+        self._rate_counter = {}
+        self._total_evaluated = 0
+        self._total_passed = 0
+        self._total_blocked = 0
+    }
+
+    fn evaluate(self, value: any, layer: string, confidence: float,
+                domain: string, source: string) -> PRISMVerdict {
+        self._total_evaluated += 1
+        let now_ns = time_ns()
+        let now = time.time()
+        let checks_total = 5
+        let checks_passed = 0
+
+        /// Check 1: confidence threshold
+        let check1 = self._check_confidence_threshold(layer, confidence)
+        if !check1["ok"] {
+            self._total_blocked += 1
+            return self._make_verdict(false, layer, confidence, source,
+                check1["reason"], now_ns, checks_passed, checks_total)
+        }
+        checks_passed += 1
+
+        /// Check 2: source trust
+        let check2 = self._check_source_trust(source)
+        if !check2["ok"] {
+            self._total_blocked += 1
+            return self._make_verdict(false, layer, confidence, source,
+                check2["reason"], now_ns, checks_passed, checks_total)
+        }
+        checks_passed += 1
+
+        /// Check 3: domain consistency
+        let check3 = self._check_domain_consistency(domain)
+        if !check3["ok"] {
+            self._total_blocked += 1
+            return self._make_verdict(false, layer, confidence, source,
+                check3["reason"], now_ns, checks_passed, checks_total)
+        }
+        checks_passed += 1
+
+        /// Check 4: dedup
+        let content_hash = hashlib.sha256(to_string(value)).hexdigest()
+        let check4 = self._check_dedup(content_hash, now)
+        if !check4["ok"] {
+            self._total_blocked += 1
+            return self._make_verdict(false, layer, confidence, source,
+                check4["reason"], now_ns, checks_passed, checks_total)
+        }
+        checks_passed += 1
+
+        /// Check 5: rate limit
+        let check5 = self._check_rate_limit(source, now)
+        if !check5["ok"] {
+            self._total_blocked += 1
+            return self._make_verdict(false, layer, confidence, source,
+                check5["reason"], now_ns, checks_passed, checks_total)
+        }
+        checks_passed += 1
+
+        /// All checks passed — commit side-effects
+        self._content_hashes[content_hash] = now
+        if self._rate_counter.get(source, nil) == nil {
+            self._rate_counter[source] = []
+        }
+        self._rate_counter[source].append(now)
+
+        self._total_passed += 1
+        return self._make_verdict(true, layer, confidence, source,
+            "all checks passed", now_ns, checks_passed, checks_total)
+    }
+
+    fn stats(self) -> any {
+        let total = self._total_evaluated
+        let pass_rate = 0.0
+        if total > 0 {
+            pass_rate = to_float(self._total_passed) / to_float(total)
+        }
+        return {
+            "total_evaluated": total,
+            "passed": self._total_passed,
+            "blocked": self._total_blocked,
+            "pass_rate": pass_rate
+        }
+    }
+
+    /// ── Internal Checks ──
+
+    fn _check_confidence_threshold(self, layer: string,
+                                   confidence: float) -> any {
+        let threshold = self._config.layer_thresholds.get(layer, nil)
+        if threshold == nil {
+            return { "ok": false, "reason": "unknown layer: " + layer }
+        }
+        if confidence < threshold {
+            return {
+                "ok": false,
+                "reason": "confidence " + to_string(confidence) +
+                    " below " + layer + " threshold " + to_string(threshold)
+            }
+        }
+        return { "ok": true, "reason": "" }
+    }
+
+    fn _check_source_trust(self, source: string) -> any {
+        if self._config.trusted_sources.len() == 0 {
+            return { "ok": true, "reason": "" }
+        }
+        if !self._config.trusted_sources.contains(source) {
+            return {
+                "ok": false, "reason": "untrusted source: " + source
+            }
+        }
+        return { "ok": true, "reason": "" }
+    }
+
+    fn _check_domain_consistency(self, domain: string) -> any {
+        if domain.strip().len() == 0 {
+            return { "ok": false, "reason": "empty domain" }
+        }
+        if self._config.valid_domains.len() == 0 {
+            return { "ok": true, "reason": "" }
+        }
+        if !self._config.valid_domains.contains(domain) {
+            return {
+                "ok": false, "reason": "invalid domain: " + domain
+            }
+        }
+        return { "ok": true, "reason": "" }
+    }
+
+    fn _check_dedup(self, content_hash: string, now: float) -> any {
+        let cutoff = now - to_float(self._config.dedup_window_seconds)
+        let expired = []
+        for h in self._content_hashes.keys() {
+            if self._content_hashes[h] < cutoff {
+                expired.append(h)
+            }
+        }
+        for h in expired {
+            self._content_hashes.remove(h)
+        }
+        if self._content_hashes.get(content_hash, nil) != nil {
+            return {
+                "ok": false, "reason": "duplicate content within dedup window"
+            }
+        }
+        return { "ok": true, "reason": "" }
+    }
+
+    fn _check_rate_limit(self, source: string, now: float) -> any {
+        let cutoff = now - 60.0
+        if self._rate_counter.get(source, nil) == nil {
+            self._rate_counter[source] = []
+        }
+        let filtered = []
+        for ts in self._rate_counter[source] {
+            if ts > cutoff { filtered.append(ts) }
+        }
+        self._rate_counter[source] = filtered
+        if filtered.len() >= self._config.rate_limit_per_minute {
+            return {
+                "ok": false,
+                "reason": "rate limit exceeded for source: " + source
+            }
+        }
+        return { "ok": true, "reason": "" }
+    }
+
+    fn _make_verdict(self, passed: bool, layer: string, confidence: float,
+                     source: string, reason: string, timestamp_ns: int,
+                     checks_passed: int, checks_total: int) -> PRISMVerdict {
+        return PRISMVerdict {
+            passed: passed,
+            layer: layer,
+            confidence: confidence,
+            source: source,
+            reason: reason,
+            timestamp_ns: timestamp_ns,
+            checks_passed: checks_passed,
+            checks_total: checks_total
+        }
+    }
+}
+
+export L1_EPHEMERAL, L2_SESSION, L3_PERSISTENT, L4_ARCHIVAL, LAYER_THRESHOLDS
+export PRISMVerdict, verdict_to_dict
+export PRISMConfig, default_prism_config
+export PRISMGate

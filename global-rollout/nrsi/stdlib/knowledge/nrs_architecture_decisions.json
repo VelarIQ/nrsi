@@ -1,0 +1,451 @@
+{
+  "domain": "nrs_architecture",
+  "version": "2026.1",
+  "source": "development_session",
+  "source_tier": "t2_verified",
+  "facts": [
+    {
+      "id": "arch-knowledge-pipeline",
+      "text": "NRS uses a 5-level knowledge resolution hierarchy: L0 seeded knowledge (axioms, belief bases, domain creases at 0.95-1.0 confidence), L1 local reasoning (causal graph, logic engine at 0.80-0.95), L2 cached knowledge (previously retrieved and validated at 0.70-0.90), L3 gated web retrieval (hard-capped at 0.75, requires cross-referencing), L4 abstention (explicit I don't know with structured gap description). The system never silently falls through.",
+      "confidence": 0.95,
+      "tags": [
+        "knowledge-pipeline",
+        "hallucination-prevention",
+        "abstention",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-vlt-seeding",
+      "text": "The VLT (Validated Ledger of Truth) can be seeded through 5 methods: bulk JSON packs from disk, single fact API, webhook push from external systems, polling feeds that pull from APIs on a schedule, and file directory loading at startup. Every fact goes through an IngestionGate that caps confidence by source tier and rejects duplicates.",
+      "confidence": 0.95,
+      "tags": [
+        "vlt",
+        "seeding",
+        "live-data",
+        "ingestion"
+      ]
+    },
+    {
+      "id": "arch-source-tiers",
+      "text": "NRS uses 5 source tiers for knowledge confidence: T1 axiomatic (0.95-1.0, mathematical proofs, definitions), T2 verified (0.80-0.95, peer-reviewed, official data), T3 curated (0.65-0.85, expert consensus, reference works), T4 observed (0.40-0.70, single observations, news), T5 unverified (0.15-0.50, social media, user input). Confidence is always capped by tier regardless of raw score.",
+      "confidence": 0.95,
+      "tags": [
+        "source-tiers",
+        "confidence",
+        "calibration"
+      ]
+    },
+    {
+      "id": "arch-abstention-vs-hallucination",
+      "text": "Unlike LLMs that always return an answer (hallucinating when uncertain), NRS explicitly abstains when no knowledge level produces confidence above the threshold (default 0.40). Abstention returns a structured response with: which levels were checked, why it abstained, the gap description, and instructions for how to seed the missing knowledge via the /v1/vlt/seed API.",
+      "confidence": 0.95,
+      "tags": [
+        "abstention",
+        "hallucination",
+        "honest-uncertainty"
+      ]
+    },
+    {
+      "id": "arch-web-confidence-cap",
+      "text": "Web-retrieved knowledge in NRS is hard-capped at 0.75 confidence regardless of how authoritative the source appears. This prevents the system from treating web knowledge as ground truth. Source credibility scoring assigns: .gov/.mil 0.85, .edu 0.80, reference sites 0.75, established media 0.60, .org 0.65, commercial 0.40, social media 0.25, unknown 0.20.",
+      "confidence": 0.93,
+      "tags": [
+        "web-retrieval",
+        "confidence-cap",
+        "credibility"
+      ]
+    },
+    {
+      "id": "arch-norm-enforcement",
+      "text": "NRSI norm conditions are transpiled into Python lambda functions that evaluate the authored predicate at runtime. Previously, the transpiler emitted lambda ctx: True for all norms (silently disabling enforcement). The fix ensures the actual condition expression from the NRSI source is compiled into the lambda. Gate require clauses beyond confidence thresholds are now emitted as runtime assertions.",
+      "confidence": 0.95,
+      "tags": [
+        "norms",
+        "transpiler",
+        "enforcement",
+        "bug-fix"
+      ]
+    },
+    {
+      "id": "arch-fail-closed-validators",
+      "text": "Unknown validator names in NRS validation gates now fail closed with (False, 0.3) instead of silently passing with (True, 0.7). This prevents unimplemented gates from appearing to validate data they never checked. The no_hallucination validator requires actual evidence chains and rejects generated/llm_output knowledge levels.",
+      "confidence": 0.95,
+      "tags": [
+        "validation",
+        "fail-closed",
+        "security"
+      ]
+    },
+    {
+      "id": "arch-crease-search-relevance",
+      "text": "Domain crease search uses keyword-overlap relevance scoring: query is tokenized, each crease entry's searchable text (value, content, description, tags) is checked for token overlap. Score = (content_match * 0.7 + key_match * 0.3) * layer_boost. Layer boosts: CORE_FACTS 1.0, INFERENCE_PATTERNS 0.9, VALIDATION_CRITERIA 0.85, TERMINOLOGY 0.8. Results sorted by relevance, filtered by min_relevance threshold.",
+      "confidence": 0.9,
+      "tags": [
+        "creases",
+        "search",
+        "relevance-scoring",
+        "knowledge-retrieval"
+      ]
+    },
+    {
+      "id": "arch-verify-claim-fail-closed",
+      "text": "mode_control.py _verify_claim now fails closed on VLT search exceptions: returns (False, 0.3, 'vlt_search_error') instead of (True, 0.5, ''). This prevents unverified claims from being treated as verified when the VLT is unavailable or errors occur.",
+      "confidence": 0.95,
+      "tags": [
+        "verification",
+        "fail-closed",
+        "mode-control",
+        "safety"
+      ]
+    },
+    {
+      "id": "arch-continuous-learning-protocol",
+      "text": "NRS continuous learning operates at two levels: (1) Runtime: LearningEngine extracts claims from interactions, gates them through KnowledgeValidator, stores accepted claims in VLT L3 with optional Redis persistence, and indexes by domain+lobe affinity. SelfImprovementLoop runs hypothesis-driven parameter tuning every 50 interactions. (2) IDE: agents-memory-updater captures development learnings into JSON knowledge packs, Cursor rules, and AGENTS.md. Both levels feed the same knowledge hierarchy.",
+      "confidence": 0.9,
+      "tags": [
+        "continuous-learning",
+        "knowledge-capture",
+        "self-improvement",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-exception-observability",
+      "text": "All exception handlers in cognitive pipeline paths (agi_integration, mode_control, reasoning_bridge) must log at minimum logger.warning with the exception details. Silent except:pass is prohibited in post-processing, learning, mode tuning, and verification paths. Redis/cache fallback paths may use logger.debug. This ensures auditability of degraded-mode operation.",
+      "confidence": 0.93,
+      "tags": [
+        "exception-handling",
+        "observability",
+        "auditability",
+        "policy"
+      ]
+    },
+    {
+      "id": "arch-local-compose-edge-smoke-surface",
+      "text": "Local docker-compose smoke checks for the public API surface should target the edge listener on port 8080, not the identity service on 8097. After platform-api and edge-gateway hardening, /v1/models returned 200 and /v1/chat/completions returned 401 on the correct edge endpoint, which is the expected unauthenticated behavior for chat completions.",
+      "confidence": 0.92,
+      "tags": [
+        "compose",
+        "edge-gateway",
+        "smoke-test",
+        "local-dev",
+        "deployment"
+      ]
+    },
+    {
+      "id": "arch-chat-web-next-dockerfile-standalone-mismatch",
+      "text": "Residual packaging risk: apps/chat_web_next/Dockerfile expects a Next.js standalone output at .next/standalone, but a Next 16 build in this repo did not emit that directory during docker build, so rebuilding the local chat-web-next image can remain blocked until build output and Dockerfile COPY paths are aligned.",
+      "confidence": 0.88,
+      "tags": [
+        "nextjs",
+        "docker",
+        "packaging",
+        "chat-web",
+        "deployment",
+        "risk"
+      ]
+    },
+    {
+      "id": "arch-compose-healthchecks-stdlib-not-curl",
+      "text": "Docker Compose healthchecks for Python services on slim images must not assume curl or wget exists. Prefer Python standard-library probes (for example urllib.request or http.client against the service port, or socket connect) in the container command. The vlt-qdrant image also lacks curl, so curl-based healthchecks fail there as well unless the image is extended.",
+      "confidence": 0.95,
+      "tags": [
+        "docker",
+        "compose",
+        "healthcheck",
+        "python",
+        "slim-image",
+        "qdrant",
+        "deployment"
+      ]
+    },
+    {
+      "id": "arch-local-chat-web-host-port-api-base-split",
+      "text": "Local compose can bind chat-web-next to a host port that conflicts with other stacks (for example 3000). Remapping the published port (for example host 3001 to container 3000) restores reachability. Browser code must resolve a public/base API URL suitable for the host browser, while server-side or internal calls may need a different base (docker service name and internal port); splitting browser versus internal API base resolution avoids subtle localhost misrouting.",
+      "confidence": 0.94,
+      "tags": [
+        "compose",
+        "nextjs",
+        "chat-web",
+        "ports",
+        "runtime-config",
+        "local-dev",
+        "deployment"
+      ]
+    },
+    {
+      "id": "arch-platform-api-oauth-proxy-unified-browser-origin",
+      "text": "When the web client uses platform-api as its browser-facing auth/API origin, OAuth start and callback routes must either live on platform-api or be proxied there. In local compose this means platform-api should forward /v1/auth/oauth/* to edge-gateway so password auth and SSO share a single browser-visible base URL and do not drift by port or service role.",
+      "confidence": 0.93,
+      "tags": [
+        "oauth",
+        "platform-api",
+        "edge-gateway",
+        "proxy",
+        "auth",
+        "browser-origin",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-constructs-platform-api-worker-proxy",
+      "text": "The Next.js constructs UI should call platform-api authenticated routes under /constructs (list/create/delete and impulses) which proxy to nrs-worker /v1/constructs using NRS_INTERNAL_KEY and user_id from the JWT subject, so browser clients never hold worker credentials. Super_admin tier is forced to enterprise in quota_enforcement and /usage/me when JWT role is super_admin so UI badges match unlimited policy. PoVI admin routes must treat super_admin like admin for validator registration.",
+      "confidence": 0.91,
+      "tags": [
+        "constructs",
+        "platform-api",
+        "nrs-worker",
+        "proxy",
+        "entitlements",
+        "povi",
+        "web"
+      ]
+    },
+    {
+      "id": "arch-chat-auto-mode-catalog",
+      "text": "The chat web client must always expose ``auto`` as the default inference mode: it sends mode=auto on /chat/completions so platform-api runs mode_router.select_mode per prompt. The mode picker hydrates options from GET /chat/modes with a static fallback that prepends auto if missing, and surfaces nrs_meta.modeDecision (selected + signals) under the header when Auto is selected so users see which concrete mode ran.",
+      "confidence": 0.92,
+      "tags": [
+        "chat-web",
+        "auto-mode",
+        "mode-router",
+        "platform-api",
+        "ux"
+      ]
+    },
+    {
+      "id": "arch-live-code-routing-metadata-contract",
+      "text": "Live-data and Code mode routing must emit explicit metadata into the chat response contract so Query Details can show what actually happened: selected route/mode, live provider or source-required status, code execution details, and confidence/source notes. The UI should consume that metadata rather than infer details from answer text or render fabricated live-lookup telemetry.",
+      "confidence": 0.94,
+      "tags": [
+        "chat-web",
+        "platform-api",
+        "query-details",
+        "realtime-data",
+        "code-mode",
+        "safety-routing",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-chat-web-regional-cors-query-details-sheet",
+      "text": "Production chat-web-next Cloud Run origins must be mirrored in platform-api CORS_ORIGINS across code defaults, Kubernetes manifests, and live Cloud Run service env when deploying regional browser frontends. The Tokyo chat-web-next origin https://chat-web-next-k3vle3ctna-an.a.run.app required an explicit platform-api allowlist update. Query Details works better as a responsive bottom sheet/slide-up panel than a persistent right rail, with settings tabs adapting for narrow viewports.",
+      "confidence": 0.94,
+      "tags": [
+        "chat-web",
+        "platform-api",
+        "cloud-run",
+        "cors",
+        "deployment",
+        "query-details",
+        "responsive-ux",
+        "frontend"
+      ]
+    },
+    {
+      "id": "arch-prism-validation-metadata-contract",
+      "text": "Prism validation display in chat Query Details is a backend metadata contract, not a frontend inference layer. platform-api should emit explicit prismValidation metadata for deterministic/reflex responses, including validation status, hallucination risk, drift risk, and validation label/source; chat-web-next should render those values only when present in backend metadata. Production browser validation should include a deterministic natural math prompt and confirm the answer plus 'Prism validated', 'Prism hallucination/drift validation', 'Hallucination Risk 0.000%', and 'Drift Risk 0.000%' from the deployed backend/frontend pair.",
+      "confidence": 0.95,
+      "tags": [
+        "chat-web",
+        "platform-api",
+        "query-details",
+        "prism-validation",
+        "metadata-contract",
+        "hallucination-prevention",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-dark-only-product-surface",
+      "text": "NRS production UI is dark-only across web and native clients. chat-web-next should keep ThemeProvider forced to dark and the Settings > Appearance surface must not expose Light or System theme choices. Android should use the Atherion dark Material color scheme directly and avoid user-facing theme toggles. iOS/macOS SwiftUI views should force .preferredColorScheme(.dark) and omit Dark Mode switches so stale stored preferences cannot re-enable light UI.",
+      "confidence": 0.94,
+      "tags": [
+        "chat-web",
+        "android",
+        "ios",
+        "appearance",
+        "dark-mode",
+        "ux-policy",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-platform-api-admin-account-control",
+      "text": "platform-api is the canonical enforcement point for admin account control: admin user APIs expose role, plan, name, status, and active suspension metadata; suspended and banned states map to account_suspension records; reactivation lifts active suspensions; auth login, /auth/me, and chat all enforce user status plus active suspension checks. The web admin UI should call this contract with role/plan dropdowns, manual suspension levels, reactivate, and super_admin-only password reset using the existing reset-token email flow.",
+      "confidence": 0.95,
+      "tags": [
+        "platform-api",
+        "chat-web",
+        "admin",
+        "rbac",
+        "account-control",
+        "suspension",
+        "auth",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-mobile-release-store-hardening",
+      "text": "Mobile store release hardening now includes app-level iOS PrivacyInfo.xcprivacy for UserDefaults required-reason API access in the PrismNRS target, with Release build/archive/export verified. Android deploy-google-play.sh should load nrs-android-upload-keystore-password from GCP Secret Manager when NRS_KEYSTORE_PASSWORD is unset and default NRS_KEY_PASSWORD to the same value; AAB build and validation can complete locally through the deploy script, while automated Play upload requires GPLAY_SERVICE_ACCOUNT_KEY. Google Play open testing release readiness requires app-content declarations, imported Data Safety CSV, contact details, store listing descriptions/screenshots, target countries, and an AAB with a bumped versionCode/versionName before sending changes for review.",
+      "confidence": 0.95,
+      "tags": [
+        "ios",
+        "android",
+        "privacy-manifest",
+        "google-play",
+        "testflight",
+        "signing",
+        "secret-manager",
+        "release",
+        "deployment",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-prod-dev-site-consolidation",
+      "text": "NRS customer-facing Cloud Run deployment is canonicalized to production web https://atheriongroup.com, production API https://api.atheriongroup.com, development web https://dev.atheriongroup.com, and development API https://dev-api.atheriongroup.com. deploy-platform.sh supports prod/dev selection: prod deploys chat-web-next plus platform-api, dev deploys chat-web-next-dev plus platform-api-dev, and the legacy chat-web service is labeled cleanup-candidate. chat-web-next Docker/cloudbuild/runtime defaults and platform-api CORS defaults should not bake raw Cloud Run URLs; dev Cloud Run services were cloned from production config and dev domain mappings exist but require DNS CNAMEs dev and dev-api to ghs.googlehosted.com before the domains are live.",
+      "confidence": 0.95,
+      "tags": [
+        "deployment",
+        "cloud-run",
+        "domain-mapping",
+        "prod-dev",
+        "chat-web",
+        "platform-api",
+        "cors",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-public-download-mobile-release-links",
+      "text": "The customer-facing web app exposes mobile release access through a public /download page with iOS TestFlight and Android Beta cards. /apps and /mobile redirect to /download, middleware must whitelist the public download route, the header nav includes Download, and deploy-platform.sh passes runtime IOS_TESTFLIGHT_URL and ANDROID_TESTING_URL env vars so production links can be changed without code edits.",
+      "confidence": 0.95,
+      "tags": [
+        "chat-web",
+        "download",
+        "mobile",
+        "testflight",
+        "android-beta",
+        "middleware",
+        "runtime-config",
+        "deployment",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-platform-api-stripe-billing-env-contract",
+      "text": "platform-api billing deploys must preserve all live Stripe price environment variables used by /billing/plans and /billing/checkout: STRIPE_PRICE_ID_THINKING, STRIPE_PRICE_ID_METACOGNITIVE, and STRIPE_PRICE_ID_PAYG. PAYG uses a Stripe Billing Meter-backed metered price for event nrs_api_units, so Checkout line_items must omit quantity for payg while licensed recurring tiers may include quantity. Production billing validation should cover checkout URL creation for payg, thinking, and metacognitive; query_only API key creation; /v1/chat/completions with the API key; and /usage/summary showing total_queries incremented with nonzero total_cost_cents.",
+      "confidence": 0.95,
+      "tags": [
+        "platform-api",
+        "stripe",
+        "billing",
+        "metered-billing",
+        "env-vars",
+        "cloud-run",
+        "deployment",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-authoritative-dns-for-prod-dev-domains",
+      "text": "For atheriongroup.com prod/dev hostnames, Cloudflare nameservers are the authoritative DNS layer even though Porkbun remains the registrar/original DNS host. Deployment runbooks should treat Cloudflare as the live DNS control plane for records such as dev and dev-api, verify NS authority before making DNS changes, and avoid relying on Porkbun DNS API writes for hostnames delegated to Cloudflare.",
+      "confidence": 0.95,
+      "tags": [
+        "cloudflare",
+        "porkbun",
+        "dns",
+        "domain-mapping",
+        "prod-dev",
+        "deployment",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-benchmark-offline-deterministic-contract",
+      "text": "Benchmark and CI throughput paths are deterministic/offline by default. run_all.py sets NRS_OFFLINE=1, NRS_BENCHMARK_LIGHTWEIGHT=1, NRS_SKIP_SEMANTIC_FILTER=1, and NRS_LEARN_FROM_WEB=0; throughput sets NRS_SKIP_KNOWLEDGE_SEED=1 and uses PVSFastPathProcessor unless NRS_THROUGHPUT_FULL_PIPELINE=1 is explicitly set. Optional external dependencies such as web retrieval, semantic vector engines, LearnableStore persistence, PostgreSQL, and Qdrant must be opt-in for profiling or integration runs, not part of reproducibility gates.",
+      "confidence": 0.95,
+      "tags": [
+        "benchmarks",
+        "ci",
+        "reproducibility",
+        "offline-mode",
+        "throughput",
+        "deterministic",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-external-benchmark-multigraph-knowledgenet",
+      "text": "External GPQA/MMLU-style benchmark runs now use the intended NRS stack instead of a single chat-answer path: NRSMCQAdapter installs the multi-graph bundle, runs deterministic/hybrid/creative mode votes, records graph_bundle metadata, and delegates option ranking to BenchmarkOptionScoringEngine. Miss learning records wrong answers into the learning, epistemic, and ontology graphs, writes low-confidence benchmark-derived KnowledgeNet facts for future offline retrieval, and keeps web retrieval opt-in via NRS_KNOWLEDGENET_ONLINE with persistence controlled by NRS_KNOWLEDGENET_LEARN.",
+      "confidence": 0.95,
+      "tags": [
+        "benchmarks",
+        "external-evals",
+        "multi-graph",
+        "knowledgenet",
+        "miss-learning",
+        "gpqa",
+        "mmlu-pro",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-external-benchmark-gap-closure-20260427",
+      "text": "KnowledgeNet/benchmark external state is isolated per run via NRS_EXTERNAL_BENCH_RESULTS, validated through schema_state, guarded with file_lock on hot JSON paths, redacted before JSONL persistence (miss logs, proposals, learned-fact queries), and allowlisted for optional online retrieval. Durable_state adds tenant-prefixed JSON plus optional Redis; http_fetch centralizes spacing, timeouts, and ETag cache; dominance-loop profiles (smoke/daily/weekly/research) map to NRS_DOMINANCE_PROFILE with structured JSON logs in run_dominance_loop. CI runs pytest under benchmarks/external/tests and keeps harness stubs in benchmark_registry until runners land.",
+      "confidence": 0.9,
+      "tags": [
+        "benchmarks",
+        "knowledgenet",
+        "security",
+        "ci",
+        "gap-closure",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-mobile-native-parity-menu-destination-contract",
+      "text": "Native parity on Android menu routing requires dashboard to remain a native destination, not a web fallback: AppMenuDestination.Web(\"/dashboard\") was replaced with AppMenuDestination.Native(\"dashboard\") and the handler/catalog were updated so no AppMenuDestination.Web entries remain for core menu routes.",
+      "confidence": 0.95,
+      "tags": [
+        "android",
+        "native-parity",
+        "app-menu",
+        "routing",
+        "mobile-release",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-env-driven-gcp-project-selection",
+      "text": "CI and deploy automation should not hardcode prism-production-v2. Workflows and scripts should use environment-driven project selection, including Cloud Build templates that resolve project from ${PROJECT_ID}. Deployment manifests should reference social-content-iq for image and service-account project IDs to keep artifact and identity ownership aligned with the target environment.",
+      "confidence": 0.95,
+      "tags": [
+        "deployment",
+        "ci",
+        "cloudbuild",
+        "project-selection",
+        "gcp",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-dominance-loop-gpu-namespace-cutover-guardrail",
+      "text": "nrs-dominance-loop GPU manifests must avoid hardcoded cross-namespace service FQDNs for runtime dependencies (for example Redis and Qdrant). Endpoint wiring should come from nrsip-config via REDIS_HOST and QDRANT_HOST so namespace changes do not require manifest rewrites. Egress NetworkPolicy namespace selectors should target nrsip as the canonical namespace for cutover-safe service discovery.",
+      "confidence": 0.95,
+      "tags": [
+        "deployment",
+        "kubernetes",
+        "namespace",
+        "dominance-loop",
+        "runtime-config",
+        "networkpolicy",
+        "redis",
+        "qdrant",
+        "architecture"
+      ]
+    }
+  ]
+}

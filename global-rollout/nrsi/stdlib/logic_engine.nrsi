@@ -1,0 +1,1249 @@
+/// NRS Reasoning — Formal Logic & Inference Engine.
+///
+/// First-order logic representation with Robinson unification, forward chaining,
+/// backward chaining, contradiction detection, and pattern-based NL extraction.
+/// Pure algorithmic — no external ML dependencies.
+
+module logic_engine
+
+import hashlib from "std/hash"
+import re from "std/regex"
+import time from "std/time"
+import logging from "std/logging"
+
+let logger = logging.getLogger("nrs.logic-engine")
+
+/// ── Knowledge Representation ───────────────────────────────────────────
+
+class Term {
+    /// A logical term: constant, variable, or function application.
+    /// Variables distinguished by is_variable=true (names starting with uppercase).
+
+    fn new(name: string, args: List[Term], is_variable: bool) -> Term {
+        let t = Term {}
+        t.name = name
+        t.args = args
+        t.is_variable = is_variable
+        return t
+    }
+
+    fn ground(self) -> bool {
+        if self.is_variable {
+            return false
+        }
+        for a in self.args {
+            if !a.ground() {
+                return false
+            }
+        }
+        return true
+    }
+
+    fn variables(self) -> any {
+        if self.is_variable {
+            return Set.of(self.name)
+        }
+        let vs: Set[string] = Set.new()
+        for a in self.args {
+            vs = vs.union(a.variables())
+        }
+        return vs
+    }
+
+    fn to_string(self) -> string {
+        if self.args.len() == 0 {
+            return self.name
+        }
+        let parts: List[string] = []
+        for a in self.args {
+            parts.append(a.to_string())
+        }
+        let inner = parts.join(", ")
+        return self.name + "(" + inner + ")"
+    }
+}
+
+class Literal {
+    /// A predicate applied to terms, possibly negated.
+
+    fn new(predicate: string, terms: List[Term], negated: bool) -> Literal {
+        let lit = Literal {}
+        lit.predicate = predicate
+        lit.terms = terms
+        lit.negated = negated
+        return lit
+    }
+
+    fn arity(self) -> int {
+        return self.terms.len()
+    }
+
+    fn complement(self) -> Literal {
+        return Literal.new(self.predicate, self.terms, !self.negated)
+    }
+
+    fn ground(self) -> bool {
+        for t in self.terms {
+            if !t.ground() {
+                return false
+            }
+        }
+        return true
+    }
+
+    fn variables(self) -> any {
+        let vs: Set[string] = Set.new()
+        for t in self.terms {
+            vs = vs.union(t.variables())
+        }
+        return vs
+    }
+
+    fn signature(self) -> List[any] {
+        return [self.predicate, self.arity(), self.negated]
+    }
+
+    fn to_string(self) -> string {
+        let prefix = ""
+        if self.negated {
+            prefix = "¬"
+        }
+        let parts: List[string] = []
+        for t in self.terms {
+            parts.append(t.to_string())
+        }
+        let inner = parts.join(", ")
+        return prefix + self.predicate + "(" + inner + ")"
+    }
+}
+
+class Rule {
+    /// An inference rule: head :- body (if body then head).
+    /// confidence in [0,1] attenuates derivations.
+
+    fn new(head: Literal, body: List[Literal], confidence: float, source: string, rule_id: string) -> Rule {
+        let r = Rule {}
+        r.head = head
+        r.body = body
+        r.confidence = confidence
+        r.source = source
+        if rule_id == "" {
+            let body_strs: List[string] = []
+            for b in body {
+                body_strs.append(b.to_string())
+            }
+            let h = hashlib.sha256((head.to_string() + ":-" + body_strs.join(",")).encode()).hexdigest()
+            r.rule_id = "rule-" + h[0:12]
+        } else {
+            r.rule_id = rule_id
+        }
+        return r
+    }
+
+    fn to_string(self) -> string {
+        if self.body.len() == 0 {
+            return self.head.to_string()
+        }
+        let parts: List[string] = []
+        for b in self.body {
+            parts.append(b.to_string())
+        }
+        let body_s = parts.join(", ")
+        return self.head.to_string() + " :- " + body_s
+    }
+}
+
+class Fact {
+    /// A ground literal with provenance.
+
+    fn new(literal: Literal, confidence: float, source: string, derived_from: List[string], fact_id: string) -> Fact {
+        let f = Fact {}
+        f.literal = literal
+        f.confidence = confidence
+        f.source = source
+        f.derived_from = derived_from
+        f.timestamp = time.time()
+        if fact_id == "" {
+            let h = hashlib.sha256(literal.to_string().encode()).hexdigest()
+            f.fact_id = "fact-" + h[0:12]
+        } else {
+            f.fact_id = fact_id
+        }
+        return f
+    }
+
+    fn to_string(self) -> string {
+        let conf = ""
+        if self.confidence < 1.0 {
+            conf = " [" + format(self.confidence, ".2f") + "]"
+        }
+        return self.literal.to_string() + conf
+    }
+}
+
+/// ── Proof & Result Data ────────────────────────────────────────────────
+
+class ProofStep {
+    /// One node in a proof tree.
+
+    fn new(goal: Literal, rule_used: Optional[Rule], fact_used: Optional[Fact],
+           substitution: Dict[string, Term], subproofs: List[ProofStep]) -> ProofStep {
+        let ps = ProofStep {}
+        ps.goal = goal
+        ps.rule_used = rule_used
+        ps.fact_used = fact_used
+        ps.substitution = substitution
+        ps.subproofs = subproofs
+        return ps
+    }
+
+    fn depth(self) -> int {
+        if self.subproofs.len() == 0 {
+            return 0
+        }
+        let max_d = 0
+        for sp in self.subproofs {
+            let d = sp.depth()
+            if d > max_d {
+                max_d = d
+            }
+        }
+        return 1 + max_d
+    }
+}
+
+type ProofResult {
+    /// Outcome of a backward-chaining proof attempt.
+    proved: bool,
+    goal: Literal,
+    proof_tree: Optional[ProofStep],
+    substitution: Dict[string, Term],
+    confidence: float,
+    depth: int
+}
+
+type Contradiction {
+    /// A detected inconsistency between two facts.
+    fact_a: Fact,
+    fact_b: Fact,
+    explanation: string
+}
+
+type LogicResult {
+    /// Full result of a high-level query against the engine.
+    answered: bool,
+    answer: string,
+    proof: Optional[ProofResult],
+    derived_facts: List[Fact],
+    contradictions: List[Contradiction],
+    confidence: float,
+    reasoning_trace: string
+}
+
+/// ── Unification Engine ─────────────────────────────────────────────────
+
+class UnificationEngine {
+    /// Robinson's unification with occurs check.
+
+    fn new() -> UnificationEngine {
+        return UnificationEngine {}
+    }
+
+    fn unify(self, x: Term, y: Term, subst: Optional[Dict[string, Term]]) -> Optional[Dict[string, Term]] {
+        if subst == None {
+            subst = {}
+        }
+
+        x = self._walk(x, subst)
+        y = self._walk(y, subst)
+
+        if x == y {
+            return subst
+        }
+
+        if x.is_variable {
+            return self._unify_var(x, y, subst)
+        }
+        if y.is_variable {
+            return self._unify_var(y, x, subst)
+        }
+
+        if x.name != y.name || x.args.len() != y.args.len() {
+            return None
+        }
+
+        let i = 0
+        while i < x.args.len() {
+            let subst_or_none = self.unify(x.args[i], y.args[i], subst)
+            if subst_or_none == None {
+                return None
+            }
+            subst = subst_or_none
+            i += 1
+        }
+
+        return subst
+    }
+
+    fn unify_literals(self, l1: Literal, l2: Literal, subst: Optional[Dict[string, Term]]) -> Optional[Dict[string, Term]] {
+        if l1.predicate != l2.predicate || l1.arity() != l2.arity() {
+            return None
+        }
+        if l1.negated != l2.negated {
+            return None
+        }
+        if subst == None {
+            subst = {}
+        }
+        let i = 0
+        while i < l1.terms.len() {
+            let subst_or_none = self.unify(l1.terms[i], l2.terms[i], subst)
+            if subst_or_none == None {
+                return None
+            }
+            subst = subst_or_none
+            i += 1
+        }
+        return subst
+    }
+
+    fn apply_substitution(self, term: Term, subst: Dict[string, Term]) -> Term {
+        term = self._walk(term, subst)
+        if term.is_variable {
+            return term
+        }
+        if term.args.len() == 0 {
+            return term
+        }
+        let new_args: List[Term] = []
+        for a in term.args {
+            new_args.append(self.apply_substitution(a, subst))
+        }
+        return Term.new(term.name, new_args, false)
+    }
+
+    fn apply_substitution_literal(self, lit: Literal, subst: Dict[string, Term]) -> Literal {
+        let new_terms: List[Term] = []
+        for t in lit.terms {
+            new_terms.append(self.apply_substitution(t, subst))
+        }
+        return Literal.new(lit.predicate, new_terms, lit.negated)
+    }
+
+    fn occurs_check(self, var: Term, term: Term, subst: Dict[string, Term]) -> bool {
+        term = self._walk(term, subst)
+        if var == term {
+            return true
+        }
+        if term.is_variable {
+            return false
+        }
+        for a in term.args {
+            if self.occurs_check(var, a, subst) {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn _walk(self, term: Term, subst: Dict[string, Term]) -> Term {
+        while term.is_variable && term.name in subst {
+            term = subst[term.name]
+        }
+        return term
+    }
+
+    fn _unify_var(self, var: Term, term: Term, subst: Dict[string, Term]) -> Optional[Dict[string, Term]] {
+        if self.occurs_check(var, term, subst) {
+            return None
+        }
+        let new_subst = Dict.copy(subst)
+        new_subst[var.name] = term
+        return new_subst
+    }
+}
+
+/// ── Forward Chaining ───────────────────────────────────────────────────
+
+class ForwardChainer {
+    /// Data-driven inference: apply rules to known facts to derive new facts.
+
+    fn new() -> ForwardChainer {
+        let fc = ForwardChainer {}
+        fc._facts = {}
+        fc._fact_set = Set.new()
+        fc._rules = []
+        fc._unifier = UnificationEngine.new()
+        fc._derived = []
+        fc._max_depth = 20
+        return fc
+    }
+
+    fn all_facts(self) -> List[any] {
+        let out: List[Fact] = []
+        for bucket in self._facts.values() {
+            out.extend(bucket)
+        }
+        return out
+    }
+
+    fn rules(self) -> List[any] {
+        return List.copy(self._rules)
+    }
+
+    fn add_fact(self, fact: Fact) -> bool {
+        let key = fact.literal.to_string()
+        if key in self._fact_set {
+            return false
+        }
+        self._fact_set.add(key)
+        if fact.literal.predicate not in self._facts {
+            self._facts[fact.literal.predicate] = []
+        }
+        self._facts[fact.literal.predicate].append(fact)
+        return true
+    }
+
+    fn add_rule(self, rule: Rule) -> void {
+        self._rules.append(rule)
+    }
+
+    fn lookup(self, predicate: string, negated: bool) -> List[any] {
+        let result: List[Fact] = []
+        for f in self._facts.get(predicate, []) {
+            if f.literal.negated == negated {
+                result.append(f)
+            }
+        }
+        return result
+    }
+
+    fn chain(self, max_iterations: int) -> List[any] {
+        let all_new: List[Fact] = []
+        let iteration = 0
+        while iteration < max_iterations {
+            let new_this_round: List[Fact] = []
+            for rule in self._rules {
+                let substitutions = self._match_body(rule.body, {}, 0)
+                for subst in substitutions {
+                    let derived_lit = self._unifier.apply_substitution_literal(rule.head, subst)
+                    if !derived_lit.ground() {
+                        continue
+                    }
+
+                    let body_confidences: List[float] = []
+                    let provenance_ids: List[string] = [rule.rule_id]
+                    for bl in rule.body {
+                        let bound_bl = self._unifier.apply_substitution_literal(bl, subst)
+                        let matched = self._find_matching_fact(bound_bl)
+                        if matched != None {
+                            body_confidences.append(matched.confidence)
+                            provenance_ids.append(matched.fact_id)
+                        }
+                    }
+
+                    let conf = rule.confidence
+                    if body_confidences.len() > 0 {
+                        let min_conf = body_confidences[0]
+                        for bc in body_confidences {
+                            if bc < min_conf {
+                                min_conf = bc
+                            }
+                        }
+                        conf = min_conf * rule.confidence
+                    }
+
+                    let new_fact = Fact.new(
+                        derived_lit,
+                        conf,
+                        "derived:forward:" + rule.rule_id,
+                        provenance_ids,
+                        ""
+                    )
+                    if self.add_fact(new_fact) {
+                        new_this_round.append(new_fact)
+                        self._derived.append(new_fact)
+                    }
+                }
+            }
+            all_new.extend(new_this_round)
+            if new_this_round.len() == 0 {
+                logger.debug("Forward chaining fixpoint at iteration " + string(iteration))
+                break
+            }
+            iteration += 1
+        }
+        return all_new
+    }
+
+    fn _match_body(self, body: List[Literal], subst: Dict[string, Term], depth: int) -> List[any] {
+        if depth > self._max_depth {
+            return []
+        }
+        if body.len() == 0 {
+            return [subst]
+        }
+
+        let first = body[0]
+        let rest = body[1:]
+        let results: List[Dict[string, Term]] = []
+        let bound_first = self._unifier.apply_substitution_literal(first, subst)
+
+        for fact in self._facts.get(first.predicate, []) {
+            if fact.literal.negated != first.negated {
+                continue
+            }
+            let unified = self._unifier.unify_literals(bound_first, fact.literal, Dict.copy(subst))
+            if unified != None {
+                let sub_results = self._match_body(rest, unified, depth + 1)
+                results.extend(sub_results)
+            }
+        }
+
+        return results
+    }
+
+    fn _find_matching_fact(self, lit: Literal) -> Optional[Fact] {
+        for f in self._facts.get(lit.predicate, []) {
+            if f.literal == lit {
+                return f
+            }
+        }
+        return None
+    }
+}
+
+/// ── Backward Chaining ──────────────────────────────────────────────────
+
+class BackwardChainer {
+    /// Goal-directed proof search using SLD resolution.
+
+    fn new(forward: ForwardChainer) -> BackwardChainer {
+        let bc = BackwardChainer {}
+        bc._forward = forward
+        bc._unifier = UnificationEngine.new()
+        bc._visited = Set.new()
+        return bc
+    }
+
+    fn prove(self, goal: Literal, max_depth: int) -> Optional[ProofResult] {
+        self._visited = Set.new()
+        let step = self._prove_goal(goal, {}, max_depth, 0)
+        if step == None {
+            return ProofResult {
+                proved: false, goal: goal, proof_tree: None,
+                substitution: {}, confidence: 0.0, depth: 0
+            }
+        }
+        let conf = _compute_confidence(step)
+        return ProofResult {
+            proved: true, goal: goal, proof_tree: step,
+            substitution: step.substitution, confidence: conf,
+            depth: step.depth()
+        }
+    }
+
+    fn prove_all(self, goals: List[Literal], subst: Optional[Dict[string, Term]], max_depth: int) -> List[any] {
+        let results: List[ProofResult] = []
+        let current_subst: Dict[string, Term] = {}
+        if subst != None {
+            current_subst = subst
+        }
+        for g in goals {
+            let bound_g = self._unifier.apply_substitution_literal(g, current_subst)
+            let pr = self.prove(bound_g, max_depth)
+            results.append(pr)
+            if pr.proved && pr.substitution.len() > 0 {
+                let merged = Dict.copy(current_subst)
+                for k, v in pr.substitution.items() {
+                    merged[k] = v
+                }
+                current_subst = merged
+            }
+        }
+        return results
+    }
+
+    fn _prove_goal(self, goal: Literal, subst: Dict[string, Term],
+                   max_depth: int, depth: int) -> Optional[ProofStep] {
+        if depth > max_depth {
+            return None
+        }
+
+        let goal_key = goal.to_string() + "@" + string(depth)
+        if goal_key in self._visited {
+            return None
+        }
+        self._visited.add(goal_key)
+
+        let bound_goal = self._unifier.apply_substitution_literal(goal, subst)
+
+        for fact in self._forward.lookup(bound_goal.predicate, bound_goal.negated) {
+            let unified = self._unifier.unify_literals(bound_goal, fact.literal, Dict.copy(subst))
+            if unified != None {
+                return ProofStep.new(bound_goal, None, fact, unified, [])
+            }
+        }
+
+        for rule in self._forward.rules() {
+            if rule.head.predicate != bound_goal.predicate {
+                continue
+            }
+            if rule.head.negated != bound_goal.negated {
+                continue
+            }
+
+            let renamed_rule = self._rename_variables(rule, depth)
+            let unified = self._unifier.unify_literals(bound_goal, renamed_rule.head, Dict.copy(subst))
+            if unified == None {
+                continue
+            }
+
+            let subproofs: List[ProofStep] = []
+            let current = unified
+            let failed = false
+            for body_lit in renamed_rule.body {
+                let sp = self._prove_goal(body_lit, current, max_depth, depth + 1)
+                if sp == None {
+                    failed = true
+                    break
+                }
+                subproofs.append(sp)
+                let merged = Dict.copy(current)
+                for k, v in sp.substitution.items() {
+                    merged[k] = v
+                }
+                current = merged
+            }
+
+            if !failed {
+                return ProofStep.new(bound_goal, rule, None, current, subproofs)
+            }
+        }
+
+        self._visited.discard(goal_key)
+        return None
+    }
+
+    fn _rename_variables(self, rule: Rule, depth: int) -> Rule {
+        let suffix = "_d" + string(depth) + "_" + string(id(rule) % 10000)
+
+        fn _rename_term(t: Term) -> Term {
+            if t.is_variable {
+                let new_name = t.name + suffix
+                return Term.new(new_name, [], true)
+            }
+            if t.args.len() > 0 {
+                let new_args: List[Term] = []
+                for a in t.args {
+                    new_args.append(_rename_term(a))
+                }
+                return Term.new(t.name, new_args, false)
+            }
+            return t
+        }
+
+        fn _rename_lit(lit: Literal) -> Literal {
+            let new_terms: List[Term] = []
+            for t in lit.terms {
+                new_terms.append(_rename_term(t))
+            }
+            return Literal.new(lit.predicate, new_terms, lit.negated)
+        }
+
+        let new_head = _rename_lit(rule.head)
+        let new_body: List[Literal] = []
+        for b in rule.body {
+            new_body.append(_rename_lit(b))
+        }
+        return Rule.new(new_head, new_body, rule.confidence, rule.source, rule.rule_id)
+    }
+}
+
+fn _compute_confidence(step: ProofStep) -> float {
+    if step.fact_used != None {
+        return step.fact_used.confidence
+    }
+    if step.rule_used != None {
+        let sub_confs: List[float] = []
+        for sp in step.subproofs {
+            sub_confs.append(_compute_confidence(sp))
+        }
+        let body_min = 1.0
+        if sub_confs.len() > 0 {
+            body_min = sub_confs[0]
+            for c in sub_confs {
+                if c < body_min {
+                    body_min = c
+                }
+            }
+        }
+        return body_min * step.rule_used.confidence
+    }
+    return 0.0
+}
+
+/// ── Contradiction Detection ────────────────────────────────────────────
+
+class ContradictionDetector {
+    /// Detect inconsistencies: P(a,b) contradicts ¬P(a,b).
+
+    fn new() -> ContradictionDetector {
+        let cd = ContradictionDetector {}
+        cd._unifier = UnificationEngine.new()
+        return cd
+    }
+
+    fn check(self, facts: List[Fact]) -> List[any] {
+        let by_pred: Dict[string, List[Fact]] = {}
+        for f in facts {
+            if f.literal.predicate not in by_pred {
+                by_pred[f.literal.predicate] = []
+            }
+            by_pred[f.literal.predicate].append(f)
+        }
+
+        let contradictions: List[Contradiction] = []
+        let seen: Set[string] = Set.new()
+
+        for pred, bucket in by_pred.items() {
+            let positives: List[Fact] = []
+            let negatives: List[Fact] = []
+            for f in bucket {
+                if !f.literal.negated {
+                    positives.append(f)
+                } else {
+                    negatives.append(f)
+                }
+            }
+
+            for pos in positives {
+                for neg in negatives {
+                    if pos.literal.arity() != neg.literal.arity() {
+                        continue
+                    }
+                    let unified = self._unifier.unify_literals(pos.literal, neg.literal.complement(), None)
+                    if unified != None {
+                        let pair_key = _pair_key(pos.fact_id, neg.fact_id)
+                        if pair_key in seen {
+                            continue
+                        }
+                        seen.add(pair_key)
+                        contradictions.append(Contradiction {
+                            fact_a: pos,
+                            fact_b: neg,
+                            explanation: pos.literal.to_string() + " contradicts " +
+                                neg.literal.to_string() + ": positive and negative forms unify under " +
+                                _fmt_subst(unified)
+                        })
+                    }
+                }
+            }
+        }
+        return contradictions
+    }
+
+    fn check_with_rules(self, facts: List[Fact], rules: List[Rule]) -> List[any] {
+        let fc = ForwardChainer.new()
+        for f in facts {
+            fc.add_fact(f)
+        }
+        for r in rules {
+            fc.add_rule(r)
+        }
+        fc.chain(50)
+        return self.check(fc.all_facts())
+    }
+}
+
+/// ── Natural Language → Logic ───────────────────────────────────────────
+
+let NL_PATTERNS: List[List[string]] = [
+    ["^if\\s+(.+?)\\s*,?\\s*then\\s+(.+)$", "implies"],
+    ["^all\\s+(.+?)\\s+(?:are|is)\\s+(?:a |an |the )?(.+)$", "all_are"],
+    ["^no\\s+(.+?)\\s+(?:are|is)\\s+(?:a |an |the )?(.+)$", "none_are"],
+    ["^(.+?)\\s+(?:is not|are not|isn't|aren't)\\s+(?:a |an |the )?(.+)$", "is_not"],
+    ["^(.+?)\\s+(?:is|are)\\s+(?:a |an |the )?(.+)$", "is_a"],
+    ["^(.+?)\\s+(?:causes?|caused)\\s+(.+)$", "causes"],
+    ["^(.+?)\\s+(?:has|have|had)\\s+(?:a |an |the )?(.+)$", "has"],
+    ["^(.+?)\\s+(?:leads?\\s+to|results?\\s+in)\\s+(.+)$", "leads_to"],
+    ["^(.+?)\\s+(?:requires?|needs?)\\s+(?:a |an |the )?(.+)$", "requires"],
+    ["^(.+?)\\s+(?:prevents?|blocks?)\\s+(.+)$", "prevents"],
+    ["^(.+?)\\s+(?:increases?|raises?)\\s+(.+)$", "increases"],
+    ["^(.+?)\\s+(?:decreases?|reduces?|lowers?)\\s+(.+)$", "decreases"]
+]
+
+let SENTENCE_SPLIT_RE = re.compile("[.;!\\n]+")
+
+class NLToLogic {
+    /// Convert natural language statements to logical form.
+
+    fn new() -> NLToLogic {
+        return NLToLogic {}
+    }
+
+    fn extract(self, text: string, source: string) -> List[any] {
+        let results: List[any] = []
+        let sentences: List[string] = []
+        for s in SENTENCE_SPLIT_RE.split(text) {
+            let trimmed = s.strip()
+            if trimmed != "" {
+                sentences.append(trimmed)
+            }
+        }
+
+        for sentence in sentences {
+            let sentence_lower = sentence.lower().rstrip(".")
+            let matched = false
+
+            for pattern_pair in NL_PATTERNS {
+                let pattern = pattern_pair[0]
+                let kind = pattern_pair[1]
+                let m = re.match(pattern, sentence_lower, re.IGNORECASE)
+                if m == None {
+                    continue
+                }
+                matched = true
+                let subj = _normalise_term(m.group(1), false)
+                let obj = _normalise_term(m.group(2), false)
+
+                if kind == "implies" {
+                    let body_items = self._extract_conjunction(subj)
+                    let head_items = self._extract_conjunction(obj)
+                    for head_s in head_items {
+                        let head_lit = _make_literal("holds", head_s, false)
+                        let body_lits: List[Literal] = []
+                        for b in body_items {
+                            body_lits.append(_make_literal("holds", b, false))
+                        }
+                        let src = source
+                        if src == "" {
+                            src = "nl_extraction"
+                        }
+                        results.append(Rule.new(head_lit, body_lits, 0.9, src, ""))
+                    }
+                } else if kind == "is_not" {
+                    let obj_s = _singularise(obj)
+                    let lit = Literal.new("is_a", [_const(subj), _const(obj_s)], true)
+                    let src = source
+                    if src == "" { src = "nl_extraction" }
+                    results.append(Fact.new(lit, 0.9, src, [], ""))
+                } else if kind == "none_are" {
+                    let subj_s = _singularise(subj)
+                    let obj_s = _singularise(obj)
+                    let src = source
+                    if src == "" { src = "nl_extraction" }
+                    results.append(Rule.new(
+                        Literal.new("is_a", [_var("X"), _const(obj_s)], true),
+                        [Literal.new("is_a", [_var("X"), _const(subj_s)], false)],
+                        0.9, src, ""
+                    ))
+                } else if kind == "all_are" {
+                    let subj_s = _singularise(subj)
+                    let obj_s = _singularise(obj)
+                    let src = source
+                    if src == "" { src = "nl_extraction" }
+                    results.append(Rule.new(
+                        Literal.new("is_a", [_var("X"), _const(obj_s)], false),
+                        [Literal.new("is_a", [_var("X"), _const(subj_s)], false)],
+                        0.9, src, ""
+                    ))
+                } else if kind == "is_a" {
+                    let obj_s = _singularise(obj)
+                    let lit = Literal.new("is_a", [_const(subj), _const(obj_s)], false)
+                    let src = source
+                    if src == "" { src = "nl_extraction" }
+                    results.append(Fact.new(lit, 0.9, src, [], ""))
+                } else {
+                    let predicate = kind
+                    let lit = Literal.new(predicate, [_const(subj), _const(obj)], false)
+                    let src = source
+                    if src == "" { src = "nl_extraction" }
+                    results.append(Fact.new(lit, 0.9, src, [], ""))
+                }
+                break
+            }
+
+            if !matched && sentence_lower != "" {
+                let prop = _normalise_term(sentence_lower, false)
+                if prop != "" {
+                    let lit = Literal.new("holds", [_const(prop)], false)
+                    let src = source
+                    if src == "" { src = "nl_extraction" }
+                    results.append(Fact.new(lit, 0.7, src, [], ""))
+                }
+            }
+        }
+
+        return results
+    }
+
+    fn extract_from_conversation(self, history: List[Dict[string, any]], source: string) -> List[any] {
+        let items: List[any] = []
+        if source == "" {
+            source = "conversation"
+        }
+        for msg in history {
+            let content = msg.get("content", "")
+            if content == "" {
+                continue
+            }
+            let role = msg.get("role", "user")
+            items.extend(self.extract(content, source + ":" + role))
+        }
+        return items
+    }
+
+    fn _extract_conjunction(self, text: string) -> List[any] {
+        let parts = re.split("\\s+and\\s+", text)
+        let result: List[string] = []
+        for p in parts {
+            let trimmed = p.strip()
+            if trimmed != "" {
+                result.append(trimmed)
+            }
+        }
+        return result
+    }
+}
+
+/// ── Main Logic Engine ──────────────────────────────────────────────────
+
+class LogicEngine {
+    /// Unified logic and inference engine for NRS.
+
+    fn new() -> LogicEngine {
+        let le = LogicEngine {}
+        le._forward = ForwardChainer.new()
+        le._backward = BackwardChainer.new(le._forward)
+        le._contradictions = ContradictionDetector.new()
+        le._nl = NLToLogic.new()
+        le._proof_count = 0
+        le._derivation_count = 0
+        le._query_count = 0
+        le._start_time = time.time()
+        return le
+    }
+
+    fn add_fact(self, fact: Fact) -> bool {
+        return self._forward.add_fact(fact)
+    }
+
+    fn add_rule(self, rule: Rule) -> void {
+        self._forward.add_rule(rule)
+    }
+
+    fn ingest_text(self, text: string, source: string) -> Dict[string, int] {
+        let items = self._nl.extract(text, source)
+        return self._ingest_items(items)
+    }
+
+    fn ingest_conversation(self, history: List[Dict[string, any]]) -> Dict[string, int] {
+        let items = self._nl.extract_from_conversation(history, "")
+        return self._ingest_items(items)
+    }
+
+    fn _ingest_items(self, items: List[any]) -> Dict[string, int] {
+        let facts_added = 0
+        let rules_added = 0
+        for item in items {
+            if item is Fact {
+                if self._forward.add_fact(item) {
+                    facts_added += 1
+                }
+            } else if item is Rule {
+                self._forward.add_rule(item)
+                rules_added += 1
+            }
+        }
+        return {"facts_added": facts_added, "rules_added": rules_added}
+    }
+
+    fn derive_new_knowledge(self, max_iterations: int) -> List[any] {
+        let new_facts = self._forward.chain(max_iterations)
+        self._derivation_count += new_facts.len()
+        return new_facts
+    }
+
+    fn query(self, question: string) -> LogicResult {
+        self._query_count += 1
+
+        let goals = self._parse_question(question)
+        if goals.len() == 0 {
+            return LogicResult {
+                answered: false,
+                answer: "Could not parse question into logical form.",
+                proof: None, derived_facts: [], contradictions: [],
+                confidence: 0.0,
+                reasoning_trace: "Input: '" + question + "' -> no parseable goals"
+            }
+        }
+
+        let trace_parts: List[string] = []
+        let goal_strs: List[string] = []
+        for g in goals {
+            goal_strs.append(g.to_string())
+        }
+        trace_parts.append("Parsed goals: [" + goal_strs.join(", ") + "]")
+
+        let results = self._backward.prove_all(goals, None, 20)
+        let all_proved = true
+        for r in results {
+            if !r.proved {
+                all_proved = false
+                break
+            }
+        }
+
+        if all_proved {
+            self._proof_count += 1
+            let best = results[0]
+            for r in results {
+                if r.confidence > best.confidence {
+                    best = r
+                }
+            }
+            let explanation = self._explain_proof(best)
+            trace_parts.append("Proved via backward chaining (depth " + string(best.depth) + ")")
+            return LogicResult {
+                answered: true, answer: explanation, proof: best,
+                derived_facts: [], contradictions: [],
+                confidence: best.confidence,
+                reasoning_trace: trace_parts.join("\n")
+            }
+        }
+
+        trace_parts.append("Direct proof failed — running forward chaining")
+        let new_facts = self.derive_new_knowledge(100)
+        trace_parts.append("Forward chaining derived " + string(new_facts.len()) + " new facts")
+
+        results = self._backward.prove_all(goals, None, 20)
+        all_proved = true
+        for r in results {
+            if !r.proved {
+                all_proved = false
+                break
+            }
+        }
+
+        let contradictions = self._contradictions.check(self._forward.all_facts())
+
+        if all_proved {
+            self._proof_count += 1
+            let best = results[0]
+            for r in results {
+                if r.confidence > best.confidence {
+                    best = r
+                }
+            }
+            let explanation = self._explain_proof(best)
+            trace_parts.append("Proved after forward chaining")
+            return LogicResult {
+                answered: true, answer: explanation, proof: best,
+                derived_facts: new_facts, contradictions: contradictions,
+                confidence: best.confidence,
+                reasoning_trace: trace_parts.join("\n")
+            }
+        }
+
+        trace_parts.append("Could not prove goal")
+        let partial: List[ProofResult] = []
+        for r in results {
+            if r.proved {
+                partial.append(r)
+            }
+        }
+        let answer = "Unable to prove the statement from known facts and rules."
+        if partial.len() > 0 {
+            let proved_strs: List[string] = []
+            for r in partial {
+                proved_strs.append(r.goal.to_string())
+            }
+            answer += " Partially proved: " + proved_strs.join(", ") + "."
+        }
+
+        return LogicResult {
+            answered: false, answer: answer, proof: None,
+            derived_facts: new_facts, contradictions: contradictions,
+            confidence: 0.0,
+            reasoning_trace: trace_parts.join("\n")
+        }
+    }
+
+    fn check_consistency(self) -> List[any] {
+        return self._contradictions.check(self._forward.all_facts())
+    }
+
+    fn check_consistency_deep(self) -> List[any] {
+        return self._contradictions.check_with_rules(self._forward.all_facts(), self._forward.rules())
+    }
+
+    fn explain_proof(self, proof: ProofResult) -> string {
+        if proof.proof_tree == None {
+            return "No proof tree available."
+        }
+        return self._explain_proof(proof)
+    }
+
+    fn _explain_proof(self, proof: ProofResult) -> string {
+        if proof.proof_tree == None {
+            return "Goal " + proof.goal.to_string() + " has no proof tree."
+        }
+        let lines: List[string] = []
+        self._explain_step(proof.proof_tree, lines, 0)
+        return lines.join("\n")
+    }
+
+    fn _explain_step(self, step: ProofStep, lines: List[string], indent: int) -> void {
+        let prefix = "  ".repeat(indent)
+        if step.fact_used != None {
+            lines.append(
+                prefix + "Known fact: " + step.fact_used.literal.to_string() +
+                " (confidence " + format(step.fact_used.confidence, ".2f") +
+                ", source: " + step.fact_used.source + ")"
+            )
+        } else if step.rule_used != None {
+            lines.append(
+                prefix + "Apply rule: " + step.rule_used.to_string() +
+                " (confidence " + format(step.rule_used.confidence, ".2f") + ")"
+            )
+            for sp in step.subproofs {
+                self._explain_step(sp, lines, indent + 1)
+            }
+        } else {
+            lines.append(prefix + "Goal: " + step.goal.to_string())
+        }
+    }
+
+    fn _parse_question(self, question: string) -> List[any] {
+        let q = question.strip().rstrip("?").lower()
+
+        let m = re.match(
+            "^(?:is|are|does|do|can|will|has|have)\\s+(.+?)\\s+(?:a |an |the )?(.+)$", q)
+        if m != None {
+            let subj = _normalise_term(m.group(1), false)
+            let obj = _normalise_term(m.group(2), true)
+            return [Literal.new("is_a", [_const(subj), _const(obj)], false)]
+        }
+
+        m = re.match(
+            "^(?:does|do|can|will)\\s+(.+?)\\s+(cause|prevent|require|increase|decrease|lead\\s+to|has|have)\\s+(.+)$", q)
+        if m != None {
+            let subj = _normalise_term(m.group(1), false)
+            let pred = _normalise_pred(m.group(2))
+            let obj = _normalise_term(m.group(3), false)
+            return [Literal.new(pred, [_const(subj), _const(obj)], false)]
+        }
+
+        m = re.match(
+            "^what\\s+(?:does|do|is|are)\\s+(.+?)(?:\\s+cause| lead to| require)?$", q)
+        if m != None {
+            let subj = _normalise_term(m.group(1), false)
+            return [Literal.new("is_a", [_const(subj), _var("What")], false)]
+        }
+
+        let items = self._nl.extract(q, "")
+        let goals: List[Literal] = []
+        for item in items {
+            if item is Fact {
+                goals.append(item.literal)
+            } else if item is Rule {
+                goals.append(item.head)
+            }
+        }
+        return goals
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        let total_facts = self._forward.all_facts().len()
+        let total_rules = self._forward.rules().len()
+        return {
+            "total_facts": total_facts,
+            "total_rules": total_rules,
+            "proofs_completed": self._proof_count,
+            "derivations": self._derivation_count,
+            "queries": self._query_count,
+            "uptime_seconds": round(time.time() - self._start_time, 2)
+        }
+    }
+}
+
+/// ── Module-level Helpers ───────────────────────────────────────────────
+
+fn _const(name: string) -> Term {
+    return Term.new(name.strip(), [], false)
+}
+
+fn _var(name: string) -> Term {
+    return Term.new(name.strip(), [], true)
+}
+
+fn _make_literal(pred: string, text: string, negated: bool) -> Literal {
+    return Literal.new(pred, [_const(text)], negated)
+}
+
+fn _normalise_term(text: string, singularise: bool) -> string {
+    text = text.strip().lower()
+    text = re.sub("[^a-z0-9_\\s]", "", text)
+    text = re.sub("\\s+", "_", text).strip("_")
+    if singularise {
+        text = _singularise(text)
+    }
+    return text
+}
+
+fn _singularise(word: string) -> string {
+    if word.endswith("ies") && word.len() > 4 {
+        return word[0:-3] + "y"
+    }
+    if word.endswith("ves") && word.len() > 4 {
+        return word[0:-3] + "f"
+    }
+    if word.endswith("ses") || word.endswith("xes") || word.endswith("zes") {
+        return word[0:-2]
+    }
+    if word.endswith("ches") || word.endswith("shes") {
+        return word[0:-2]
+    }
+    if word.endswith("s") && !word.endswith("ss") && word.len() > 3 {
+        return word[0:-1]
+    }
+    return word
+}
+
+fn _normalise_pred(text: string) -> string {
+    text = text.strip().lower()
+    text = re.sub("\\s+", "_", text)
+    let mapping: Dict[string, string] = {
+        "cause": "causes", "prevent": "prevents",
+        "require": "requires", "increase": "increases",
+        "decrease": "decreases", "lead_to": "leads_to",
+        "has": "has", "have": "has"
+    }
+    return mapping.get(text, text)
+}
+
+fn _pair_key(a: string, b: string) -> string {
+    let lo = a
+    let hi = b
+    if b < a {
+        lo = b
+        hi = a
+    }
+    return lo + "|" + hi
+}
+
+fn _fmt_subst(subst: Dict[string, Term]) -> string {
+    if subst.len() == 0 {
+        return "{}"
+    }
+    let parts: List[string] = []
+    for k, v in subst.items() {
+        parts.append(k + "=" + v.to_string())
+    }
+    return "{" + parts.join(", ") + "}"
+}
+
+export Term, Literal, Rule, Fact, ProofStep, ProofResult, Contradiction, LogicResult
+export UnificationEngine, ForwardChainer, BackwardChainer
+export ContradictionDetector, NLToLogic, LogicEngine

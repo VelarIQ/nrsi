@@ -1,0 +1,546 @@
+/// NRSI — Multi-Modal Reasoning Synthesizer.
+///
+/// Fuses causal + temporal + quantitative + social + common-sense
+/// reasoning into structured, multi-dimensional answers.
+/// All transformer-free.
+
+module reasoning_synthesis
+
+from "reasoning_graph" import CausalGraph, GraphEdge, RelationType
+from "reasoning_inference" import InferenceEngine, InferenceResult
+from "reasoning_temporal" import TemporalReasoner, QuantitativeReasoner, TemporalFact, QuantityFact
+from "reasoning_social" import SocialCognition
+from "reasoning_commonsense" import DefaultReasoner
+from "reasoning_bayesian" import GraphConfidenceManager
+
+/// ---------- Dimension Types ----------
+
+type CausalDimension {
+    chains: List[List[string]],
+    root_causes: List[string],
+    effects: List[string],
+    confidence: float
+}
+
+fn causal_text(d: CausalDimension) -> string {
+    let parts: List[string] = []
+    if len(d.root_causes) > 0 {
+        let items: List[string] = []
+        for i in range(min(3, len(d.root_causes))) {
+            items.append(d.root_causes[i])
+        }
+        parts.append("Root causes: " + ", ".join(items))
+    }
+    for i in range(min(2, len(d.chains))) {
+        parts.append("  Chain: " + " → ".join(d.chains[i]))
+    }
+    if len(d.effects) > 0 {
+        let items: List[string] = []
+        for i in range(min(3, len(d.effects))) {
+            items.append(d.effects[i])
+        }
+        parts.append("Effects: " + ", ".join(items))
+    }
+    if len(parts) > 0 {
+        return "\n".join(parts)
+    }
+    return "No causal information available."
+}
+
+type TemporalDimension {
+    facts: List[Dict[string, Any]],
+    timeline: List[Tuple[string, Optional[int]]],
+    is_current: Optional[bool]
+}
+
+fn temporal_text(d: TemporalDimension) -> string {
+    let parts: List[string] = []
+    if d.is_current != None {
+        if d.is_current {
+            parts.append("Currently active: yes")
+        } else {
+            parts.append("Currently active: no")
+        }
+    }
+    if len(d.timeline) > 0 {
+        let items: List[string] = []
+        for i in range(min(5, len(d.timeline))) {
+            let name = d.timeline[i][0]
+            let yr = d.timeline[i][1]
+            let yr_str = "?"
+            if yr != None {
+                yr_str = str(yr)
+            }
+            items.append(name + " (" + yr_str + ")")
+        }
+        parts.append("Timeline: " + " → ".join(items))
+    }
+    for i in range(min(3, len(d.facts))) {
+        let f = d.facts[i]
+        parts.append(str(f.get("concept", "")) + ": " + str(f.get("info", "")))
+    }
+    if len(parts) > 0 {
+        return "\n".join(parts)
+    }
+    return "No temporal information available."
+}
+
+type QuantitativeDimension {
+    quantities: List[Dict[string, Any]],
+    comparisons: List[string]
+}
+
+fn quantitative_text(d: QuantitativeDimension) -> string {
+    let parts: List[string] = []
+    for i in range(min(5, len(d.quantities))) {
+        let q = d.quantities[i]
+        parts.append(str(q.get("concept", "")) + ": " + str(q.get("value", "")))
+    }
+    for i in range(min(3, len(d.comparisons))) {
+        parts.append(d.comparisons[i])
+    }
+    if len(parts) > 0 {
+        return "\n".join(parts)
+    }
+    return "No quantitative data available."
+}
+
+type SocialDimension {
+    perspectives: Dict[string, string],
+    consensus: Optional[string],
+    disagreements: List[string]
+}
+
+fn social_text(d: SocialDimension) -> string {
+    let parts: List[string] = []
+    if d.consensus != None {
+        parts.append("Consensus: " + d.consensus)
+    }
+    let count = 0
+    for agent in d.perspectives {
+        if count >= 3 {
+            break
+        }
+        parts.append("  " + agent + ": " + d.perspectives[agent])
+        count += 1
+    }
+    if len(d.disagreements) > 0 {
+        let items: List[string] = []
+        for i in range(min(2, len(d.disagreements))) {
+            items.append(d.disagreements[i])
+        }
+        parts.append("Disagreements: " + "; ".join(items))
+    }
+    if len(parts) > 0 {
+        return "\n".join(parts)
+    }
+    return "No social context available."
+}
+
+type CommonSenseDimension {
+    properties: List[Tuple[string, string]],
+    defaults: List[string]
+}
+
+fn commonsense_text(d: CommonSenseDimension) -> string {
+    let parts: List[string] = []
+    for i in range(min(5, len(d.properties))) {
+        parts.append("  " + d.properties[i][0] + ": " + d.properties[i][1])
+    }
+    if len(d.defaults) > 0 {
+        let items: List[string] = []
+        for i in range(min(3, len(d.defaults))) {
+            items.append(d.defaults[i])
+        }
+        parts.append("Background: " + "; ".join(items))
+    }
+    if len(parts) > 0 {
+        return "\n".join(parts)
+    }
+    return ""
+}
+
+type ConfidenceDimension {
+    overall: float,
+    per_dimension: Dict[string, float],
+    weakest_link: string,
+    strongest_link: string
+}
+
+fn confidence_text(d: ConfidenceDimension) -> string {
+    let label = "speculative"
+    if d.overall >= 0.7 {
+        label = "established"
+    } else if d.overall >= 0.4 {
+        label = "likely"
+    } else if d.overall >= 0.2 {
+        label = "tentative"
+    }
+    let parts: List[string] = []
+    parts.append("Overall confidence: " + str(round(d.overall * 100, 0)) + "% (" + label + ")")
+    if d.weakest_link != "" {
+        parts.append("Weakest evidence: " + d.weakest_link)
+    }
+    if d.strongest_link != "" {
+        parts.append("Strongest evidence: " + d.strongest_link)
+    }
+    return "\n".join(parts)
+}
+
+/// ---------- Synthesized Answer ----------
+
+type SynthesizedAnswer {
+    query: string,
+    causal: CausalDimension,
+    temporal: TemporalDimension,
+    quantitative: QuantitativeDimension,
+    social: SocialDimension,
+    common_sense: CommonSenseDimension,
+    confidence: ConfidenceDimension
+}
+
+fn synthesized_full_text(a: SynthesizedAnswer) -> string {
+    let sections: List[string] = []
+
+    let ct = causal_text(a.causal)
+    if "No causal" not in ct {
+        sections.append("[CAUSAL]\n" + ct)
+    }
+    let tt = temporal_text(a.temporal)
+    if "No temporal" not in tt {
+        sections.append("[TEMPORAL]\n" + tt)
+    }
+    let qt = quantitative_text(a.quantitative)
+    if "No quantitative" not in qt {
+        sections.append("[QUANTITATIVE]\n" + qt)
+    }
+    let st = social_text(a.social)
+    if "No social" not in st {
+        sections.append("[SOCIAL]\n" + st)
+    }
+    let cst = commonsense_text(a.common_sense)
+    if cst != "" {
+        sections.append("[COMMON SENSE]\n" + cst)
+    }
+    sections.append("[CONFIDENCE]\n" + confidence_text(a.confidence))
+
+    return "\n\n".join(sections)
+}
+
+fn synthesized_flat_text(a: SynthesizedAnswer) -> string {
+    let parts: List[string] = []
+
+    if len(a.causal.root_causes) > 0 {
+        let items: List[string] = []
+        for i in range(min(2, len(a.causal.root_causes))) {
+            items.append(a.causal.root_causes[i])
+        }
+        parts.append("This is primarily caused by " + ", ".join(items))
+    }
+    if len(a.causal.effects) > 0 {
+        let items: List[string] = []
+        for i in range(min(2, len(a.causal.effects))) {
+            items.append(a.causal.effects[i])
+        }
+        parts.append("leading to " + ", ".join(items))
+    }
+    if a.temporal.is_current != None {
+        let status = "historical"
+        if a.temporal.is_current {
+            status = "ongoing"
+        }
+        parts.append("(" + status + ")")
+    }
+    if len(a.quantitative.quantities) > 0 {
+        let q = a.quantitative.quantities[0]
+        parts.append("with measured value " + str(q.get("value", "?")))
+    }
+    if a.social.consensus != None {
+        parts.append("[" + a.social.consensus + "]")
+    }
+
+    let label = "uncertain"
+    if a.confidence.overall >= 0.7 {
+        label = "established"
+    } else if a.confidence.overall >= 0.4 {
+        label = "likely"
+    }
+    parts.append("(confidence: " + label + ")")
+
+    if len(parts) > 0 {
+        return " ".join(parts) + "."
+    }
+    return "Insufficient information to synthesize."
+}
+
+fn synthesized_dimension_count(a: SynthesizedAnswer) -> int {
+    let count = 0
+    if len(a.causal.chains) > 0 or len(a.causal.root_causes) > 0 {
+        count += 1
+    }
+    if len(a.temporal.facts) > 0 or len(a.temporal.timeline) > 0 {
+        count += 1
+    }
+    if len(a.quantitative.quantities) > 0 or len(a.quantitative.comparisons) > 0 {
+        count += 1
+    }
+    if len(a.social.perspectives) > 0 or a.social.consensus != None {
+        count += 1
+    }
+    if len(a.common_sense.properties) > 0 {
+        count += 1
+    }
+    return count
+}
+
+/// ---------- Reasoning Synthesizer ----------
+
+class ReasoningSynthesizer {
+    fn __init__(self, graph: CausalGraph,
+                temporal: Optional[TemporalReasoner],
+                quantitative: Optional[QuantitativeReasoner],
+                social: Optional[SocialCognition],
+                commonsense: Optional[DefaultReasoner],
+                confidence_mgr: Optional[GraphConfidenceManager]) {
+        self._graph = graph
+        self._engine = InferenceEngine(graph, None, None)
+        if temporal != None {
+            self._temporal = temporal
+        } else {
+            self._temporal = TemporalReasoner()
+        }
+        if quantitative != None {
+            self._quantitative = quantitative
+        } else {
+            self._quantitative = QuantitativeReasoner()
+        }
+        if social != None {
+            self._social = social
+        } else {
+            self._social = SocialCognition()
+        }
+        self._commonsense = commonsense
+        self._confidence = confidence_mgr
+    }
+
+    fn synthesize(self, concepts: List[string], user_id: string) -> SynthesizedAnswer {
+        let answer = SynthesizedAnswer {
+            query: " ".join(concepts),
+            causal: CausalDimension { chains: [], root_causes: [], effects: [], confidence: 0.0 },
+            temporal: TemporalDimension { facts: [], timeline: [], is_current: None },
+            quantitative: QuantitativeDimension { quantities: [], comparisons: [] },
+            social: SocialDimension { perspectives: {}, consensus: None, disagreements: [] },
+            common_sense: CommonSenseDimension { properties: [], defaults: [] },
+            confidence: ConfidenceDimension { overall: 0.0, per_dimension: {}, weakest_link: "", strongest_link: "" }
+        }
+
+        let dim_confidences: Dict[string, float] = {}
+
+        answer.causal = self._build_causal(concepts)
+        if len(answer.causal.chains) > 0 or len(answer.causal.root_causes) > 0 {
+            dim_confidences["causal"] = answer.causal.confidence
+        }
+
+        answer.temporal = self._build_temporal(concepts)
+        if len(answer.temporal.facts) > 0 {
+            dim_confidences["temporal"] = 0.7
+        }
+
+        answer.quantitative = self._build_quantitative(concepts)
+        if len(answer.quantitative.quantities) > 0 {
+            dim_confidences["quantitative"] = 0.7
+        }
+
+        answer.social = self._build_social(concepts, user_id)
+        if len(answer.social.perspectives) > 0 {
+            dim_confidences["social"] = 0.5
+        }
+
+        answer.common_sense = self._build_commonsense(concepts)
+        if len(answer.common_sense.properties) > 0 {
+            dim_confidences["common_sense"] = 0.8
+        }
+
+        let all_confs: List[float] = []
+        for k in dim_confidences {
+            all_confs.append(dim_confidences[k])
+        }
+        if len(all_confs) == 0 {
+            all_confs.append(0.0)
+        }
+        let total_conf = 0.0
+        for c in all_confs {
+            total_conf += c
+        }
+
+        let weakest = ""
+        let strongest = ""
+        let min_conf = 2.0
+        let max_conf = -1.0
+        for k in dim_confidences {
+            if dim_confidences[k] < min_conf {
+                min_conf = dim_confidences[k]
+                weakest = k
+            }
+            if dim_confidences[k] > max_conf {
+                max_conf = dim_confidences[k]
+                strongest = k
+            }
+        }
+
+        answer.confidence = ConfidenceDimension {
+            overall: total_conf / len(all_confs),
+            per_dimension: dim_confidences,
+            weakest_link: weakest,
+            strongest_link: strongest
+        }
+
+        return answer
+    }
+
+    fn _build_causal(self, concepts: List[string]) -> CausalDimension {
+        let dim = CausalDimension { chains: [], root_causes: [], effects: [], confidence: 0.0 }
+        let confs: List[float] = []
+
+        for i in range(min(3, len(concepts))) {
+            let c = concepts[i]
+            let causes = self._graph.incoming(c, RelationType.CAUSES)
+            for e in causes {
+                dim.root_causes.append(e.source)
+                confs.append(e.confidence)
+            }
+
+            let effects = self._graph.outgoing(c, RelationType.CAUSES)
+            for e in effects {
+                dim.effects.append(e.target)
+                confs.append(e.confidence)
+            }
+
+            let fwd = self._engine.forward(c, 3)
+            for inf in fwd {
+                if len(inf.path) > 1 {
+                    dim.chains.append(inf.path)
+                    confs.append(inf.confidence)
+                }
+            }
+        }
+
+        if len(confs) > 0 {
+            let total = 0.0
+            for c in confs {
+                total += c
+            }
+            dim.confidence = total / len(confs)
+        }
+        return dim
+    }
+
+    fn _build_temporal(self, concepts: List[string]) -> TemporalDimension {
+        let dim = TemporalDimension { facts: [], timeline: [], is_current: None }
+
+        for i in range(min(3, len(concepts))) {
+            let c = concepts[i]
+            let tf = self._temporal.get_fact(c)
+            if tf != None and tf.has_time {
+                let start_str = "?"
+                if tf.year_start != None {
+                    start_str = str(tf.year_start)
+                }
+                let end_str = "present"
+                if tf.year_end != None {
+                    end_str = str(tf.year_end)
+                }
+                dim.facts.append({
+                    "concept": c,
+                    "info": start_str + "–" + end_str
+                })
+                if dim.is_current == None {
+                    dim.is_current = tf.is_current()
+                }
+            }
+        }
+
+        if len(concepts) > 0 {
+            dim.timeline = self._temporal.timeline(concepts)
+        }
+
+        return dim
+    }
+
+    fn _build_quantitative(self, concepts: List[string]) -> QuantitativeDimension {
+        let dim = QuantitativeDimension { quantities: [], comparisons: [] }
+
+        for i in range(min(3, len(concepts))) {
+            let c = concepts[i]
+            let qs = self._quantitative.get_quantities(c)
+            for j in range(min(2, len(qs))) {
+                dim.quantities.append({"concept": c, "value": str(qs[j])})
+            }
+        }
+
+        if len(concepts) >= 2 {
+            let comp = self._quantitative.compare(concepts[0], concepts[1])
+            if comp != None {
+                dim.comparisons.append(comp)
+            }
+        }
+
+        return dim
+    }
+
+    fn _build_social(self, concepts: List[string], user_id: string) -> SocialDimension {
+        let dim = SocialDimension { perspectives: {}, consensus: None, disagreements: [] }
+
+        for agent_id in self._social.beliefs._agents {
+            let agent_model = self._social.beliefs._agents[agent_id]
+            for c in concepts {
+                let belief = agent_model.beliefs.get(c)
+                if belief != None {
+                    dim.perspectives[agent_id] = belief.belief.value + " (conf " + str(round(belief.confidence, 2)) + ")"
+                }
+            }
+        }
+
+        return dim
+    }
+
+    fn _build_commonsense(self, concepts: List[string]) -> CommonSenseDimension {
+        let dim = CommonSenseDimension { properties: [], defaults: [] }
+
+        if self._commonsense == None {
+            return dim
+        }
+
+        for i in range(min(3, len(concepts))) {
+            let c = concepts[i]
+            let props = self._commonsense.what_properties(c)
+            for j in range(min(3, len(props))) {
+                let prop = props[j][0]
+                let conf = props[j][1]
+                let source = props[j][2]
+                dim.properties.append((c, prop + " (" + str(round(conf, 2)) + ", " + source + ")"))
+            }
+        }
+
+        return dim
+    }
+}
+
+/// ---------- Gate ----------
+
+gate synthesis_gate(data: raw[SynthesizedAnswer]) -> validated[SynthesizedAnswer] {
+    require confidence >= 0.3
+    validate dimension_check
+    validate consistency_check
+}
+
+/// ---------- Exports ----------
+
+export CausalDimension, TemporalDimension, QuantitativeDimension
+export SocialDimension, CommonSenseDimension, ConfidenceDimension
+export SynthesizedAnswer
+export causal_text, temporal_text, quantitative_text, social_text
+export commonsense_text, confidence_text
+export synthesized_full_text, synthesized_flat_text, synthesized_dimension_count
+export ReasoningSynthesizer
+export synthesis_gate

@@ -1,0 +1,700 @@
+/// NRS Sandboxed Code Executor — Actual Computation for Intelligence.
+///
+/// Math solving, unit conversions, sandboxed execution with security layers,
+/// static analysis, timeout, and output truncation.
+
+module code_executor
+
+import re from "std/regex"
+import math from "std/math"
+import time from "std/time"
+import logging from "std/logging"
+
+let logger = logging.getLogger("nrs.code-executor")
+
+/// ── Data Structures ────────────────────────────────────────────────────
+
+type ExecutionResult {
+    success: bool,
+    output: any,
+    stdout: string,
+    error: string,
+    execution_time_ms: float
+}
+
+fn execution_result_to_dict(r: ExecutionResult) -> Dict[string, any] {
+    let out_repr = None
+    if r.output != None {
+        out_repr = repr(r.output)
+    }
+    let stdout_val = ""
+    if r.stdout != "" {
+        stdout_val = r.stdout[0:2000]
+    }
+    return {
+        "success": r.success,
+        "output": out_repr,
+        "stdout": stdout_val,
+        "error": r.error,
+        "execution_time_ms": r.execution_time_ms
+    }
+}
+
+/// ── Sandbox Definitions ────────────────────────────────────────────────
+
+let SAFE_MODULES: Set[string] = Set.of(
+    "math", "statistics", "fractions", "decimal",
+    "collections", "itertools", "functools", "operator",
+    "datetime", "json", "re", "random"
+)
+
+let SAFE_BUILTIN_NAMES: Set[string] = Set.of(
+    "abs", "all", "any", "bin", "bool", "bytes", "bytearray",
+    "chr", "complex", "dict", "divmod", "enumerate", "filter",
+    "float", "format", "frozenset", "hash", "hex", "int",
+    "isinstance", "issubclass", "iter", "len", "list", "map",
+    "max", "memoryview", "min", "next", "oct", "ord", "pow",
+    "print", "range", "repr", "reversed", "round", "set",
+    "slice", "sorted", "str", "sum", "tuple", "type", "zip"
+)
+
+let HARD_FORBIDDEN: List[string] = [
+    "__(?:subclasses|bases|mro|globals|builtins|import|code|func|loader|spec|qualname)__",
+    "\\bos\\b\\s*\\.\\s*(?:system|popen|exec|fork|kill|remove|unlink|rmdir|rename|mkdir|chdir|getcwd|environ|path|listdir|walk|scandir|getenv|putenv)",
+    "\\bsubprocess\\b",
+    "\\bsocket\\b",
+    "\\bshutil\\b",
+    "\\bpathlib\\b",
+    "\\bctypes\\b",
+    "\\bsignal\\b",
+    "\\bimportlib\\b",
+    "\\b(?:open|file)\\s*\\(",
+    "\\bsys\\b\\s*\\.\\s*(?:exit|modules|path|stdin|stdout|stderr|_getframe|settrace|setprofile)",
+    "\\b(?:eval|exec|compile|execfile)\\s*\\(",
+    "\\b(?:getattr|setattr|delattr)\\s*\\(",
+    "\\b(?:globals|locals|vars)\\s*\\(\\s*\\)",
+    "\\bbreakpoint\\s*\\(",
+    "\\binput\\s*\\("
+]
+
+fn _make_restricted_import() -> fn {
+    fn _restricted_import(name: string) -> any {
+        if name not in SAFE_MODULES {
+            raise ImportError("Import of '" + name + "' is not allowed in sandbox")
+        }
+        return __real_import__(name)
+    }
+    return _restricted_import
+}
+
+fn _build_safe_builtins() -> Dict[string, any] {
+    let safe: Dict[string, any] = {}
+    for name in SAFE_BUILTIN_NAMES {
+        let obj = builtin_get(name)
+        if obj != None {
+            safe[name] = obj
+        }
+    }
+    safe["__import__"] = _make_restricted_import()
+    safe["__build_class__"] = builtin_get("__build_class__")
+    safe["True"] = true
+    safe["False"] = false
+    safe["None"] = None
+    safe["ArithmeticError"] = ArithmeticError
+    safe["ZeroDivisionError"] = ZeroDivisionError
+    safe["ValueError"] = ValueError
+    safe["TypeError"] = TypeError
+    safe["KeyError"] = KeyError
+    safe["IndexError"] = IndexError
+    safe["AttributeError"] = AttributeError
+    safe["RuntimeError"] = RuntimeError
+    safe["OverflowError"] = OverflowError
+    safe["StopIteration"] = StopIteration
+    safe["Exception"] = Exception
+    return safe
+}
+
+/// ── Code Executor ──────────────────────────────────────────────────────
+
+class CodeExecutor {
+    /// Sandboxed code execution with static analysis, restricted builtins,
+    /// restricted imports, timeout via threading, and output truncation.
+
+    fn __init__(self, timeout_seconds: float = 5.0, max_output_chars: int = 10000) {
+        self._timeout = timeout_seconds
+        self._max_output = max_output_chars
+        self._total_executions = 0
+        self._total_successes = 0
+        self._total_failures = 0
+        self._total_timeouts = 0
+    }
+
+    fn execute(self, code: string) -> ExecutionResult {
+        let t0 = time.monotonic()
+        self._total_executions += 1
+
+        let violation = _static_check(code)
+        if violation != None {
+            self._total_failures += 1
+            return ExecutionResult {
+                success: false, output: None, stdout: "",
+                error: "Security violation: " + violation,
+                execution_time_ms: (time.monotonic() - t0) * 1000
+            }
+        }
+
+        let sandbox_globals = _build_sandbox()
+        let stdout_buf = StringIO.new()
+        let holder: Dict[string, any] = {"value": None, "error": None}
+
+        try {
+            let result_val = sandbox_exec(code, sandbox_globals, stdout_buf, self._timeout)
+            holder["value"] = result_val
+        } catch(timeout_err) {
+            if timeout_err is TimeoutError {
+                self._total_timeouts += 1
+                self._total_failures += 1
+                return ExecutionResult {
+                    success: false, output: None, stdout: "",
+                    error: "Execution timed out after " + string(self._timeout) + "s",
+                    execution_time_ms: (time.monotonic() - t0) * 1000
+                }
+            }
+            holder["error"] = type_name(timeout_err) + ": " + string(timeout_err)
+        }
+
+        let elapsed_ms = (time.monotonic() - t0) * 1000
+        let captured = stdout_buf.getvalue()
+        if captured.len() > self._max_output {
+            captured = captured[0:self._max_output] + "\n... [truncated]"
+        }
+
+        if holder["error"] != None {
+            self._total_failures += 1
+            return ExecutionResult {
+                success: false, output: None,
+                stdout: captured, error: holder["error"],
+                execution_time_ms: elapsed_ms
+            }
+        }
+
+        self._total_successes += 1
+
+        let output = holder["value"]
+        if output == None && captured.strip() != "" {
+            let last_line = captured.strip().rsplit("\n", 1)[-1]
+            try {
+                if "." in last_line {
+                    output = float(last_line)
+                } else {
+                    output = int(last_line)
+                }
+            } catch(e) {
+                output = last_line
+            }
+        }
+
+        return ExecutionResult {
+            success: true, output: output,
+            stdout: captured, error: "",
+            execution_time_ms: elapsed_ms
+        }
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        return {
+            "total_executions": self._total_executions,
+            "successes": self._total_successes,
+            "failures": self._total_failures,
+            "timeouts": self._total_timeouts,
+            "success_rate": self._total_successes / max(self._total_executions, 1)
+        }
+    }
+}
+
+fn _static_check(code: string) -> Optional[string] {
+    for pattern in HARD_FORBIDDEN {
+        let m = re.search(pattern, code)
+        if m != None {
+            return "Forbidden pattern: " + m.group()
+        }
+    }
+    return None
+}
+
+fn _build_sandbox() -> Dict[string, any] {
+    let sandbox: Dict[string, any] = {"__builtins__": _build_safe_builtins()}
+    for mod_name in SAFE_MODULES {
+        try {
+            sandbox[mod_name] = __real_import__(mod_name)
+        } catch(e) {
+            pass
+        }
+    }
+    return sandbox
+}
+
+/// ── Unit Conversions ───────────────────────────────────────────────────
+
+let UNIT_CONVERSIONS: Dict[string, float] = {
+    "miles:km": 1.60934, "km:miles": 0.621371,
+    "miles:meters": 1609.34, "meters:miles": 0.000621371,
+    "feet:meters": 0.3048, "meters:feet": 3.28084,
+    "inches:cm": 2.54, "cm:inches": 0.393701,
+    "yards:meters": 0.9144, "meters:yards": 1.09361,
+    "km:meters": 1000.0, "meters:km": 0.001,
+    "miles:feet": 5280.0, "feet:miles": 0.000189394,
+    "feet:inches": 12.0, "inches:feet": 0.0833333,
+    "pounds:kg": 0.453592, "kg:pounds": 2.20462,
+    "lbs:kg": 0.453592, "kg:lbs": 2.20462,
+    "ounces:grams": 28.3495, "grams:ounces": 0.035274,
+    "oz:grams": 28.3495, "grams:oz": 0.035274,
+    "kg:grams": 1000.0, "grams:kg": 0.001,
+    "tons:kg": 907.185, "kg:tons": 0.00110231,
+    "gallons:liters": 3.78541, "liters:gallons": 0.264172,
+    "cups:ml": 236.588, "ml:cups": 0.00422675,
+    "liters:ml": 1000.0, "ml:liters": 0.001,
+    "mph:kph": 1.60934, "kph:mph": 0.621371,
+    "acres:hectares": 0.404686, "hectares:acres": 2.47105,
+    "sqft:sqm": 0.092903, "sqm:sqft": 10.7639
+}
+
+let UNIT_ALIASES: Dict[string, string] = {
+    "mi": "miles", "mile": "miles",
+    "kilometer": "km", "kilometers": "km", "kilometre": "km",
+    "meter": "meters", "metre": "meters", "metres": "meters",
+    "foot": "feet", "ft": "feet",
+    "inch": "inches", "in": "inches",
+    "yard": "yards", "yd": "yards",
+    "pound": "pounds", "lb": "lbs",
+    "ounce": "ounces", "gram": "grams",
+    "kilogram": "kg", "kilograms": "kg",
+    "ton": "tons",
+    "liter": "liters", "litre": "liters", "litres": "liters",
+    "gallon": "gallons", "cup": "cups",
+    "milliliter": "ml", "millilitre": "ml",
+    "milliliters": "ml", "millilitres": "ml",
+    "hectare": "hectares", "acre": "acres"
+}
+
+fn _resolve_unit(name: string) -> string {
+    return UNIT_ALIASES.get(name, name)
+}
+
+/// ── Regex Patterns for Math Parsing ────────────────────────────────────
+
+let PERCENT_PAT = re.compile("(?:what\\s+is\\s+)?(\\d+(?:\\.\\d+)?)\\s*%\\s+of\\s+(\\d+(?:\\.\\d+)?)", re.IGNORECASE)
+let TEMP_PAT = re.compile("(-?\\d+(?:\\.\\d+)?)\\s*°?\\s*(celsius|fahrenheit|kelvin|[CFK])\\s+(?:to|in)\\s+°?\\s*(celsius|fahrenheit|kelvin|[CFK])", re.IGNORECASE)
+let CONVERT_PAT = re.compile("(?:convert\\s+)?(-?\\d+(?:\\.\\d+)?)\\s+([\\w]+)\\s+(?:to|in|into)\\s+([\\w]+)", re.IGNORECASE)
+let QUADRATIC_PAT = re.compile("(?:solve\\s+)?(-?\\d*)\\s*x\\s*\\^?\\s*2\\s*([+-]\\s*\\d*\\s*x)?\\s*([+-]\\s*\\d+)?\\s*=\\s*0", re.IGNORECASE)
+let ARITH_PAT = re.compile("(?:what\\s+is\\s+|calculate\\s+|compute\\s+)?(-?\\d+(?:\\.\\d+)?)\\s*([+\\-*/^×÷])\\s*(-?\\d+(?:\\.\\d+)?)", re.IGNORECASE)
+let FACTORIAL_PAT = re.compile("(?:what\\s+is\\s+)?(\\d+)\\s*!|factorial\\s+(?:of\\s+)?(\\d+)", re.IGNORECASE)
+let COMBINATION_PAT = re.compile("(?:how\\s+many\\s+)?(?:combinations?|C)\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)|(\\d+)\\s*(?:choose|C)\\s*(\\d+)", re.IGNORECASE)
+let PERMUTATION_PAT = re.compile("(?:how\\s+many\\s+)?(?:permutations?|P)\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)|(\\d+)\\s*P\\s*(\\d+)", re.IGNORECASE)
+let STATS_PAT = re.compile("(?:(?:find|calculate|compute|what\\s+is)\\s+(?:the\\s+)?)(mean|average|median|mode|std|standard\\s+deviation|variance|sum)\\s+of\\s+(.+)", re.IGNORECASE)
+let CIRCLE_AREA_PAT = re.compile("area\\s+of\\s+(?:a\\s+)?circle\\s+(?:with\\s+)?(?:radius|r)\\s*=?\\s*(\\d+(?:\\.\\d+)?)", re.IGNORECASE)
+let SPHERE_VOL_PAT = re.compile("volume\\s+of\\s+(?:a\\s+)?sphere\\s+(?:with\\s+)?(?:radius|r)\\s*=?\\s*(\\d+(?:\\.\\d+)?)", re.IGNORECASE)
+let COMPOUND_PAT = re.compile("compound\\s+interest.*?(?:principal|amount)\\s*=?\\s*\\$?(\\d+(?:,?\\d+)*(?:\\.\\d+)?).*?rate\\s*=?\\s*(\\d+(?:\\.\\d+)?)%?.*?(?:years?|time|period)\\s*=?\\s*(\\d+(?:\\.\\d+)?)", re.IGNORECASE)
+let RAW_EXPR = re.compile("^[\\d\\s+\\-*/().^%]+$")
+
+let COMPUTATION_INDICATORS: List[string] = [
+    "\\b\\d+\\s*[+\\-*/^×÷%]\\s*\\d+\\b",
+    "\\b(?:calculate|compute|solve|evaluate|what\\s+is|how\\s+(?:much|many)|convert)\\b",
+    "\\b\\d+(?:\\.\\d+)?\\s*%\\s+of\\b",
+    "\\b(?:factorial|permutation|combination|mean|median|average|std|variance)\\b",
+    "\\b(?:area|volume|circumference|perimeter|distance|radius)\\b",
+    "\\b(?:compound\\s+interest|NPV|ROI|mortgage|loan)\\b",
+    "\\b\\d+\\s+(?:\\w+)\\s+(?:to|in|into)\\s+(?:\\w+)\\b",
+    "\\bx\\s*\\^?\\s*\\d+\\b",
+    "\\b\\d+\\s*!",
+    "[CP]\\s*\\(\\s*\\d+\\s*,\\s*\\d+\\s*\\)",
+    "\\b\\d+\\s+(?:choose|C|P)\\s+\\d+\\b"
+]
+
+/// ── Math Solver ────────────────────────────────────────────────────────
+
+class MathSolver {
+    /// Solve mathematical problems by parsing and computing.
+
+    fn __init__(self) {
+        self._executor = CodeExecutor(5.0, 10000)
+        self._total_solved = 0
+        self._total_failed = 0
+    }
+
+    fn solve(self, problem: string) -> ExecutionResult {
+        problem = problem.strip()
+        if problem == "" {
+            return ExecutionResult {
+                success: false, output: None, stdout: "",
+                error: "Empty problem", execution_time_ms: 0.0
+            }
+        }
+
+        let expression = self._extract_math_expression(problem)
+        if expression == None {
+            self._total_failed += 1
+            return ExecutionResult {
+                success: false, output: None, stdout: "",
+                error: "Could not parse mathematical expression from input",
+                execution_time_ms: 0.0
+            }
+        }
+
+        let code = self._generate_code(expression)
+        let result = self._executor.execute(code)
+
+        if result.success {
+            self._total_solved += 1
+        } else {
+            self._total_failed += 1
+        }
+        return result
+    }
+
+    fn _extract_math_expression(self, text: string) -> Optional[string] {
+        let m = PERCENT_PAT.search(text)
+        if m != None {
+            return "percent:" + m.group(1) + ":" + m.group(2)
+        }
+
+        m = TEMP_PAT.search(text)
+        if m != None {
+            return "temp:" + m.group(1) + ":" + m.group(2)[0].upper() + ":" + m.group(3)[0].upper()
+        }
+
+        m = CONVERT_PAT.search(text)
+        if m != None {
+            return "convert:" + m.group(1) + ":" + m.group(2).lower() + ":" + m.group(3).lower()
+        }
+
+        m = QUADRATIC_PAT.search(text)
+        if m != None {
+            let parsed = _parse_quadratic_groups(m)
+            return "quadratic:" + string(parsed[0]) + ":" + string(parsed[1]) + ":" + string(parsed[2])
+        }
+
+        m = FACTORIAL_PAT.search(text)
+        if m != None {
+            let val = m.group(1)
+            if val == None { val = m.group(2) }
+            return "factorial:" + val
+        }
+
+        m = COMBINATION_PAT.search(text)
+        if m != None {
+            let n = m.group(1)
+            if n == None { n = m.group(3) }
+            let k = m.group(2)
+            if k == None { k = m.group(4) }
+            return "combination:" + n + ":" + k
+        }
+
+        m = PERMUTATION_PAT.search(text)
+        if m != None {
+            let n = m.group(1)
+            if n == None { n = m.group(3) }
+            let k = m.group(2)
+            if k == None { k = m.group(4) }
+            return "permutation:" + n + ":" + k
+        }
+
+        m = STATS_PAT.search(text)
+        if m != None {
+            let fn_name = m.group(1).lower()
+            fn_name = fn_name.replace("standard deviation", "std").replace("average", "mean")
+            return "stats:" + fn_name + ":" + m.group(2)
+        }
+
+        m = CIRCLE_AREA_PAT.search(text)
+        if m != None {
+            return "circle_area:" + m.group(1)
+        }
+
+        m = SPHERE_VOL_PAT.search(text)
+        if m != None {
+            return "sphere_volume:" + m.group(1)
+        }
+
+        m = COMPOUND_PAT.search(text)
+        if m != None {
+            return "compound:" + m.group(1).replace(",", "") + ":" + m.group(2) + ":" + m.group(3)
+        }
+
+        m = ARITH_PAT.search(text)
+        if m != None {
+            let op = m.group(2).replace("×", "*").replace("÷", "/").replace("^", "**")
+            return "arith:" + m.group(1) + ":" + op + ":" + m.group(3)
+        }
+
+        let cleaned = text.lower()
+        let prefixes = ["what is", "calculate", "compute", "evaluate", "find"]
+        for prefix in prefixes {
+            if cleaned.startswith(prefix) {
+                cleaned = cleaned[prefix.len():].strip()
+            }
+        }
+        cleaned = cleaned.rstrip("?. ")
+        if cleaned != "" && RAW_EXPR.match(cleaned) != None {
+            return "raw:" + cleaned.replace("^", "**")
+        }
+
+        return None
+    }
+
+    fn _generate_code(self, expression: string) -> string {
+        let idx = expression.index(":")
+        let tag = expression[0:idx]
+        let params = expression[idx + 1:]
+
+        if tag == "percent" {
+            let parts = params.split(":")
+            let pct = parts[0]
+            let base = parts[1]
+            return "_result_ = " + base + " * " + pct + " / 100\nprint(str(" + pct + ") + '% of ' + str(" + base + ") + ' = ' + str(_result_))"
+        }
+
+        if tag == "temp" {
+            let parts = params.split(":")
+            return _temp_code(float(parts[0]), parts[1], parts[2])
+        }
+
+        if tag == "convert" {
+            let parts = params.split(":")
+            return _convert_code(float(parts[0]), parts[1], parts[2])
+        }
+
+        if tag == "quadratic" {
+            let parts = params.split(":")
+            return "import math\na, b, c = " + parts[0] + ", " + parts[1] + ", " + parts[2] + "\ndisc = b**2 - 4*a*c\nif disc < 0:\n    _result_ = 'No real solutions (discriminant = ' + str(disc) + ')'\nelif disc == 0:\n    x = -b / (2*a)\n    _result_ = (round(x, 10),)\n    print('x = ' + str(x))\nelse:\n    x1 = (-b + math.sqrt(disc)) / (2*a)\n    x2 = (-b - math.sqrt(disc)) / (2*a)\n    _result_ = (round(x1, 10), round(x2, 10))\n    print('x1 = ' + str(x1) + ', x2 = ' + str(x2))\n"
+        }
+
+        if tag == "factorial" {
+            return "import math\n_result_ = math.factorial(" + params + ")\nprint(_result_)"
+        }
+
+        if tag == "combination" {
+            let parts = params.split(":")
+            return "import math\n_result_ = math.comb(" + parts[0] + ", " + parts[1] + ")\nprint('C(" + parts[0] + "," + parts[1] + ") = ' + str(_result_))"
+        }
+
+        if tag == "permutation" {
+            let parts = params.split(":")
+            return "import math\n_result_ = math.perm(" + parts[0] + ", " + parts[1] + ")\nprint('P(" + parts[0] + "," + parts[1] + ") = ' + str(_result_))"
+        }
+
+        if tag == "stats" {
+            let split_idx = params.index(":")
+            let fn_name = params[0:split_idx]
+            let numbers_str = params[split_idx + 1:]
+            let nums = re.findall("-?\\d+(?:\\.\\d+)?", numbers_str)
+            let nums_list = nums.join(", ")
+            let lines: List[string] = ["import statistics", "data = [" + nums_list + "]"]
+            let fn_map: Dict[string, string] = {
+                "mean": "_result_ = statistics.mean(data)",
+                "median": "_result_ = statistics.median(data)",
+                "mode": "_result_ = statistics.mode(data)",
+                "std": "_result_ = statistics.stdev(data) if len(data) > 1 else 0.0",
+                "stdev": "_result_ = statistics.stdev(data) if len(data) > 1 else 0.0",
+                "variance": "_result_ = statistics.variance(data) if len(data) > 1 else 0.0",
+                "sum": "_result_ = sum(data)"
+            }
+            lines.append(fn_map.get(fn_name, "_result_ = statistics.mean(data)"))
+            lines.append("print(_result_)")
+            return lines.join("\n")
+        }
+
+        if tag == "circle_area" {
+            return "import math\nr = " + params + "\n_result_ = math.pi * r**2\nprint('Area = ' + str(round(_result_, 6)))"
+        }
+
+        if tag == "sphere_volume" {
+            return "import math\nr = " + params + "\n_result_ = (4/3) * math.pi * r**3\nprint('Volume = ' + str(round(_result_, 6)))"
+        }
+
+        if tag == "compound" {
+            let parts = params.split(":")
+            return "P, r, t = " + parts[0] + ", " + parts[1] + "/100, " + parts[2] + "\n_result_ = P * (1 + r) ** t\nprint('Future value = ' + str(round(_result_, 2)))"
+        }
+
+        if tag == "arith" {
+            let parts = params.split(":")
+            return "_result_ = " + parts[0] + " " + parts[1] + " " + parts[2] + "\nprint(_result_)"
+        }
+
+        if tag == "raw" {
+            return "_result_ = " + params + "\nprint(_result_)"
+        }
+
+        return "_result_ = None"
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        return {
+            "total_solved": self._total_solved,
+            "total_failed": self._total_failed,
+            "success_rate": self._total_solved / max(self._total_solved + self._total_failed, 1)
+        }
+    }
+}
+
+fn _temp_code(val: float, from_u: string, to_u: string) -> string {
+    let conversions: Dict[string, string] = {
+        "C:F": "_result_ = " + string(val) + " * 9/5 + 32",
+        "F:C": "_result_ = (" + string(val) + " - 32) * 5/9",
+        "C:K": "_result_ = " + string(val) + " + 273.15",
+        "K:C": "_result_ = " + string(val) + " - 273.15",
+        "F:K": "_result_ = (" + string(val) + " - 32) * 5/9 + 273.15",
+        "K:F": "_result_ = (" + string(val) + " - 273.15) * 9/5 + 32"
+    }
+    let key = from_u + ":" + to_u
+    let expr = conversions.get(key, None)
+    if expr == None {
+        if from_u == to_u {
+            expr = "_result_ = " + string(val)
+        } else {
+            return "_result_ = 'Unknown temperature conversion: " + from_u + " to " + to_u + "'"
+        }
+    }
+    return expr + "\nprint(str(" + string(val) + ") + '°" + from_u + " = ' + str(round(_result_, 4)) + '°" + to_u + "')"
+}
+
+fn _convert_code(val: float, from_u: string, to_u: string) -> string {
+    let resolved_from = _resolve_unit(from_u)
+    let resolved_to = _resolve_unit(to_u)
+
+    let keys_to_try = [from_u + ":" + to_u, resolved_from + ":" + resolved_to]
+    for key in keys_to_try {
+        let factor = UNIT_CONVERSIONS.get(key, None)
+        if factor != None {
+            return "_result_ = " + string(val) + " * " + string(factor) + "\nprint(str(" + string(val) + ") + ' " + from_u + " = ' + str(round(_result_, 6)) + ' " + to_u + "')"
+        }
+    }
+
+    return "_result_ = 'Unknown conversion: " + from_u + " to " + to_u + "'"
+}
+
+fn _parse_quadratic_groups(m: any) -> List[any] {
+    let a_str = m.group(1)
+    if a_str == None { a_str = "" }
+    a_str = a_str.strip()
+    if a_str == "" || a_str == "+" {
+        a_str = "1"
+    } else if a_str == "-" {
+        a_str = "-1"
+    }
+
+    let b = 0.0
+    if m.group(2) != None {
+        let b_str = m.group(2).replace("x", "").replace(" ", "")
+        if b_str == "" || b_str == "+" {
+            b = 1.0
+        } else if b_str == "-" {
+            b = -1.0
+        } else {
+            b = float(b_str)
+        }
+    }
+
+    let c = 0.0
+    if m.group(3) != None {
+        c = float(m.group(3).replace(" ", ""))
+    }
+
+    return [float(a_str), b, c]
+}
+
+/// ── Computation Engine (Unified Interface) ─────────────────────────────
+
+class ComputationEngine {
+    /// Unified computation engine for NRS.
+    /// Routes queries to the appropriate solver.
+
+    fn __init__(self) {
+        self._math = MathSolver()
+        self._executor = CodeExecutor(5.0, 10000)
+        self._total_queries = 0
+        self._total_computed = 0
+        self._total_skipped = 0
+    }
+
+    fn can_compute(self, query: string) -> bool {
+        for pattern in COMPUTATION_INDICATORS {
+            if re.search(pattern, query, re.IGNORECASE) != None {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn compute(self, query: string) -> Optional[ExecutionResult] {
+        self._total_queries += 1
+        if !self.can_compute(query) {
+            self._total_skipped += 1
+            return None
+        }
+
+        let result = self._math.solve(query)
+        if result.success {
+            self._total_computed += 1
+        }
+        return result
+    }
+
+    fn execute_code(self, code: string) -> ExecutionResult {
+        return self._executor.execute(code)
+    }
+
+    fn solve_step_by_step(self, problem: string) -> List[any] {
+        let steps: List[Dict[string, string]] = [
+            {"step": "Parse", "description": "Analyzing: " + problem}
+        ]
+
+        let expr = self._math._extract_math_expression(problem)
+        if expr == None {
+            steps.append({"step": "Error", "description": "Could not parse mathematical expression"})
+            return steps
+        }
+
+        let tag_end = expr.index(":")
+        steps.append({"step": "Identify", "description": "Expression type: " + expr[0:tag_end]})
+
+        let code = self._math._generate_code(expr)
+        steps.append({"step": "Generate", "description": "Generated computation code", "code": code})
+
+        let result = self._executor.execute(code)
+
+        if result.success {
+            steps.append({
+                "step": "Compute",
+                "description": "Result: " + string(result.output),
+                "stdout": result.stdout
+            })
+        } else {
+            steps.append({
+                "step": "Error",
+                "description": "Computation failed: " + result.error
+            })
+        }
+
+        steps.append({
+            "step": "Done",
+            "description": "Completed in " + format(result.execution_time_ms, ".1f") + "ms"
+        })
+
+        return steps
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        return {
+            "total_queries": self._total_queries,
+            "computed": self._total_computed,
+            "skipped": self._total_skipped,
+            "compute_rate": self._total_computed / max(self._total_queries, 1),
+            "math_solver": self._math.stats(),
+            "executor": self._executor.stats()
+        }
+    }
+}
+
+export ExecutionResult, MathSolver, CodeExecutor, ComputationEngine

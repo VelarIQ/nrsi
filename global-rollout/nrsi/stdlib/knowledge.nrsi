@@ -1,0 +1,78 @@
+/// NRSI Knowledge Lifecycle -- Versioned Knowledge Pattern Management
+
+module knowledge
+
+import NRSIData, TrustLevel, TemporalValidity from "types"
+
+/// ---------- Enumerations ----------
+
+enum KnowledgeState {
+    CANDIDATE,
+    ACTIVE,
+    DEPRECATED,
+    ARCHIVED,
+    RETRACTED
+}
+
+/// ---------- Core Types ----------
+
+type KnowledgePattern {
+    key: string,
+    value: NRSIData,
+    version: int,
+    state: KnowledgeState,
+    domain: string,
+    source: string,
+    confidence: float,
+    temporal: TemporalValidity,
+    access_count: int,
+    superseded_by: string
+}
+
+/// ---------- Lifecycle Functions ----------
+
+fn ingest(key: string, value: NRSIData, domain: string) -> KnowledgePattern {
+    require value.confidence >= 0.3
+    return KnowledgePattern {
+        key: key,
+        value: value,
+        version: 1,
+        state: KnowledgeState.CANDIDATE,
+        domain: domain,
+        source: "",
+        confidence: value.confidence,
+        temporal: TemporalValidity.CURRENT,
+        access_count: 0,
+        superseded_by: ""
+    }
+}
+
+fn promote(pattern: KnowledgePattern) -> KnowledgePattern {
+    require pattern.state == KnowledgeState.CANDIDATE
+    require pattern.confidence >= 0.70
+    return pattern
+}
+
+fn deprecate(pattern: KnowledgePattern, reason: string) -> KnowledgePattern {
+    require pattern.state == KnowledgeState.ACTIVE
+    return pattern
+}
+
+fn retract(pattern: KnowledgePattern) -> KnowledgePattern {
+    return pattern
+}
+
+/// ---------- Norms ----------
+
+norm no_retracted_in_answers {
+    type: prohibition,
+    scope: global,
+    action: "use_in_response",
+    priority: 95,
+    condition: pattern.state == KnowledgeState.RETRACTED
+}
+
+/// ---------- Exports ----------
+
+export KnowledgeState, KnowledgePattern
+export ingest, promote, deprecate, retract

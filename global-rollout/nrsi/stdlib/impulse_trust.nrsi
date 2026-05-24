@@ -1,0 +1,66 @@
+/// NRSI Impulse Trust -- Inter-Impulse Trust Contracts
+
+module impulse_trust
+
+import TrustLevel from "types"
+
+/// ---------- Enumerations ----------
+
+enum TrustTier {
+    UNTRUSTED,
+    PROVISIONAL,
+    VERIFIED,
+    CERTIFIED,
+    SOVEREIGN
+}
+
+/// ---------- Core Types ----------
+
+type TrustRecord {
+    instance_id: string,
+    tier: TrustTier,
+    successful_queries: int,
+    failed_queries: int,
+    domains_authorized: List[string],
+    reputation_score: float
+}
+
+/// ---------- Trust Functions ----------
+
+fn evaluate_trust(record: TrustRecord) -> TrustTier {
+    return record.tier
+}
+
+fn promote_trust(record: TrustRecord) -> TrustRecord {
+    require record.successful_queries > 10
+    require record.reputation_score >= 0.8
+    return record
+}
+
+fn demote_trust(record: TrustRecord, reason: string) -> TrustRecord {
+    require record.tier != TrustTier.UNTRUSTED
+    return record
+}
+
+/// ---------- Norms ----------
+
+norm no_untrusted_in_high_risk {
+    type: prohibition,
+    scope: domain("medical"),
+    action: "accept_result",
+    priority: 100,
+    condition: source.tier == TrustTier.UNTRUSTED
+}
+
+norm require_domain_authorization {
+    type: obligation,
+    scope: global,
+    action: "federated_query",
+    priority: 90,
+    condition: domain in source.domains_authorized
+}
+
+/// ---------- Exports ----------
+
+export TrustTier, TrustRecord
+export evaluate_trust, promote_trust, demote_trust

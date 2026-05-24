@@ -1,0 +1,97 @@
+/// NRSI Signals -- Inhibition, Amplification, and Routing Signals
+
+module signals
+
+import NRSIData from "types"
+
+/// ---------- Enumerations ----------
+
+enum SignalType {
+    INHIBIT,
+    AMPLIFY,
+    GATE,
+    MODULATE,
+    SUPPRESS,
+    PRIME
+}
+
+enum SignalPriority {
+    CRITICAL,
+    HIGH,
+    NORMAL,
+    LOW,
+    BACKGROUND
+}
+
+/// ---------- Core Types ----------
+
+type Signal {
+    signal_type: SignalType,
+    source: string,
+    target: string,
+    strength: float,
+    priority: SignalPriority,
+    reason: string,
+    ttl_ms: float,
+    audit_id: string
+}
+
+/// ---------- Signal Functions ----------
+
+fn inhibit(target: string, strength: float, reason: string) -> Signal {
+    require strength >= 0.0
+    require strength <= 1.0
+    return Signal {
+        signal_type: SignalType.INHIBIT,
+        source: "normative",
+        target: target,
+        strength: strength,
+        priority: SignalPriority.HIGH,
+        reason: reason,
+        ttl_ms: 5000.0,
+        audit_id: ""
+    }
+}
+
+fn amplify(target: string, strength: float, reason: string) -> Signal {
+    require strength >= 0.0
+    require strength <= 2.0
+    return Signal {
+        signal_type: SignalType.AMPLIFY,
+        source: "attention",
+        target: target,
+        strength: strength,
+        priority: SignalPriority.NORMAL,
+        reason: reason,
+        ttl_ms: 5000.0,
+        audit_id: ""
+    }
+}
+
+fn suppress_domain(domain: string, reason: string) -> Signal {
+    return Signal {
+        signal_type: SignalType.SUPPRESS,
+        source: "safety",
+        target: domain,
+        strength: 1.0,
+        priority: SignalPriority.CRITICAL,
+        reason: reason,
+        ttl_ms: 30000.0,
+        audit_id: ""
+    }
+}
+
+/// ---------- Norms ----------
+
+norm safety_inhibition_overrides {
+    type: obligation,
+    scope: global,
+    action: "process_signal",
+    priority: 100,
+    condition: signal.priority == SignalPriority.CRITICAL
+}
+
+/// ---------- Exports ----------
+
+export SignalType, SignalPriority, Signal
+export inhibit, amplify, suppress_domain

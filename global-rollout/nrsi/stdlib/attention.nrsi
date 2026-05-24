@@ -1,0 +1,59 @@
+/// NRSI Attention — Focus Policy and Resource Allocation Norms
+///
+/// Declares how attentional resources are allocated across
+/// lobes, domains, and concurrent queries.
+
+module attention
+
+import NRSIData from "types"
+
+/// ---------- Attention Types ----------
+
+enum AttentionMode {
+    FOCUSED,
+    DISTRIBUTED,
+    SELECTIVE,
+    SUSTAINED,
+    DIVIDED
+}
+
+type AttentionAllocation {
+    mode: AttentionMode,
+    primary_lobe: String,
+    resource_fraction: Float,
+    timeout_ms: Int
+}
+
+/// ---------- Attention Norms ----------
+
+norm safety_gets_priority_attention {
+    type: obligation,
+    scope: global,
+    action: "prioritize_safety_check",
+    priority: 100,
+    condition: true
+}
+
+norm no_attention_starvation {
+    type: prohibition,
+    scope: global,
+    action: "starve_secondary_lobes",
+    priority: 80,
+    condition: resource_fraction < 0.05
+}
+
+norm timeout_prevents_hang {
+    type: obligation,
+    scope: global,
+    action: "enforce_timeout",
+    priority: 90,
+    condition: timeout_ms > 0
+}
+
+/// ---------- Attention Gate ----------
+
+gate attention_gate(data: raw[NRSIData]) -> validated[NRSIData] {
+    require data.domain != "unknown"
+    validate attention_allocated
+    validate no_starvation
+}

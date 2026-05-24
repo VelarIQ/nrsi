@@ -1,0 +1,812 @@
+/// NRS Self-Improvement Loop — Autonomous Performance Enhancement.
+///
+/// 1. Monitors performance across interactions
+/// 2. Detects systematic patterns of failure
+/// 3. Generates hypotheses about why it's failing
+/// 4. Tests whether improvements are working
+/// 5. Automatically adjusts system parameters
+/// 6. Builds a meta-knowledge base about its own capabilities
+///
+/// Loop: interact -> measure -> detect weakness -> hypothesize -> adjust -> measure again
+
+module self_improvement
+
+import hashlib from "std/hash"
+import json from "std/json"
+import logging from "std/logging"
+import math from "std/math"
+import time from "std/time"
+
+let logger = logging.getLogger("nrs.self_improvement")
+
+/// ── Metric Types ───────────────────────────────────────────────────────
+
+enum MetricType {
+    CONFIDENCE,
+    LATENCY,
+    FACT_HIT_RATE,
+    USER_SATISFACTION,
+    CONTRADICTION_RATE,
+    KNOWLEDGE_GAP_RATE
+}
+
+/// ── Data Objects ───────────────────────────────────────────────────────
+
+type InteractionRecord {
+    query: string,
+    domain: string,
+    mode: string,
+    confidence: float,
+    latency_ms: float,
+    had_facts: bool,
+    had_web_facts: bool,
+    had_computation: bool,
+    had_logic_proof: bool,
+    plan_used: bool,
+    response_length: int,
+    timestamp: float,
+    user_feedback: Optional[string],
+    failure_reason: Optional[string]
+}
+
+fn new_interaction_record(query: string, domain: string, mode: string, confidence: float, latency_ms: float, had_facts: bool, had_web_facts: bool, had_computation: bool, had_logic_proof: bool, plan_used: bool, response_length: int) -> InteractionRecord {
+    return InteractionRecord {
+        query: query,
+        domain: domain,
+        mode: mode,
+        confidence: confidence,
+        latency_ms: latency_ms,
+        had_facts: had_facts,
+        had_web_facts: had_web_facts,
+        had_computation: had_computation,
+        had_logic_proof: had_logic_proof,
+        plan_used: plan_used,
+        response_length: response_length,
+        timestamp: time.time(),
+        user_feedback: None,
+        failure_reason: None
+    }
+}
+
+
+type Weakness {
+    weakness_type: string,
+    domain: string,
+    severity: float,
+    sample_size: int,
+    metric_value: float,
+    metric_name: string,
+    description: string,
+    detected_at: float
+}
+
+fn new_weakness(weakness_type: string, domain: string, severity: float, sample_size: int, metric_value: float, metric_name: string, description: string) -> Weakness {
+    return Weakness {
+        weakness_type: weakness_type,
+        domain: domain,
+        severity: severity,
+        sample_size: sample_size,
+        metric_value: metric_value,
+        metric_name: metric_name,
+        description: description,
+        detected_at: time.time()
+    }
+}
+
+
+class Hypothesis {
+    fn new(hypothesis_id: string, weakness: Weakness, proposed_action: string, parameter_changes: Dict[string, any], expected_improvement: float, baseline_metric: float) -> Hypothesis {
+        let h = Hypothesis {}
+        h.hypothesis_id = hypothesis_id
+        h.weakness = weakness
+        h.proposed_action = proposed_action
+        h.parameter_changes = parameter_changes
+        h.expected_improvement = expected_improvement
+        h.baseline_metric = baseline_metric
+        h.status = "proposed"
+        h.test_start = None
+        h.test_results = []
+        h.created_at = time.time()
+        return h
+    }
+}
+
+
+type ImprovementResult {
+    improvements_applied: int,
+    weaknesses_detected: int,
+    hypotheses_generated: int,
+    hypotheses_confirmed: int,
+    hypotheses_rejected: int,
+    parameter_adjustments: Dict[string, any],
+    summary: string
+}
+
+
+/// ── Welford Accumulator ────────────────────────────────────────────────
+
+class WelfordAccumulator {
+    fn new() -> WelfordAccumulator {
+        let w = WelfordAccumulator {}
+        w.count = 0
+        w._mean = 0.0
+        w._m2 = 0.0
+        return w
+    }
+
+    fn update(self, value: float) -> void {
+        self.count += 1
+        let delta = value - self._mean
+        self._mean += delta / self.count
+        let delta2 = value - self._mean
+        self._m2 += delta * delta2
+    }
+
+    fn mean(self) -> float {
+        if self.count > 0 { return self._mean }
+        return 0.0
+    }
+
+    fn variance(self) -> float {
+        if self.count > 1 { return self._m2 / self.count }
+        return 0.0
+    }
+
+    fn std(self) -> float {
+        if self.count > 1 { return math.sqrt(self.variance()) }
+        return 0.0
+    }
+}
+
+
+/// ── Performance Tracker ────────────────────────────────────────────────
+
+class PerformanceTracker {
+    fn new(window_size: int) -> PerformanceTracker {
+        let pt = PerformanceTracker {}
+        pt._window_size = window_size
+        pt._records = []
+        pt._domain_stats = {}
+        pt._mode_stats = {}
+        pt._domain_fact_hits = {}
+        pt._domain_computation_hits = {}
+        pt._overall = {
+            "confidence": WelfordAccumulator.new(),
+            "latency": WelfordAccumulator.new()
+        }
+        return pt
+    }
+
+    fn _ensure_domain_stats(self, domain: string) -> void {
+        if domain not in self._domain_stats {
+            self._domain_stats[domain] = {
+                "confidence": WelfordAccumulator.new(),
+                "latency": WelfordAccumulator.new()
+            }
+        }
+    }
+
+    fn _ensure_mode_stats(self, mode: string) -> void {
+        if mode not in self._mode_stats {
+            self._mode_stats[mode] = {
+                "confidence": WelfordAccumulator.new(),
+                "latency": WelfordAccumulator.new()
+            }
+        }
+    }
+
+    fn record(self, interaction: InteractionRecord) -> void {
+        self._records.append(interaction)
+        if self._records.len() > self._window_size {
+            self._records = self._records[-self._window_size:]
+        }
+
+        let d = interaction.domain
+        let m = interaction.mode
+        self._ensure_domain_stats(d)
+        self._ensure_mode_stats(m)
+
+        self._domain_stats[d]["confidence"].update(interaction.confidence)
+        self._domain_stats[d]["latency"].update(interaction.latency_ms)
+        self._mode_stats[m]["confidence"].update(interaction.confidence)
+        self._mode_stats[m]["latency"].update(interaction.latency_ms)
+        self._overall["confidence"].update(interaction.confidence)
+        self._overall["latency"].update(interaction.latency_ms)
+
+        if d not in self._domain_fact_hits {
+            self._domain_fact_hits[d] = [0, 0]
+        }
+        if interaction.had_facts { self._domain_fact_hits[d][0] += 1 }
+        self._domain_fact_hits[d][1] += 1
+
+        if d not in self._domain_computation_hits {
+            self._domain_computation_hits[d] = [0, 0]
+        }
+        if interaction.had_computation { self._domain_computation_hits[d][0] += 1 }
+        self._domain_computation_hits[d][1] += 1
+    }
+
+    fn get_domain_stats(self, domain: string) -> Dict[string, any] {
+        let ds = self._domain_stats.get(domain, None)
+        if ds == None { return {} }
+        let fact_pair = self._domain_fact_hits.get(domain, [0, 0])
+        let hits = fact_pair[0]
+        let total = fact_pair[1]
+        if total == 0 { total = 1 }
+        return {
+            "confidence_mean": ds["confidence"].mean(),
+            "confidence_std": ds["confidence"].std(),
+            "latency_mean": ds["latency"].mean(),
+            "latency_std": ds["latency"].std(),
+            "fact_hit_rate": hits / total,
+            "sample_count": ds["confidence"].count
+        }
+    }
+
+    fn get_overall_stats(self) -> Dict[string, any] {
+        return {
+            "confidence_mean": self._overall["confidence"].mean(),
+            "confidence_std": self._overall["confidence"].std(),
+            "latency_mean": self._overall["latency"].mean(),
+            "latency_std": self._overall["latency"].std(),
+            "total_interactions": self._overall["confidence"].count,
+            "domains_seen": self._domain_stats.keys()
+        }
+    }
+
+    fn recent(self, n: int, domain: Optional[string]) -> List[any] {
+        let records = self._records
+        if domain != None {
+            let filtered: List[InteractionRecord] = []
+            for r in records {
+                if r.domain == domain { filtered.append(r) }
+            }
+            records = filtered
+        }
+        return records[-n:]
+    }
+}
+
+
+/// ── Weakness Detector ──────────────────────────────────────────────────
+
+class WeaknessDetector {
+    fn new() -> WeaknessDetector {
+        let wd = WeaknessDetector {}
+        wd.CONFIDENCE_THRESHOLD = 0.5
+        wd.LATENCY_THRESHOLD_MS = 5000.0
+        wd.FACT_HIT_THRESHOLD = 0.3
+        wd.MIN_SAMPLES = 10
+        return wd
+    }
+
+    fn detect(self, tracker: PerformanceTracker) -> List[any] {
+        let weaknesses: List[Weakness] = []
+
+        for domain in tracker._domain_stats.keys() {
+            let stats = tracker.get_domain_stats(domain)
+            let sample_count = stats.get("sample_count", 0)
+            if sample_count < self.MIN_SAMPLES { continue }
+
+            if stats["confidence_mean"] < self.CONFIDENCE_THRESHOLD {
+                weaknesses.append(new_weakness(
+                    "low_confidence_domain",
+                    domain,
+                    1.0 - stats["confidence_mean"],
+                    sample_count,
+                    stats["confidence_mean"],
+                    "confidence_mean",
+                    "Domain '" + domain + "' has low average confidence: " + string(round(stats["confidence_mean"], 2)) + " (threshold: " + string(self.CONFIDENCE_THRESHOLD) + ")"
+                ))
+            }
+
+            if stats["latency_mean"] > self.LATENCY_THRESHOLD_MS {
+                let sev = stats["latency_mean"] / (self.LATENCY_THRESHOLD_MS * 3)
+                if sev > 1.0 { sev = 1.0 }
+                weaknesses.append(new_weakness(
+                    "high_latency_domain",
+                    domain,
+                    sev,
+                    sample_count,
+                    stats["latency_mean"],
+                    "latency_mean",
+                    "Domain '" + domain + "' has high latency: " + string(round(stats["latency_mean"], 0)) + "ms (threshold: " + string(self.LATENCY_THRESHOLD_MS) + "ms)"
+                ))
+            }
+
+            if stats["fact_hit_rate"] < self.FACT_HIT_THRESHOLD {
+                weaknesses.append(new_weakness(
+                    "low_fact_hit_domain",
+                    domain,
+                    1.0 - stats["fact_hit_rate"],
+                    sample_count,
+                    stats["fact_hit_rate"],
+                    "fact_hit_rate",
+                    "Domain '" + domain + "' has low fact hit rate: " + string(round(stats["fact_hit_rate"], 2)) + " (threshold: " + string(self.FACT_HIT_THRESHOLD) + ")"
+                ))
+            }
+        }
+
+        let recent = tracker.recent(100, None)
+        if recent.len() >= 20 {
+            let failure_domains: Dict[string, int] = {}
+            for r in recent {
+                if r.confidence < 0.3 {
+                    if r.domain not in failure_domains { failure_domains[r.domain] = 0 }
+                    failure_domains[r.domain] += 1
+                }
+            }
+            let sorted_failures: List[List[any]] = []
+            for domain, count in failure_domains.items() {
+                sorted_failures.append([domain, count])
+            }
+            sorted_failures.sort_by(fn(x) { return -x[1] })
+
+            let top_count = 0
+            for pair in sorted_failures {
+                if top_count >= 3 { break }
+                let domain = pair[0]
+                let count = pair[1]
+                if count >= 5 {
+                    let sev = count / recent.len()
+                    if sev > 1.0 { sev = 1.0 }
+                    weaknesses.append(new_weakness(
+                        "frequent_failure_domain",
+                        domain,
+                        sev,
+                        recent.len(),
+                        count / recent.len(),
+                        "failure_rate",
+                        "Domain '" + domain + "' has " + string(count) + " recent failures out of " + string(recent.len()) + " interactions"
+                    ))
+                }
+                top_count += 1
+            }
+        }
+
+        weaknesses.sort_by(fn(w) { return -w.severity })
+        return weaknesses
+    }
+}
+
+
+/// ── Hypothesis Engine ──────────────────────────────────────────────────
+
+class HypothesisEngine {
+    fn new() -> HypothesisEngine {
+        let he = HypothesisEngine {}
+        return he
+    }
+
+    fn hypothesize(self, weakness: Weakness) -> Optional[Hypothesis] {
+        let h_id = hashlib.sha256((weakness.weakness_type + ":" + weakness.domain + ":" + string(time.time())).encode()).hexdigest()[0:12]
+
+        if weakness.weakness_type == "low_confidence_domain" {
+            return Hypothesis.new(
+                h_id, weakness,
+                "increase_web_search_for_domain",
+                {
+                    "web_search_threshold": {weakness.domain: 0.1},
+                    "web_max_facts": {weakness.domain: 8},
+                    "knowledge_loader_top_k": {weakness.domain: 15}
+                },
+                0.15,
+                weakness.metric_value
+            )
+        }
+
+        if weakness.weakness_type == "high_latency_domain" {
+            return Hypothesis.new(
+                h_id, weakness,
+                "reduce_lobe_count_for_domain",
+                {
+                    "max_lobes": {weakness.domain: 3},
+                    "web_timeout_ms": {weakness.domain: 3000},
+                    "skip_web_if_facts_above": {weakness.domain: 3}
+                },
+                -500.0,
+                weakness.metric_value
+            )
+        }
+
+        if weakness.weakness_type == "low_fact_hit_domain" {
+            return Hypothesis.new(
+                h_id, weakness,
+                "expand_knowledge_sources",
+                {
+                    "enable_domain_search": {weakness.domain: true},
+                    "web_domain_sources": {weakness.domain: "all"},
+                    "semantic_similarity_threshold": {weakness.domain: 0.05}
+                },
+                0.2,
+                weakness.metric_value
+            )
+        }
+
+        if weakness.weakness_type == "frequent_failure_domain" {
+            return Hypothesis.new(
+                h_id, weakness,
+                "force_hybrid_mode",
+                {
+                    "force_mode": {weakness.domain: "HYBRID"},
+                    "enable_planner": {weakness.domain: true},
+                    "min_web_facts": {weakness.domain: 2}
+                },
+                0.1,
+                weakness.metric_value
+            )
+        }
+
+        return None
+    }
+}
+
+
+/// ── Parameter Tuner ────────────────────────────────────────────────────
+
+class ParameterTuner {
+    fn new() -> ParameterTuner {
+        let pt = ParameterTuner {}
+        pt._overrides = {}
+        pt._history = []
+        return pt
+    }
+
+    fn apply(self, hypothesis: Hypothesis) -> void {
+        for param, changes in hypothesis.parameter_changes.items() {
+            if param not in self._overrides {
+                self._overrides[param] = {}
+            }
+            for k, v in changes.items() {
+                self._overrides[param][k] = v
+            }
+        }
+
+        self._history.append({
+            "hypothesis_id": hypothesis.hypothesis_id,
+            "action": hypothesis.proposed_action,
+            "changes": hypothesis.parameter_changes,
+            "timestamp": time.time()
+        })
+    }
+
+    fn get(self, param: string, domain: string, default_val: any) -> any {
+        let overrides = self._overrides.get(param, None)
+        if overrides == None { return default_val }
+        if domain in overrides { return overrides[domain] }
+        if "general" in overrides { return overrides["general"] }
+        return default_val
+    }
+
+    fn rollback(self, hypothesis_id: string) -> void {
+        for record in self._history {
+            if record["hypothesis_id"] == hypothesis_id {
+                for param, changes in record["changes"].items() {
+                    for domain in changes.keys() {
+                        if param in self._overrides && domain in self._overrides[param] {
+                            del self._overrides[param][domain]
+                        }
+                    }
+                }
+                break
+            }
+        }
+    }
+
+    fn active_overrides(self) -> Dict[string, any] {
+        return self._overrides.copy()
+    }
+}
+
+
+/// ── Meta Knowledge ─────────────────────────────────────────────────────
+
+class MetaKnowledge {
+    fn new() -> MetaKnowledge {
+        let mk = MetaKnowledge {}
+        mk._strengths = {}
+        mk._limitations = {}
+        mk._improvement_history = []
+        mk._capability_map = {}
+        return mk
+    }
+
+    fn update_from_tracker(self, tracker: PerformanceTracker) -> void {
+        for domain in tracker._domain_stats.keys() {
+            let stats = tracker.get_domain_stats(domain)
+            let sample_count = stats.get("sample_count", 0)
+            if sample_count >= 5 {
+                self._strengths[domain] = stats["confidence_mean"]
+
+                let capabilities: Dict[string, float] = {}
+                let fact_pair = tracker._domain_fact_hits.get(domain, [0, 0])
+                let hits = fact_pair[0]
+                let total = fact_pair[1]
+                if total == 0 { total = 1 }
+                capabilities["fact_retrieval"] = hits / total
+
+                let comp_pair = tracker._domain_computation_hits.get(domain, [0, 0])
+                let c_hits = comp_pair[0]
+                let c_total = comp_pair[1]
+                if c_total == 0 { c_total = 1 }
+                capabilities["computation"] = c_hits / c_total
+
+                capabilities["confidence"] = stats["confidence_mean"]
+                let speed = 1.0 - stats["latency_mean"] / 10000
+                if speed < 0.0 { speed = 0.0 }
+                capabilities["speed"] = speed
+
+                self._capability_map[domain] = capabilities
+            }
+        }
+    }
+
+    fn record_improvement(self, hypothesis: Hypothesis, before: float, after: float) -> void {
+        self._improvement_history.append({
+            "hypothesis_id": hypothesis.hypothesis_id,
+            "domain": hypothesis.weakness.domain,
+            "action": hypothesis.proposed_action,
+            "before": before,
+            "after": after,
+            "improvement": after - before,
+            "timestamp": time.time()
+        })
+    }
+
+    fn get_capability_summary(self) -> string {
+        if self._strengths.len() == 0 {
+            return "Insufficient data to assess capabilities."
+        }
+
+        let strong: List[List[any]] = []
+        let weak: List[List[any]] = []
+        for d, s in self._strengths.items() {
+            if s > 0.7 { strong.append([d, s]) }
+            if s < 0.4 { weak.append([d, s]) }
+        }
+
+        let parts: List[string] = []
+        if strong.len() > 0 {
+            strong.sort_by(fn(x) { return -x[1] })
+            let items: List[string] = []
+            let count = 0
+            for pair in strong {
+                if count >= 5 { break }
+                items.append(pair[0] + " (" + string(round(pair[1] * 100, 0)) + "%)")
+                count += 1
+            }
+            parts.append("Strong domains: " + items.join(", "))
+        }
+        if weak.len() > 0 {
+            weak.sort_by(fn(x) { return x[1] })
+            let items: List[string] = []
+            let count = 0
+            for pair in weak {
+                if count >= 5 { break }
+                items.append(pair[0] + " (" + string(round(pair[1] * 100, 0)) + "%)")
+                count += 1
+            }
+            parts.append("Weak domains: " + items.join(", "))
+        }
+
+        let total_improved = 0
+        for h in self._improvement_history {
+            if h["improvement"] > 0 { total_improved += 1 }
+        }
+        if self._improvement_history.len() > 0 {
+            parts.append("Improvements: " + string(total_improved) + "/" + string(self._improvement_history.len()) + " successful")
+        }
+
+        if parts.len() > 0 { return parts.join(". ") }
+        return "System operational, gathering data."
+    }
+
+    fn to_dict(self) -> Dict[string, any] {
+        let history_slice = self._improvement_history
+        if history_slice.len() > 20 {
+            history_slice = history_slice[-20:]
+        }
+        return {
+            "strengths": self._strengths.copy(),
+            "limitations": self._limitations.copy(),
+            "capability_map": self._capability_map.copy(),
+            "improvement_history": history_slice
+        }
+    }
+}
+
+
+/// ── Self-Improvement Loop ──────────────────────────────────────────────
+
+class SelfImprovementLoop {
+    fn new() -> SelfImprovementLoop {
+        let sil = SelfImprovementLoop {}
+        sil.IMPROVEMENT_INTERVAL = 50
+        sil.HYPOTHESIS_TEST_WINDOW = 30
+        sil.MAX_ACTIVE_HYPOTHESES = 5
+        sil.tracker = PerformanceTracker.new(1000)
+        sil.detector = WeaknessDetector.new()
+        sil.hypothesis_engine = HypothesisEngine.new()
+        sil.tuner = ParameterTuner.new()
+        sil.meta = MetaKnowledge.new()
+        sil._active_hypotheses = []
+        sil._interaction_count = 0
+        sil._improvement_count = 0
+        sil._total_improvements_applied = 0
+        return sil
+    }
+
+    fn record_interaction(self, record: InteractionRecord) -> Optional[ImprovementResult] {
+        self.tracker.record(record)
+        self._interaction_count += 1
+
+        for hyp in self._active_hypotheses {
+            if hyp.status == "testing" {
+                if record.domain == hyp.weakness.domain {
+                    if hyp.weakness.metric_name == "confidence_mean" {
+                        hyp.test_results.append(record.confidence)
+                    } else if hyp.weakness.metric_name == "latency_mean" {
+                        hyp.test_results.append(record.latency_ms)
+                    } else if hyp.weakness.metric_name == "fact_hit_rate" || hyp.weakness.metric_name == "failure_rate" {
+                        if record.had_facts { hyp.test_results.append(1.0) }
+                        else { hyp.test_results.append(0.0) }
+                    }
+                }
+            }
+        }
+
+        if self._interaction_count % self.IMPROVEMENT_INTERVAL == 0 {
+            return self.improve()
+        }
+        return None
+    }
+
+    fn improve(self) -> ImprovementResult {
+        self._improvement_count += 1
+        let confirmed = 0
+        let rejected = 0
+
+        let still_active: List[Hypothesis] = []
+        for hyp in self._active_hypotheses {
+            if hyp.status == "testing" && hyp.test_results.len() >= self.HYPOTHESIS_TEST_WINDOW {
+                if hyp.test_results.len() > 0 {
+                    let total = 0.0
+                    for v in hyp.test_results { total += v }
+                    let current_metric = total / hyp.test_results.len()
+
+                    let improved = false
+                    if hyp.weakness.metric_name == "confidence_mean" || hyp.weakness.metric_name == "fact_hit_rate" {
+                        improved = current_metric > hyp.baseline_metric
+                    } else if hyp.weakness.metric_name == "latency_mean" || hyp.weakness.metric_name == "failure_rate" {
+                        improved = current_metric < hyp.baseline_metric
+                    }
+
+                    if improved {
+                        hyp.status = "confirmed"
+                        confirmed += 1
+                        self.meta.record_improvement(hyp, hyp.baseline_metric, current_metric)
+                        logger.info("Hypothesis CONFIRMED: " + hyp.proposed_action + " for " + hyp.weakness.domain + " (" + string(round(hyp.baseline_metric, 3)) + " -> " + string(round(current_metric, 3)) + ")")
+                    } else {
+                        hyp.status = "rejected"
+                        rejected += 1
+                        self.tuner.rollback(hyp.hypothesis_id)
+                        logger.info("Hypothesis REJECTED (rolled back): " + hyp.proposed_action + " for " + hyp.weakness.domain)
+                    }
+                }
+            } else if hyp.status == "testing" {
+                still_active.append(hyp)
+            }
+        }
+        self._active_hypotheses = still_active
+
+        let weaknesses = self.detector.detect(self.tracker)
+
+        let new_hypotheses = 0
+        let w_idx = 0
+        while w_idx < weaknesses.len() && w_idx < 3 {
+            if self._active_hypotheses.len() >= self.MAX_ACTIVE_HYPOTHESES { break }
+            let weakness = weaknesses[w_idx]
+
+            let already_testing = false
+            for h in self._active_hypotheses {
+                if h.weakness.weakness_type == weakness.weakness_type && h.weakness.domain == weakness.domain {
+                    already_testing = true
+                    break
+                }
+            }
+            if already_testing { w_idx += 1; continue }
+
+            let hypothesis = self.hypothesis_engine.hypothesize(weakness)
+            if hypothesis != None {
+                hypothesis.status = "testing"
+                hypothesis.test_start = time.time()
+                self.tuner.apply(hypothesis)
+                self._active_hypotheses.append(hypothesis)
+                new_hypotheses += 1
+                logger.info("New hypothesis: " + hypothesis.proposed_action + " for domain '" + weakness.domain + "' (severity=" + string(round(weakness.severity, 2)) + ")")
+            }
+            w_idx += 1
+        }
+
+        self.meta.update_from_tracker(self.tracker)
+        self._total_improvements_applied += confirmed
+
+        return ImprovementResult {
+            improvements_applied: confirmed,
+            weaknesses_detected: weaknesses.len(),
+            hypotheses_generated: new_hypotheses,
+            hypotheses_confirmed: confirmed,
+            hypotheses_rejected: rejected,
+            parameter_adjustments: self.tuner.active_overrides(),
+            summary: "Cycle #" + string(self._improvement_count) + ": " + string(weaknesses.len()) + " weaknesses, " + string(new_hypotheses) + " new hypotheses, " + string(confirmed) + " confirmed, " + string(rejected) + " rejected. " + self.meta.get_capability_summary()
+        }
+    }
+
+    fn get_runtime_param(self, param: string, domain: string, default_val: any) -> any {
+        return self.tuner.get(param, domain, default_val)
+    }
+
+    fn save_to_redis(self, redis_client: any) -> int {
+        try {
+            let r = redis_client
+            let state = {
+                "meta": self.meta.to_dict(),
+                "overrides": self.tuner.active_overrides(),
+                "interaction_count": self._interaction_count,
+                "improvement_count": self._improvement_count,
+                "total_improvements": self._total_improvements_applied
+            }
+            r.set("nrs:self_improvement:state", json.dumps(state))
+            return 1
+        } catch(e) {
+            logger.debug("Self-improvement Redis save failed: " + string(e))
+            return 0
+        }
+    }
+
+    fn load_from_redis(self, redis_client: any) -> int {
+        try {
+            let r = redis_client
+            let raw = r.get("nrs:self_improvement:state")
+            if raw == None { return 0 }
+            let state = json.loads(raw)
+
+            let meta_data = state.get("meta", {})
+            self.meta._strengths = meta_data.get("strengths", {})
+            self.meta._limitations = meta_data.get("limitations", {})
+            self.meta._capability_map = meta_data.get("capability_map", {})
+            self.meta._improvement_history = meta_data.get("improvement_history", [])
+
+            let overrides = state.get("overrides", {})
+            for param, ov in overrides.items() {
+                self.tuner._overrides[param] = ov
+            }
+
+            self._interaction_count = state.get("interaction_count", 0)
+            self._improvement_count = state.get("improvement_count", 0)
+            self._total_improvements_applied = state.get("total_improvements", 0)
+
+            return 1
+        } catch(e) {
+            logger.debug("Self-improvement Redis load failed: " + string(e))
+            return 0
+        }
+    }
+
+    fn stats(self) -> Dict[string, any] {
+        return {
+            "interaction_count": self._interaction_count,
+            "improvement_cycles": self._improvement_count,
+            "total_improvements_applied": self._total_improvements_applied,
+            "active_hypotheses": self._active_hypotheses.len(),
+            "active_overrides": self.tuner.active_overrides().len(),
+            "overall_performance": self.tracker.get_overall_stats(),
+            "meta_summary": self.meta.get_capability_summary()
+        }
+    }
+}
+
+
+export MetricType, InteractionRecord, Weakness, Hypothesis, ImprovementResult
+export WelfordAccumulator, PerformanceTracker, WeaknessDetector
+export HypothesisEngine, ParameterTuner, MetaKnowledge, SelfImprovementLoop

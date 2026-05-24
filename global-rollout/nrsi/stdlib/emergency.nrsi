@@ -1,0 +1,269 @@
+/// NRSIP emergency subsystem: killswitch, quarantine, and guarded pipeline.
+///
+/// Full implementation of `nrsip/emergency.py`.
+/// Patent Continuation E — Emergency broadcast, node quarantine, and
+/// safety-critical processing halt.
+
+module emergency
+
+
+import time from "std/time"
+import uuid from "std/uuid"
+/// ---------- Enumerations ----------
+
+enum EmergencyLevel {
+    ALERT,
+    CRITICAL,
+    SHUTDOWN
+}
+
+/// ---------- Data records ----------
+
+type EmergencyBroadcast {
+    broadcast_id: string,
+    level: EmergencyLevel,
+    reason: string,
+    source_node: string,
+    affected_nodes: List[string],
+    timestamp: float,
+    signature: string
+}
+
+fn emergency_broadcast_to_dict(eb: EmergencyBroadcast) -> Dict[string, Any] {
+    return {
+        "broadcast_id": eb.broadcast_id,
+        "level": enum_value(eb.level),
+        "reason": eb.reason,
+        "source_node": eb.source_node,
+        "affected_nodes": list_copy(eb.affected_nodes),
+        "timestamp": eb.timestamp,
+        "signature": eb.signature
+    }
+}
+
+type QuarantineRecord {
+    node_id: string,
+    reason: string,
+    severity: EmergencyLevel,
+    quarantined_at: float,
+    released_at: Optional[float]
+}
+
+fn quarantine_record_is_active(qr: QuarantineRecord) -> bool {
+    return qr.released_at == None
+}
+
+/// ---------- Killswitch ----------
+
+class Killswitch {
+    let _DEACTIVATION_KEY = "NRS-EMERGENCY-OVERRIDE-001"
+
+    fn new(self) {
+        self._active = false
+        self._reason = None
+        self._level = None
+        self._source_node = None
+        self._activated_at = None
+        self._broadcasts = []
+    }
+
+    fn activate(self, reason: string, level: EmergencyLevel,
+                source_node: string, signing_key: string,
+                affected_nodes: Optional[List[string]]) -> EmergencyBroadcast {
+        self._active = true
+        self._reason = reason
+        self._level = level
+        self._source_node = source_node
+        self._activated_at = time.time()
+
+        let nodes = affected_nodes
+        if nodes == None {
+            nodes = []
+        }
+
+        let broadcast = build_emergency_broadcast(
+            level, reason, source_node, signing_key, nodes
+        )
+        append(self._broadcasts, broadcast)
+        log_warning((
+            "Killswitch ACTIVATED  level=" + enum_value(level)
+            + "  reason=" + reason
+            + "  source=" + source_node
+        ))
+        return broadcast
+    }
+
+    fn deactivate(self, authorization_key: string) -> bool {
+        if !self._active {
+            return false
+        }
+        if !hmac_compare_digest(authorization_key, Killswitch._DEACTIVATION_KEY) {
+            log_error("Killswitch deactivation REJECTED — bad key")
+            return false
+        }
+        self._active = false
+        log_info("Killswitch DEACTIVATED")
+        return true
+    }
+
+    fn is_active(self) -> bool {
+        return self._active
+    }
+
+    fn status(self) -> Dict[string, Any] {
+        let level_val = None
+        if self._level != None {
+            level_val = enum_value(self._level)
+        }
+        return {
+            "active": self._active,
+            "reason": self._reason,
+            "level": level_val,
+            "source_node": self._source_node,
+            "activated_at": self._activated_at,
+            "total_broadcasts": len(self._broadcasts)
+        }
+    }
+}
+
+/// ---------- QuarantineManager ----------
+
+class QuarantineManager {
+    fn new(self) {
+        self._records = {}
+    }
+
+    fn quarantine_node(self, node_id: string, reason: string,
+                       severity: EmergencyLevel) -> QuarantineRecord {
+        let record = QuarantineRecord {
+            node_id: node_id,
+            reason: reason,
+            severity: severity,
+            quarantined_at: time.time(),
+            released_at: None
+        }
+        self._records[node_id] = record
+        log_info((
+            "Node QUARANTINED  node=" + node_id
+            + "  severity=" + enum_value(severity)
+            + "  reason=" + reason
+        ))
+        return record
+    }
+
+    fn release_node(self, node_id: string) -> bool {
+        let record = get_or_default(self._records, node_id, None)
+        if record == None or !quarantine_record_is_active(record) {
+            return false
+        }
+        record.released_at = time.time()
+        log_info("Node RELEASED  node=" + node_id)
+        return true
+    }
+
+    fn is_quarantined(self, node_id: string) -> bool {
+        let record = get_or_default(self._records, node_id, None)
+        return record != None and quarantine_record_is_active(record)
+    }
+
+    fn quarantined_list(self) -> List[any] {
+        let result = []
+        for nid in keys(self._records) {
+            if quarantine_record_is_active(self._records[nid]) {
+                append(result, nid)
+            }
+        }
+        return result
+    }
+}
+
+/// ---------- GuardedPipeline ----------
+
+class GuardedPipeline {
+    fn new(self, handler: Callable, killswitch: Killswitch,
+           quarantine: QuarantineManager, source_node: string) {
+        self._handler = handler
+        self._killswitch = killswitch
+        self._quarantine = quarantine
+        self._source_node = source_node
+        self._total_calls = 0
+        self._blocked_calls = 0
+        self._passed_calls = 0
+    }
+
+    fn process(self, query: Any, kwargs: Dict[string, Any]) -> Any {
+        self._total_calls += 1
+
+        if self._killswitch.is_active() {
+            self._blocked_calls += 1
+            raise PipelineBlocked((
+                "Killswitch active — processing halted "
+                + "(status=" + str(self._killswitch.status()) + ")"
+            ))
+        }
+
+        if self._quarantine.is_quarantined(self._source_node) {
+            self._blocked_calls += 1
+            raise PipelineBlocked(
+                "Source node '" + self._source_node + "' is quarantined"
+            )
+        }
+
+        let result = self._handler(query, kwargs)
+        self._passed_calls += 1
+        return result
+    }
+
+    fn guard_stats(self) -> Dict[string, Any] {
+        return {
+            "total_calls": self._total_calls,
+            "blocked_calls": self._blocked_calls,
+            "passed_calls": self._passed_calls,
+            "killswitch_active": self._killswitch.is_active(),
+            "source_quarantined": self._quarantine.is_quarantined(self._source_node)
+        }
+    }
+}
+
+/// ---------- Convenience factory ----------
+
+fn build_emergency_broadcast(
+    level: EmergencyLevel, reason: string, source_node: string,
+    signing_key: string, affected_nodes: Optional[List[string]]
+) -> EmergencyBroadcast {
+    let broadcast_id = uuid.uuid4().hex
+    let ts = time.time()
+
+    let key_bytes = None
+    if signing_key != "" {
+        key_bytes = encode_utf8(signing_key)
+    } else {
+        key_bytes = zero_bytes(32)
+    }
+
+    let payload = encode_utf8(
+        broadcast_id + "|" + enum_value(level) + "|" + reason + "|" + source_node
+    )
+    let sig = hmac_sha256_hex(key_bytes, payload)
+
+    let nodes = affected_nodes
+    if nodes == None {
+        nodes = []
+    }
+
+    return EmergencyBroadcast {
+        broadcast_id: broadcast_id,
+        level: level,
+        reason: reason,
+        source_node: source_node,
+        affected_nodes: list_copy(nodes),
+        timestamp: ts,
+        signature: sig
+    }
+}
+
+export EmergencyLevel
+export EmergencyBroadcast, emergency_broadcast_to_dict
+export QuarantineRecord, quarantine_record_is_active
+export Killswitch, QuarantineManager, GuardedPipeline
+export build_emergency_broadcast

@@ -1,0 +1,825 @@
+/// NRSI — Advanced Inference.
+///
+/// Abductive reasoning, counterfactual reasoning, constraint propagation,
+/// and working memory for multi-step deduction chains.
+/// All transformer-free.
+
+module reasoning_advanced
+
+
+import time from "std/time"
+from "reasoning_graph" import CausalGraph, GraphEdge, GraphNode, RelationType
+from "reasoning_inference" import InferenceEngine, InferenceResult, BackwardChainer, ForwardChainer
+
+/// ---------- Types ----------
+
+type WorkingMemoryItem {
+    proposition: string,
+    confidence: float,
+    source: string,
+    step: int,
+    depends_on: List[string],
+    timestamp: float
+}
+
+type Hypothesis {
+    explanation: string,
+    confidence: float,
+    evidence_for: List[string],
+    evidence_against: List[string],
+    explanatory_depth: int,
+    path: List[string],
+    competing_hypotheses: int
+}
+
+fn hypothesis_net_evidence(h: Hypothesis) -> float {
+    let total = len(h.evidence_for) + len(h.evidence_against)
+    if total == 0 {
+        return 0.0
+    }
+    return len(h.evidence_for) / total
+}
+
+type CounterfactualResult {
+    removed_concept: string,
+    affected_conclusions: List[string],
+    broken_chains: List[List[string]],
+    confidence_changes: Dict[string, float],
+    cascading_effects: int,
+    summary: string
+}
+
+type Constraint {
+    variable: string,
+    domain_values: Set[string],
+    source: string
+}
+
+type PropagationResult {
+    assignments: Dict[string, string],
+    confidence: float,
+    steps: int,
+    unsatisfied: List[string],
+    explanation: string
+}
+
+type DeductionStep {
+    step_number: int,
+    operation: string,
+    proposition: string,
+    confidence: float,
+    justification: string
+}
+
+type DeductionChain {
+    goal: string,
+    steps: List[DeductionStep],
+    conclusion: string,
+    confidence: float,
+    working_memory_snapshot: List[Dict[string, Any]],
+    success: bool
+}
+
+/// ---------- Working Memory ----------
+
+class WorkingMemory {
+    fn __init__(self, capacity: int) {
+        if capacity == None {
+            capacity = 9
+        }
+        self._items: Dict[string, WorkingMemoryItem] = {}
+        self._capacity = capacity
+        self._step = 0
+    }
+
+    fn size(self) -> int {
+        return len(self._items)
+    }
+
+    fn current_step(self) -> int {
+        return self._step
+    }
+
+    fn push(self, proposition: string, confidence: float,
+            source: string, depends_on: Optional[List[string]]) {
+        self._step += 1
+        let deps: List[string] = []
+        if depends_on != None {
+            deps = depends_on
+        }
+        let item = WorkingMemoryItem {
+            proposition: proposition, confidence: confidence,
+            source: source, step: self._step,
+            depends_on: deps, timestamp: time.time()
+        }
+        self._items[proposition] = item
+
+        if len(self._items) > self._capacity {
+            let worst_key = ""
+            let worst_conf = 2.0
+            for k in self._items {
+                if self._items[k].confidence < worst_conf {
+                    worst_conf = self._items[k].confidence
+                    worst_key = k
+                }
+            }
+            del self._items[worst_key]
+        }
+    }
+
+    fn contains(self, proposition: string) -> bool {
+        return proposition in self._items
+    }
+
+    fn get(self, proposition: string) -> Optional[WorkingMemoryItem] {
+        if proposition in self._items {
+            return self._items[proposition]
+        }
+        return None
+    }
+
+    fn all_items(self) -> List[any] {
+        let items: List[WorkingMemoryItem] = []
+        for k in self._items {
+            items.append(self._items[k])
+        }
+        let sorted_items: List[WorkingMemoryItem] = []
+        let remaining = list(items)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            let best_step = remaining[0].step
+            for i in range(1, len(remaining)) {
+                if remaining[i].step < best_step {
+                    best_step = remaining[i].step
+                    best_idx = i
+                }
+            }
+            sorted_items.append(remaining.pop(best_idx))
+        }
+        return sorted_items
+    }
+
+    fn highest_confidence(self) -> Optional[WorkingMemoryItem] {
+        if len(self._items) == 0 {
+            return None
+        }
+        let best: Optional[WorkingMemoryItem] = None
+        for k in self._items {
+            if best == None or self._items[k].confidence > best.confidence {
+                best = self._items[k]
+            }
+        }
+        return best
+    }
+
+    fn clear(self) {
+        self._items = {}
+        self._step = 0
+    }
+
+    fn dump(self) -> List[any] {
+        let result: List[Dict[string, Any]] = []
+        for item in self.all_items() {
+            result.append({
+                "proposition": item.proposition, "confidence": item.confidence,
+                "source": item.source, "step": item.step, "depends_on": item.depends_on
+            })
+        }
+        return result
+    }
+}
+
+/// ---------- Abductive Reasoner ----------
+
+class AbductiveReasoner {
+    fn __init__(self, graph: CausalGraph = None, max_hypotheses: int = None, max_depth: int = None) {
+        self._graph = graph
+        if max_hypotheses == None {
+            max_hypotheses = 10
+        }
+        if max_depth == None {
+            max_depth = 4
+        }
+        self._max_hypotheses = max_hypotheses
+        self._backward = BackwardChainer(graph, max_depth, 0.1, None)
+        self._forward = ForwardChainer(graph, 3, 0.1, None)
+    }
+
+    fn explain(self, observation: string,
+               additional_observations: Optional[List[string]]) -> List[any] {
+        let obs_norm = observation.lower().strip()
+        let observations: Set[string] = set()
+        observations.add(obs_norm)
+        if additional_observations != None {
+            for o in additional_observations {
+                observations.add(o.lower().strip())
+            }
+        }
+
+        let candidates = self._backward.chain(obs_norm, self._max_hypotheses * 2)
+        if len(candidates) == 0 {
+            return []
+        }
+
+        let hypotheses: List[Hypothesis] = []
+        for candidate in candidates {
+            let h = Hypothesis {
+                explanation: candidate.conclusion,
+                confidence: candidate.confidence,
+                evidence_for: [],
+                evidence_against: [],
+                explanatory_depth: candidate.depth,
+                path: candidate.path,
+                competing_hypotheses: 0
+            }
+
+            let effects = self._forward.chain(candidate.conclusion, 20)
+            let effect_set: Set[string] = set()
+            for r in effects {
+                effect_set.add(r.conclusion)
+            }
+
+            for obs in observations {
+                if obs in effect_set or obs == obs_norm {
+                    h.evidence_for.append(obs)
+                }
+            }
+
+            for edge in self._graph.outgoing(candidate.conclusion, RelationType.CONTRADICTS) {
+                if edge.target in observations {
+                    h.evidence_against.append(edge.target)
+                }
+            }
+            for edge in self._graph.outgoing(candidate.conclusion, RelationType.PREVENTS) {
+                if edge.target in observations {
+                    h.evidence_against.append(edge.target)
+                }
+            }
+
+            hypotheses.append(h)
+        }
+
+        for h in hypotheses {
+            h.competing_hypotheses = len(hypotheses) - 1
+        }
+
+        let sorted_hyps: List[Hypothesis] = []
+        let remaining = list(hypotheses)
+        while len(remaining) > 0 {
+            let best_idx = 0
+            let best_score = self._score(remaining[0])
+            for i in range(1, len(remaining)) {
+                let s = self._score(remaining[i])
+                if s > best_score {
+                    best_score = s
+                    best_idx = i
+                }
+            }
+            sorted_hyps.append(remaining.pop(best_idx))
+        }
+
+        let limited: List[Hypothesis] = []
+        for i in range(min(self._max_hypotheses, len(sorted_hyps))) {
+            limited.append(sorted_hyps[i])
+        }
+        return limited
+    }
+
+    fn _score(self, h: Hypothesis) -> float {
+        let coverage = hypothesis_net_evidence(h)
+        let depth_bonus = h.explanatory_depth / 4.0
+        if depth_bonus > 1.0 {
+            depth_bonus = 1.0
+        }
+        let parsimony = 1.0 / (1.0 + len(h.path))
+        let confidence = h.confidence
+        return coverage * 0.35 + depth_bonus * 0.25 + parsimony * 0.15 + confidence * 0.25
+    }
+
+    fn best_explanation(self, observation: string,
+                        additional_observations: Optional[List[string]]) -> Optional[Hypothesis] {
+        let hypotheses = self.explain(observation, additional_observations)
+        if len(hypotheses) > 0 {
+            return hypotheses[0]
+        }
+        return None
+    }
+}
+
+/// ---------- Counterfactual Reasoner ----------
+
+class CounterfactualReasoner {
+    fn __init__(self, graph: CausalGraph = None, max_depth: int = None) {
+        self._graph = graph
+        if max_depth == None {
+            max_depth = 4
+        }
+        self._max_depth = max_depth
+    }
+
+    fn remove_concept(self, concept: string) -> CounterfactualResult {
+        let concept_norm = concept.lower().strip()
+
+        let exclude_set: Set[string] = set()
+        exclude_set.add(concept_norm)
+        let before_conclusions = self._all_reachable_from_roots(exclude_set)
+        let all_conclusions = self._all_reachable_from_roots(set())
+
+        let lost: Set[string] = set()
+        for c in all_conclusions {
+            if c not in before_conclusions {
+                lost.add(c)
+            }
+        }
+        let broken_chains = self._find_broken_chains(concept_norm)
+
+        let conf_changes: Dict[string, float] = {}
+        for conclusion in lost {
+            conf_changes[conclusion] = -1.0
+        }
+
+        let summary_parts: List[string] = []
+        summary_parts.append("Removing '" + concept_norm + "' would:")
+        if len(lost) > 0 {
+            let lost_list: List[string] = []
+            for c in lost {
+                lost_list.append(c)
+            }
+            let limited: List[string] = []
+            for i in range(min(5, len(lost_list))) {
+                limited.append(lost_list[i])
+            }
+            summary_parts.append("  - Eliminate " + str(len(lost)) + " derived conclusion(s): " + ", ".join(limited))
+        }
+        if len(broken_chains) > 0 {
+            summary_parts.append("  - Break " + str(len(broken_chains)) + " reasoning chain(s)")
+        }
+        if len(lost) == 0 and len(broken_chains) == 0 {
+            summary_parts.append("  - Have minimal impact on the knowledge graph")
+        }
+
+        let affected_list: List[string] = []
+        for c in lost {
+            affected_list.append(c)
+        }
+
+        return CounterfactualResult {
+            removed_concept: concept_norm,
+            affected_conclusions: affected_list,
+            broken_chains: broken_chains,
+            confidence_changes: conf_changes,
+            cascading_effects: len(lost),
+            summary: "\n".join(summary_parts)
+        }
+    }
+
+    fn what_if_edge_removed(self, source: string, relation: RelationType,
+                             target: string) -> CounterfactualResult {
+        let source_norm = source.lower().strip()
+        let target_norm = target.lower().strip()
+
+        let fwd = ForwardChainer(self._graph, self._max_depth, 0.05, None)
+        let before_results = fwd.chain(source_norm, 50)
+        let before: Set[string] = set()
+        for r in before_results {
+            before.add(r.conclusion)
+        }
+
+        let edge = self._graph.get_edge(source_norm, relation, target_norm)
+        if edge == None {
+            return CounterfactualResult {
+                removed_concept: source_norm + "→" + target_norm,
+                affected_conclusions: [],
+                broken_chains: [],
+                confidence_changes: {},
+                cascading_effects: 0,
+                summary: "Edge '" + source_norm + " " + relation.value + " " + target_norm + "' not found."
+            }
+        }
+
+        let downstream_results = fwd.chain(target_norm, 50)
+        let potentially_lost: Set[string] = set()
+        for r in downstream_results {
+            potentially_lost.add(r.conclusion)
+        }
+
+        let alternate_paths: Set[string] = set()
+        for other_edge in self._graph.outgoing(source_norm) {
+            if other_edge.target == target_norm and other_edge.relation == relation {
+                continue
+            }
+            let alt_results = fwd.chain(other_edge.target, 30)
+            for r in alt_results {
+                alternate_paths.add(r.conclusion)
+            }
+        }
+
+        let actually_lost: List[string] = []
+        for c in potentially_lost {
+            if c not in alternate_paths {
+                actually_lost.append(c)
+            }
+        }
+
+        let conf_changes: Dict[string, float] = {}
+        for c in actually_lost {
+            conf_changes[c] = -1.0
+        }
+
+        let alt_count = 0
+        for c in potentially_lost {
+            if c in alternate_paths {
+                alt_count += 1
+            }
+        }
+
+        return CounterfactualResult {
+            removed_concept: source_norm + " " + relation.value + " " + target_norm,
+            affected_conclusions: actually_lost,
+            broken_chains: [],
+            confidence_changes: conf_changes,
+            cascading_effects: len(actually_lost),
+            summary: "Removing '" + source_norm + " " + relation.value + " " + target_norm + "' would affect " + str(len(actually_lost)) + " downstream conclusion(s). " + str(alt_count) + " have alternate paths."
+        }
+    }
+
+    fn _all_reachable_from_roots(self, exclude: Set[string]) -> any {
+        let roots: Set[string] = set()
+        for node in self._graph.all_nodes() {
+            let nid = node.node_id
+            if nid in exclude {
+                continue
+            }
+            let incoming = self._graph.incoming(nid)
+            let has_valid = false
+            for e in incoming {
+                if e.source not in exclude {
+                    has_valid = true
+                    break
+                }
+            }
+            if not has_valid {
+                roots.add(nid)
+            }
+        }
+
+        let reachable: Set[string] = set()
+        for root in roots {
+            let visited: Set[string] = set()
+            let queue: List[string] = [root]
+            while len(queue) > 0 {
+                let current = queue.pop(0)
+                if current in visited or current in exclude {
+                    continue
+                }
+                visited.add(current)
+                reachable.add(current)
+                for edge in self._graph.outgoing(current) {
+                    if edge.target not in visited and edge.target not in exclude {
+                        queue.append(edge.target)
+                    }
+                }
+            }
+        }
+
+        return reachable
+    }
+
+    fn _find_broken_chains(self, removed: string) -> List[any] {
+        let chains: List[List[string]] = []
+        for edge in self._graph.incoming(removed) {
+            for out_edge in self._graph.outgoing(removed) {
+                chains.append([edge.source, removed, out_edge.target])
+            }
+        }
+        let limited: List[List[string]] = []
+        for i in range(min(20, len(chains))) {
+            limited.append(chains[i])
+        }
+        return limited
+    }
+}
+
+/// ---------- Constraint Propagator ----------
+
+class ConstraintPropagator {
+    fn __init__(self, graph: CausalGraph) {
+        self._graph = graph
+    }
+
+    fn propagate(self, known_true: List[string],
+                 known_false: Optional[List[string]]) -> PropagationResult {
+        let true_set: Set[string] = set()
+        for c in known_true {
+            true_set.add(c.lower().strip())
+        }
+        let false_set: Set[string] = set()
+        if known_false != None {
+            for c in known_false {
+                false_set.add(c.lower().strip())
+            }
+        }
+        let inferred_true: Set[string] = set()
+        let inferred_false: Set[string] = set()
+        let unsatisfied: List[string] = []
+        let steps = 0
+
+        let changed = true
+        while changed and steps < 50 {
+            changed = false
+            steps += 1
+            let all_true: Set[string] = set()
+            for c in true_set {
+                all_true.add(c)
+            }
+            for c in inferred_true {
+                all_true.add(c)
+            }
+
+            for concept in list(all_true) {
+                for edge in self._graph.outgoing(concept, RelationType.CAUSES) {
+                    if edge.target not in all_true and edge.target not in inferred_true {
+                        if edge.confidence >= 0.5 {
+                            inferred_true.add(edge.target)
+                            changed = true
+                        }
+                    }
+                }
+
+                for edge in self._graph.outgoing(concept, RelationType.ENABLES) {
+                    if edge.target not in all_true and edge.target not in inferred_true {
+                        if edge.confidence >= 0.6 {
+                            inferred_true.add(edge.target)
+                            changed = true
+                        }
+                    }
+                }
+
+                for edge in self._graph.outgoing(concept, RelationType.PREVENTS) {
+                    if edge.target not in false_set and edge.target not in inferred_false {
+                        if edge.confidence >= 0.5 {
+                            inferred_false.add(edge.target)
+                            changed = true
+                        }
+                    }
+                }
+            }
+
+            for concept in list(all_true) {
+                for edge in self._graph.outgoing(concept, RelationType.REQUIRES) {
+                    let required = edge.target
+                    if required in false_set or required in inferred_false {
+                        unsatisfied.append("'" + concept + "' requires '" + required + "' but it is false/prevented")
+                    }
+                }
+            }
+        }
+
+        let all_true_final: Set[string] = set()
+        for c in true_set {
+            all_true_final.add(c)
+        }
+        for c in inferred_true {
+            all_true_final.add(c)
+        }
+        let assignments: Dict[string, string] = {}
+        for c in all_true_final {
+            assignments[c] = "true"
+        }
+        let all_false: Set[string] = set()
+        for c in false_set {
+            all_false.add(c)
+        }
+        for c in inferred_false {
+            all_false.add(c)
+        }
+        for c in all_false {
+            assignments[c] = "false"
+        }
+
+        let confidence = 1.0 - (len(unsatisfied) * 0.15)
+        if confidence < 0.0 {
+            confidence = 0.0
+        }
+
+        let parts: List[string] = []
+        if len(inferred_true) > 0 {
+            let items: List[string] = []
+            let count = 0
+            for c in inferred_true {
+                if count >= 5 {
+                    break
+                }
+                items.append(c)
+                count += 1
+            }
+            parts.append("Inferred true: " + ", ".join(items))
+        }
+        if len(inferred_false) > 0 {
+            let items: List[string] = []
+            let count = 0
+            for c in inferred_false {
+                if count >= 5 {
+                    break
+                }
+                items.append(c)
+                count += 1
+            }
+            parts.append("Inferred false: " + ", ".join(items))
+        }
+        if len(unsatisfied) > 0 {
+            let items: List[string] = []
+            for i in range(min(3, len(unsatisfied))) {
+                items.append(unsatisfied[i])
+            }
+            parts.append("Unsatisfied constraints: " + "; ".join(items))
+        }
+
+        let explanation = "No new inferences from given constraints."
+        if len(parts) > 0 {
+            explanation = ". ".join(parts)
+        }
+
+        return PropagationResult {
+            assignments: assignments,
+            confidence: confidence,
+            steps: steps,
+            unsatisfied: unsatisfied,
+            explanation: explanation
+        }
+    }
+}
+
+/// ---------- Deduction Engine ----------
+
+class DeductionEngine {
+    fn __init__(self, graph: CausalGraph = None, memory_capacity: int = None) {
+        if memory_capacity == None {
+            memory_capacity = 9
+        }
+        self._graph = graph
+        self._engine = InferenceEngine(graph, 5, 0.1)
+        self._abductive = AbductiveReasoner(graph, None, None)
+        self._constraints = ConstraintPropagator(graph)
+        self._counterfactual = CounterfactualReasoner(graph, None)
+        self._memory = WorkingMemory(memory_capacity)
+    }
+
+    fn working_memory(self) -> WorkingMemory {
+        return self._memory
+    }
+
+    fn deduce(self, premises: List[string], goal: string) -> DeductionChain {
+        self._memory.clear()
+        let steps: List[DeductionStep] = []
+        let step_num = 0
+
+        for premise in premises {
+            step_num += 1
+            let p_clean = premise.lower().strip()
+            self._memory.push(p_clean, 1.0, "premise", None)
+            steps.append(DeductionStep {
+                step_number: step_num, operation: "assert_premise",
+                proposition: p_clean, confidence: 1.0,
+                justification: "Given premise"
+            })
+        }
+
+        let goal_clean = goal.lower().strip()
+
+        let prop_result = self._constraints.propagate(premises, None)
+        for concept in prop_result.assignments {
+            let state = prop_result.assignments[concept]
+            if state == "true" and not self._memory.contains(concept) {
+                step_num += 1
+                self._memory.push(concept, 0.8, "constraint_propagation", None)
+                steps.append(DeductionStep {
+                    step_number: step_num, operation: "propagate",
+                    proposition: concept, confidence: 0.8,
+                    justification: "Inferred via constraint propagation"
+                })
+            }
+        }
+
+        if self._memory.contains(goal_clean) {
+            let item = self._memory.get(goal_clean)
+            let conf = 0.8
+            if item != None {
+                conf = item.confidence
+            }
+            return DeductionChain {
+                goal: goal_clean, steps: steps,
+                conclusion: goal_clean, confidence: conf,
+                working_memory_snapshot: self._memory.dump(),
+                success: true
+            }
+        }
+
+        for premise in premises {
+            let p_clean = premise.lower().strip()
+            let paths = self._engine.connect(p_clean, goal_clean, 3)
+            if len(paths) > 0 {
+                let best = paths[0]
+                for edge in best.edges {
+                    if not self._memory.contains(edge.target) {
+                        step_num += 1
+                        self._memory.push(edge.target, best.confidence, "forward_chain from " + edge.source, None)
+                        steps.append(DeductionStep {
+                            step_number: step_num, operation: "forward_chain",
+                            proposition: edge.target,
+                            confidence: best.confidence,
+                            justification: edge.source + " " + edge.relation.value + " " + edge.target
+                        })
+                    }
+                }
+
+                if self._memory.contains(goal_clean) {
+                    let item = self._memory.get(goal_clean)
+                    let conf = best.confidence
+                    if item != None {
+                        conf = item.confidence
+                    }
+                    return DeductionChain {
+                        goal: goal_clean, steps: steps,
+                        conclusion: goal_clean, confidence: conf,
+                        working_memory_snapshot: self._memory.dump(),
+                        success: true
+                    }
+                }
+            }
+        }
+
+        let hypotheses = self._abductive.explain(goal_clean, None)
+        for i in range(min(3, len(hypotheses))) {
+            let h = hypotheses[i]
+            let premise_set: Set[string] = set()
+            for p in premises {
+                premise_set.add(p.lower().strip())
+            }
+            if h.explanation in premise_set or self._memory.contains(h.explanation) {
+                step_num += 1
+                self._memory.push(goal_clean, h.confidence * 0.9, "abductive", None)
+                steps.append(DeductionStep {
+                    step_number: step_num, operation: "abductive_inference",
+                    proposition: goal_clean,
+                    confidence: h.confidence * 0.9,
+                    justification: "Best explanation: " + h.explanation + " explains " + goal_clean + " (depth=" + str(h.explanatory_depth) + ")"
+                })
+                return DeductionChain {
+                    goal: goal_clean, steps: steps,
+                    conclusion: goal_clean,
+                    confidence: h.confidence * 0.9,
+                    working_memory_snapshot: self._memory.dump(),
+                    success: true
+                }
+            }
+        }
+
+        step_num += 1
+        steps.append(DeductionStep {
+            step_number: step_num, operation: "fail",
+            proposition: goal_clean, confidence: 0.0,
+            justification: "Could not derive goal from given premises"
+        })
+
+        return DeductionChain {
+            goal: goal_clean, steps: steps,
+            conclusion: "", confidence: 0.0,
+            working_memory_snapshot: self._memory.dump(),
+            success: false
+        }
+    }
+
+    fn analyze_importance(self, concept: string) -> Dict[string, Any] {
+        let cf = self._counterfactual.remove_concept(concept)
+        let limited: List[string] = []
+        for i in range(min(10, len(cf.affected_conclusions))) {
+            limited.append(cf.affected_conclusions[i])
+        }
+        return {
+            "concept": concept,
+            "cascading_effects": cf.cascading_effects,
+            "affected_conclusions": limited,
+            "broken_chains": len(cf.broken_chains),
+            "summary": cf.summary,
+            "is_load_bearing": cf.cascading_effects > 3
+        }
+    }
+}
+
+/// ---------- Gate ----------
+
+gate advanced_inference_gate(data: raw[DeductionChain]) -> validated[DeductionChain] {
+    require confidence >= 0.5
+    validate proof_completeness
+    validate consistency_check
+}
+
+/// ---------- Exports ----------
+
+export WorkingMemoryItem, Hypothesis, CounterfactualResult, Constraint
+export PropagationResult, DeductionStep, DeductionChain
+export hypothesis_net_evidence
+export WorkingMemory, AbductiveReasoner, CounterfactualReasoner
+export ConstraintPropagator, DeductionEngine
+export advanced_inference_gate
