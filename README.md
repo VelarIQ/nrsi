@@ -38,3 +38,4 @@ NRS ecosystem.
 - Source: `website/`
 - GitHub Pages workflow: `.github/workflows/pages.yml`
 - Expected URL: `https://velariq.github.io/nrsi/`
+- Custom domain target: `https://nrsi.ai` (see `website/DEPLOYMENT.md`)

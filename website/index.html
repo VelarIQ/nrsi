@@ -3,134 +3,136 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NRSI | Open Core. Enterprise Ready.</title>
+    <title>NRSI | Open Core Reasoning Runtime</title>
     <meta
       name="description"
-      content="NRSI is an open-core neuromorphic reasoning runtime with day-one enterprise monetization: managed deployment, SLA support, and compliance services."
+      content="NRSI is the open-core neuromorphic reasoning runtime. Build free, deploy with enterprise-grade support, compliance, and SLA-backed operations."
     />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <header class="site-header">
-      <div class="container nav">
-        <a class="brand" href="#top">NRSI</a>
-        <nav>
-          <a href="#pricing">Pricing</a>
-          <a href="#business-model">Business Model</a>
-          <a href="#enterprise">Enterprise</a>
-          <a href="#community">Community</a>
+      <div class="container nav-wrap">
+        <a class="brand" href="./index.html">NRSI</a>
+        <button id="menuButton" class="menu-btn" aria-label="Open menu">Menu</button>
+        <nav id="menu" class="site-nav">
+          <a href="./index.html" class="active">Home</a>
+          <a href="./pricing.html">Pricing</a>
+          <a href="./developers.html">Developers</a>
+          <a href="./enterprise.html">Enterprise</a>
+          <a class="cta-link" href="mailto:legal@velariq.com?subject=NRSI%20Enterprise%20Pilot">Contact</a>
         </nav>
       </div>
     </header>
 
-    <main id="top">
-      <section class="hero container">
-        <p class="eyebrow">Open-source runtime. Commercial from day one.</p>
-        <h1>Build on NRSI for free. Scale with enterprise support.</h1>
-        <p class="lead">
-          NRSI is an Apache-2.0 neuromorphic reasoning runtime and tooling stack.
-          The code is open. Production trust, compliance, and operational support
-          are commercial services.
-        </p>
-        <div class="actions">
-          <a class="btn primary" href="https://github.com/VelarIQ/nrsi">View GitHub</a>
-          <a class="btn" href="mailto:legal@velariq.com?subject=NRSI%20Enterprise%20Inquiry">Talk to Enterprise</a>
+    <main>
+      <section class="hero">
+        <div class="container hero-grid">
+          <div>
+            <p class="eyebrow">Open-source runtime. Commercial from day one.</p>
+            <h1>Build on NRSI for free. Scale with enterprise confidence.</h1>
+            <p class="lead">
+              Apache-2.0 core runtime and tooling for neuromorphic reasoning,
+              paired with production-grade support, governance, and compliance
+              services for enterprise teams.
+            </p>
+            <div class="actions">
+              <a class="btn primary" href="https://github.com/VelarIQ/nrsi">View GitHub</a>
+              <a class="btn" href="./enterprise.html">Talk to Enterprise</a>
+            </div>
+          </div>
+          <aside class="hero-panel">
+            <h3>Execution Targets</h3>
+            <ul>
+              <li>3-5 paid enterprise pilots</li>
+              <li>$200K-$400K ACV pilot motion</li>
+              <li>$1M+ ARR run-rate target by Dec 2026</li>
+              <li>Series A readiness in Q1-Q2 2027</li>
+            </ul>
+          </aside>
         </div>
       </section>
 
-      <section id="pricing" class="container section">
-        <h2>Pricing Framework</h2>
-        <p class="section-intro">
-          Public framework aligned to our commercialization model. Final terms are
-          set by contract.
-        </p>
-        <div class="grid">
-          <article class="card">
-            <h3>Community</h3>
-            <p class="price">Free</p>
-            <ul>
-              <li>Apache-2.0 core runtime/tooling</li>
-              <li>Public docs and community issues</li>
-              <li>Self-managed deployment</li>
-            </ul>
-          </article>
-          <article class="card">
-            <h3>Team</h3>
-            <p class="price">Annual Subscription</p>
-            <ul>
-              <li>Priority support response windows</li>
-              <li>Upgrade and architecture guidance</li>
-              <li>Integration assistance</li>
-            </ul>
-          </article>
-          <article class="card">
-            <h3>Enterprise Pilot</h3>
-            <p class="price">$200K-$400K ACV</p>
-            <ul>
-              <li>Dedicated onboarding and deployment</li>
-              <li>Security and compliance workstreams</li>
-              <li>Pilot-to-production success criteria</li>
-            </ul>
-          </article>
-          <article class="card">
-            <h3>Enterprise Production</h3>
-            <p class="price">Contracted Annual</p>
-            <ul>
-              <li>SLA-backed support and incident response</li>
-              <li>Production governance and reliability SLOs</li>
-              <li>Dedicated TAM / forward-deployed engineering</li>
-            </ul>
-          </article>
+      <section class="section">
+        <div class="container">
+          <h2>Why teams choose NRSI</h2>
+          <div class="cards">
+            <article class="card">
+              <h3>Open Core by Default</h3>
+              <p>
+                Runtime and tooling remain open under Apache-2.0 for developers,
+                partners, and researchers.
+              </p>
+            </article>
+            <article class="card">
+              <h3>Enterprise by Design</h3>
+              <p>
+                Move from pilot to production with explicit SLA, incident, and
+                governance support tracks.
+              </p>
+            </article>
+            <article class="card">
+              <h3>Built for Scale</h3>
+              <p>
+                Structure for regulated and sovereign environments without
+                forcing lock-in at the code level.
+              </p>
+            </article>
+          </div>
         </div>
       </section>
 
-      <section id="business-model" class="container section">
-        <h2>Business Model Alignment</h2>
-        <div class="split">
+      <section class="section alt">
+        <div class="container split">
           <article class="panel">
-            <h3>Open Core</h3>
+            <h3>Builder Path</h3>
+            <p class="muted">Start free and ship quickly.</p>
             <ul>
-              <li>Core NRSI source remains open and builder-friendly.</li>
-              <li>No trademark, certification, or SLA rights in OSS license.</li>
-              <li>Community contributions stay central to runtime evolution.</li>
+              <li>Read docs and clone repo</li>
+              <li>Run language/runtime tests</li>
+              <li>Open PRs through public workflow</li>
             </ul>
+            <a class="text-link" href="./developers.html">Go to developer guide</a>
           </article>
           <article class="panel">
-            <h3>Commercial Layer</h3>
+            <h3>Enterprise Path</h3>
+            <p class="muted">Production reliability and compliance.</p>
             <ul>
-              <li>Monetize production trust, reliability, and compliance.</li>
-              <li>Land via paid pilots, expand into production contracts.</li>
-              <li>Drive recurring ARR through support and managed services.</li>
+              <li>Pilot scoping and architecture design</li>
+              <li>Security/compliance workstreams</li>
+              <li>Operational SLA and deployment support</li>
             </ul>
+            <a class="text-link" href="./enterprise.html">Go to enterprise page</a>
           </article>
         </div>
       </section>
 
-      <section id="enterprise" class="container section">
-        <h2>Enterprise Contact</h2>
-        <p>
-          Need deployment, SLA, or compliance support? Contact our team to scope
-          pilot or production engagement.
-        </p>
-        <a class="btn primary" href="mailto:legal@velariq.com?subject=NRSI%20Enterprise%20Pilot">Request Enterprise Pilot</a>
-      </section>
-
-      <section id="community" class="container section">
-        <h2>Community Resources</h2>
-        <ul class="links">
-          <li><a href="https://github.com/VelarIQ/nrsi">GitHub Repository</a></li>
-          <li><a href="https://github.com/VelarIQ/nrsi/blob/main/README.md">Documentation</a></li>
-          <li><a href="https://github.com/VelarIQ/nrsi/blob/main/BUSINESS_MODEL.md">Business Model</a></li>
-          <li><a href="https://github.com/VelarIQ/nrsi/blob/main/CONTRIBUTING.md">Contributing Guide</a></li>
-          <li><a href="https://github.com/VelarIQ/nrsi/blob/main/SECURITY.md">Security Policy</a></li>
-        </ul>
+      <section class="section">
+        <div class="container center">
+          <h2>Ready to deploy NRSI properly?</h2>
+          <p class="lead narrow">
+            Use the open source runtime today, then engage our team when you need
+            enterprise deployment, governance, and production support.
+          </p>
+          <div class="actions center-actions">
+            <a class="btn primary" href="./pricing.html">View Pricing</a>
+            <a class="btn" href="mailto:legal@velariq.com?subject=NRSI%20Enterprise%20Pilot">Request Pilot</a>
+          </div>
+        </div>
       </section>
     </main>
 
     <footer class="site-footer">
-      <div class="container">
-        <p>© 2026 VelarIQ Inc. NRSI is open core with commercial enterprise layers.</p>
+      <div class="container footer-inner">
+        <p>© <span id="year"></span> VelarIQ Inc. NRSI is open core with enterprise service layers.</p>
+        <div class="footer-links">
+          <a href="https://github.com/VelarIQ/nrsi">GitHub</a>
+          <a href="https://github.com/VelarIQ/nrsi/blob/main/BUSINESS_MODEL.md">Business Model</a>
+          <a href="https://github.com/VelarIQ/nrsi/blob/main/SECURITY.md">Security</a>
+        </div>
       </div>
     </footer>
+
+    <script src="./site.js"></script>
   </body>
 </html>

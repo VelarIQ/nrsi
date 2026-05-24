@@ -47,3 +47,17 @@ here.
 
 - `README.md` now documents website source, deployment workflow, and expected
   Pages URL.
+
+## [0.1.3] - 2026-05-24
+
+### Changed
+
+- Upgraded website from single-page splash to multi-page launch site:
+  `index.html`, `pricing.html`, `developers.html`, `enterprise.html`.
+- Improved UX/UI styling, responsive navigation, and reusable client script.
+
+### Added
+
+- `website/CNAME` set to `nrsi.ai`.
+- `website/DEPLOYMENT.md` with Porkbun DNS + GitHub Pages setup instructions.
+- Pages workflow environment updated to force Node 24 JavaScript actions.
