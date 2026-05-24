@@ -2,19 +2,21 @@
 
 ## Near-term (0-3 months)
 
-- Complete public split into `nrsi` and `nrsip-spec`.
+- Convert day-one paid pilot pipeline into signed enterprise pilot contracts.
 - Stabilize OSS governance and contribution workflow.
-- Publish initial compatibility matrix for protocol/reference versions.
 - Improve contributor onboarding and CI reliability.
+- Publish commercial packaging and support boundaries for community vs paid tiers.
 
 ## Mid-term (3-6 months)
 
-- Promote NRSIP specification process with RFC-style change proposals.
 - Expand language/runtime tooling docs and sample integrations.
 - Add release automation for reproducible artifacts and checksums.
+- Convert pilot engagements into production contracts with SLA-backed support.
+- Drive toward $1M+ ARR run-rate execution gate by Dec 2026.
 
 ## Longer-term (6+ months)
 
-- Formalize compatibility/certification program for NRSIP implementations.
 - Expand SDK and client ecosystem.
 - Improve benchmark transparency and reproducibility assets for builders.
+- Scale recurring support and managed-operation revenue while preserving open
+  core adoption.

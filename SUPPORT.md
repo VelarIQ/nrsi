@@ -8,6 +8,7 @@
 ## Commercial/support inquiries
 
 - legal@velariq.com
+- See commercial model: `BUSINESS_MODEL.md`
 
 ## What to include in bug reports
 

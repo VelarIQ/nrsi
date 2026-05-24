@@ -32,3 +32,5 @@ here.
 ### Added
 
 - Repo-native GitHub templates and CI workflows under `.github/`.
+- `BUSINESS_MODEL.md` documenting day-one commercialization aligned to ARR and
+  funding milestones.

@@ -31,3 +31,4 @@ NRS ecosystem.
 - Security reporting: `SECURITY.md`
 - Governance model: `GOVERNANCE.md`
 - Roadmap: `ROADMAP.md`
+- Day-one commercialization model: `BUSINESS_MODEL.md`
