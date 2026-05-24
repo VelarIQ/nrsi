@@ -36,6 +36,6 @@ NRS ecosystem.
 ## NRSI website
 
 - Source: `website/`
-- GitHub Pages workflow: `.github/workflows/pages.yml`
-- Expected URL: `https://velariq.github.io/nrsi/`
-- Custom domain target: `https://nrsi.ai` (see `website/DEPLOYMENT.md`)
+- Primary deployment target: GCP Cloud Run via `scripts/deploy_gcp.sh`
+- Domain target: `https://nrsi.ai` (see `website/DEPLOYMENT.md`)
+- GitHub Pages workflow: `.github/workflows/pages.yml` (fallback path)

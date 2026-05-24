@@ -1,42 +1,61 @@
 # NRSI Website Deployment Notes
 
-This static site deploys via GitHub Pages from:
+Primary hosting is now Google Cloud Run.
 
 - repository: `VelarIQ/nrsi`
-- source artifact path: `website/`
-- workflow: `.github/workflows/pages.yml`
+- static source: `website/`
+- container build: `website/Dockerfile`
+- deploy script: `scripts/deploy_gcp.sh`
 
 ## Primary domain
 
 - `nrsi.ai` (apex)
 
-## DNS (Porkbun) for GitHub Pages
+## Deploy to GCP
 
-Remove `pixie.porkbun.com` parking records and set:
+Example:
 
-### Apex (`@` / `nrsi.ai`)
+```bash
+./scripts/deploy_gcp.sh prism-production-v2 us-central1 nrsi-site
+```
 
-- A -> `185.199.108.153`
-- A -> `185.199.109.153`
-- A -> `185.199.110.153`
-- A -> `185.199.111.153`
+Then map domain:
 
-### WWW
+```bash
+gcloud beta run domain-mappings create \
+  --project prism-production-v2 \
+  --region us-central1 \
+  --service nrsi-site \
+  --domain nrsi.ai
+```
 
-- CNAME `www` -> `velariq.github.io`
+The command outputs DNS records you must set in Porkbun.
 
-Optional:
+## DNS (Porkbun) for Cloud Run
 
-- URL redirect `nrsilang.dev` -> `https://nrsi.ai/developers.html`
+1. Remove parking records (`pixie.porkbun.com` aliases/CNAME).
+2. Add the exact records printed by:
 
-## GitHub Pages settings
+```bash
+gcloud beta run domain-mappings describe \
+  --project prism-production-v2 \
+  --region us-central1 \
+  --domain nrsi.ai
+```
 
-- Build/deploy source: GitHub Actions
-- Custom domain: `nrsi.ai`
-- Enforce HTTPS: enabled
+3. Optional `www` handling:
+
+- map `www.nrsi.ai` as a second Cloud Run domain mapping, or
+- redirect `www` to `https://nrsi.ai`.
+
+## GitHub Pages fallback
+
+- Workflow `.github/workflows/pages.yml` remains available as backup publishing
+  path.
+- Do not attach `nrsi.ai` to Pages once Cloud Run domain mapping is active.
 
 ## Verify
 
 1. `https://nrsi.ai`
-2. `https://www.nrsi.ai`
-3. Confirm HTTPS certificate is valid and auto-renewed.
+2. `https://www.nrsi.ai` (if configured)
+3. Confirm managed certificate is provisioned and HTTPS is valid.

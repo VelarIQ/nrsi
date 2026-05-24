@@ -61,3 +61,19 @@ here.
 - `website/CNAME` set to `nrsi.ai`.
 - `website/DEPLOYMENT.md` with Porkbun DNS + GitHub Pages setup instructions.
 - Pages workflow environment updated to force Node 24 JavaScript actions.
+
+## [0.1.4] - 2026-05-24
+
+### Added
+
+- Cloud Run deployment artifacts for website hosting:
+  - `website/Dockerfile`
+  - `website/nginx.conf.template`
+  - `website/docker-entrypoint.sh`
+  - `scripts/deploy_gcp.sh`
+
+### Changed
+
+- Website deployment guidance now prioritizes GCP Cloud Run with `nrsi.ai`.
+- Removed Pages `CNAME` file to avoid domain ownership conflicts during Cloud
+  Run cutover.
