@@ -1,6 +1,7 @@
 # NRSI
 
-NRSI is the neuromorphic reasoning runtime/tooling surface.
+NRSI is the neuromorphic reasoning runtime and tooling surface for the broader
+NRS ecosystem.
 
 ## License
 
@@ -8,21 +9,25 @@ NRSI is the neuromorphic reasoning runtime/tooling surface.
 - Patent policy: `PATENTS.md`
 - Trademarks: `TRADEMARKS.md`
 
-## What is in this repo
+## Repository layout
 
-- NRSI runtime modules
-- language/tooling (`nrsi-lang`)
-- SDKs and tests needed for external builders
+- `global-rollout/nrsi/`: core NRSI runtime and language implementation.
+- `global-rollout/tools/nrsi-lang/`: compiler/toolchain packaging and docs.
+- `global-rollout/sdks/`: SDK surfaces for external builders.
+- `global-rollout/tests/`: integration and subsystem test suites.
 
 ## Quick start
 
-1. Install dependencies:
-   - `pip install -r requirements.txt`
-2. Run tests:
-   - `pytest tests/ -v`
+1. Install Python dependencies:
+   - `python -m pip install -r global-rollout/requirements.txt`
+2. Run a focused validation test:
+   - `python -m pytest global-rollout/tests/test_nrsi_lang.py -v`
+3. Run broader suite (optional):
+   - `python -m pytest global-rollout/tests -v`
 
-## Community
+## Contributing and support
 
-- Contributing: `CONTRIBUTING.md`
+- Contributing guide: `CONTRIBUTING.md`
 - Security reporting: `SECURITY.md`
-- Governance: `GOVERNANCE.md`
+- Governance model: `GOVERNANCE.md`
+- Roadmap: `ROADMAP.md`

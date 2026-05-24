@@ -1,15 +1,11 @@
 # Contributing
 
-Thanks for helping improve NRSI and NRSIP.
+Thanks for helping improve NRSI.
 
 ## Scope
 
-This monorepo is in transition toward two public repositories:
-
-- `nrsi` for runtime/tooling.
-- `nrsip-spec` for protocol specification and reference assets.
-
-Contributions should clearly indicate which surface they affect.
+This repository is focused on the NRSI runtime/tooling surface. Protocol
+specification work belongs in the separate `nrsip-spec` repository.
 
 ## Before you start
 
@@ -23,6 +19,10 @@ Contributions should clearly indicate which surface they affect.
 2. Keep changes small and focused.
 3. Add or update tests for behavior changes.
 4. Run relevant test suites locally before opening a PR.
+
+Recommended baseline:
+
+- `python -m pytest global-rollout/tests/test_nrsi_lang.py -v`
 
 ## Commit and PR expectations
 
@@ -48,7 +48,7 @@ PRs are reviewed for:
 - correctness and regression risk,
 - security and confidentiality impact,
 - test coverage and maintainability,
-- compatibility impact for NRSIP consumers.
+- compatibility impact for NRSI consumers and SDK integrations.
 
 ## Security issues
 

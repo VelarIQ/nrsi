@@ -2,8 +2,7 @@
 
 ## Supported release posture
 
-This repository is transitioning to split public repositories. Until then,
-security fixes may land here first and then be mirrored into public trees.
+This repository is the public NRSI runtime/tooling repository.
 
 ## Reporting a vulnerability
 
@@ -36,3 +35,10 @@ Include:
 - Never commit `.env` files, credentials, tokens, or private keys.
 - Avoid including internal endpoint/account information in docs.
 - Run tests and checks before PR submission.
+
+## Related repositories
+
+- NRSI runtime/tooling security issues: report here via the private channel
+  above.
+- NRSIP protocol-spec issues should be reported in the `nrsip-spec` repository
+  using the same private reporting channel.

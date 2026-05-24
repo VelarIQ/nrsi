@@ -9,12 +9,6 @@ here.
 
 - Apache-2.0 root `LICENSE`.
 - `PATENTS.md` and `TRADEMARKS.md` governance policies.
-- `NRSIP_SPEC_LICENSE.md` for protocol-spec licensing boundary.
-- Open-source export manifests and exporter:
-  - `release/open-source/allowlist.nrsi.txt`
-  - `release/open-source/allowlist.nrsip-spec.txt`
-  - `release/open-source/denylist.sensitive.txt`
-  - `release/open-source/export_public_repo.py`
 - Community/governance baseline:
   - `README.md`
   - `CONTRIBUTING.md`
@@ -25,3 +19,16 @@ here.
   - `SUPPORT.md`
   - `ROADMAP.md`
   - `COMPATIBILITY.md`
+
+## [0.1.1] - 2026-05-24
+
+### Changed
+
+- Corrected `README.md` quickstart/test commands to use actual repository paths
+  under `global-rollout/`.
+- Added explicit repository layout guidance for external builders.
+- Updated contribution/security language to reflect standalone `nrsi` scope.
+
+### Added
+
+- Repo-native GitHub templates and CI workflows under `.github/`.
