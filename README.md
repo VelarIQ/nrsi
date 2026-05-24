@@ -32,3 +32,9 @@ NRS ecosystem.
 - Governance model: `GOVERNANCE.md`
 - Roadmap: `ROADMAP.md`
 - Day-one commercialization model: `BUSINESS_MODEL.md`
+
+## NRSI website
+
+- Source: `website/`
+- GitHub Pages workflow: `.github/workflows/pages.yml`
+- Expected URL: `https://velariq.github.io/nrsi/`

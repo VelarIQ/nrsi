@@ -34,3 +34,16 @@ here.
 - Repo-native GitHub templates and CI workflows under `.github/`.
 - `BUSINESS_MODEL.md` documenting day-one commercialization aligned to ARR and
   funding milestones.
+
+## [0.1.2] - 2026-05-24
+
+### Added
+
+- NRSI website source under `website/` with pricing, business model, enterprise
+  CTA, and community resource sections.
+- GitHub Pages deployment workflow at `.github/workflows/pages.yml`.
+
+### Changed
+
+- `README.md` now documents website source, deployment workflow, and expected
+  Pages URL.
