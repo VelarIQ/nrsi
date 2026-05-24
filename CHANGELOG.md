@@ -93,3 +93,22 @@ here.
 - Search/discovery assets:
   - `website/sitemap.xml`
   - `website/robots.txt`
+
+## [0.1.6] - 2026-05-24
+
+### Added
+
+- AEO-focused page and machine-friendly canonical content:
+  - `website/aeo.html`
+  - `website/llms.txt`
+- Authentication and role-based UX flow pages:
+  - `website/login.html`
+  - `website/dashboard.html`
+  - `website/admin.html`
+
+### Changed
+
+- Expanded global website navigation to include AEO and workspace entry points.
+- Added client-side session/auth handling and role guards in `website/site.js`.
+- Enhanced UI system for auth, KPI dashboards, admin tables, and operational
+  control surfaces.

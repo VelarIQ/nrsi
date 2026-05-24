@@ -43,6 +43,10 @@ NRS ecosystem.
   - `index.html`
   - `platform.html`
   - `pricing.html`
+  - `aeo.html`
   - `developers.html`
   - `enterprise.html`
   - `contact.html`
+  - `login.html`
+  - `dashboard.html`
+  - `admin.html`

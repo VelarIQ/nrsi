@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NRSI Admin Dashboard</title>
+    <meta name="description" content="Comprehensive NRSI admin dashboard for governance, operations, and commercial controls." />
+    <meta name="robots" content="noindex,nofollow" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body data-require-auth="true" data-require-role="admin">
+    <header class="site-header">
+      <div class="container nav-wrap">
+        <a class="brand" href="./index.html">NRSI</a>
+        <button id="menuButton" class="menu-btn" aria-label="Open menu">Menu</button>
+        <nav id="menu" class="site-nav">
+          <a href="./index.html">Home</a>
+          <a href="./platform.html">Platform</a>
+          <a href="./pricing.html">Pricing</a>
+          <a href="./aeo.html">AEO</a>
+          <a href="./developers.html">Developers</a>
+          <a href="./enterprise.html">Enterprise</a>
+          <a href="./dashboard.html">Dashboard</a>
+          <a href="./admin.html" class="active">Admin</a>
+          <a href="./login.html" class="js-logout">Logout</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="dashboard-main">
+      <section class="section">
+        <div class="container">
+          <div class="dash-head">
+            <div>
+              <p class="eyebrow">Admin control plane</p>
+              <h1>NRSI Comprehensive Admin Dashboard</h1>
+              <p class="muted">
+                Operator: <strong data-auth-email>admin@nrsi.ai</strong> · Role:
+                <strong data-auth-role>admin</strong>
+              </p>
+            </div>
+            <div class="dash-actions">
+              <a class="btn" href="./dashboard.html">User dashboard</a>
+              <a class="btn primary" href="./contact.html">Escalate support</a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section alt">
+        <div class="container kpi-grid">
+          <article class="kpi-card">
+            <h3>Total enterprise accounts</h3>
+            <p class="kpi-value">37</p>
+            <p class="kpi-note">12 active pilots · 25 production</p>
+          </article>
+          <article class="kpi-card">
+            <h3>Monthly recurring revenue</h3>
+            <p class="kpi-value">$91K</p>
+            <p class="kpi-note">Current run-rate trendline</p>
+          </article>
+          <article class="kpi-card">
+            <h3>Security posture</h3>
+            <p class="kpi-value">Green</p>
+            <p class="kpi-note">No critical open vulnerabilities</p>
+          </article>
+          <article class="kpi-card">
+            <h3>Ops reliability</h3>
+            <p class="kpi-value">99.93%</p>
+            <p class="kpi-note">30-day service availability</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="container admin-grid">
+          <article class="panel">
+            <h3>Governance and policy</h3>
+            <ul>
+              <li>Change-control board: next review in 2 days</li>
+              <li>Compliance evidence backlog: 4 items pending</li>
+              <li>Trademark/certification requests: 7 open</li>
+              <li>Policy exceptions awaiting legal review: 2</li>
+            </ul>
+          </article>
+          <article class="panel">
+            <h3>Security and access</h3>
+            <div class="mini-cards">
+              <div class="mini-card"><h4>IAM drift</h4><p>0 high-risk drifts detected in last scan.</p></div>
+              <div class="mini-card"><h4>Incident queue</h4><p>1 medium incident under active remediation.</p></div>
+              <div class="mini-card"><h4>Audit trail</h4><p>Daily attestation pipeline passing.</p></div>
+            </div>
+          </article>
+          <article class="panel">
+            <h3>Commercial operations</h3>
+            <ul>
+              <li>Enterprise pilot conversion this month: 3/5</li>
+              <li>Weighted pipeline next quarter: $1.4M</li>
+              <li>Renewal at-risk accounts: 2</li>
+              <li>Pricing approval queue: 6 proposals</li>
+            </ul>
+          </article>
+          <article class="panel">
+            <h3>Program controls</h3>
+            <table class="admin-table">
+              <thead>
+                <tr>
+                  <th>Control Area</th>
+                  <th>Status</th>
+                  <th>Owner</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Production release gate</td>
+                  <td>Healthy</td>
+                  <td>Platform Ops</td>
+                </tr>
+                <tr>
+                  <td>SOC2 evidence collection</td>
+                  <td>In Progress</td>
+                  <td>Security</td>
+                </tr>
+                <tr>
+                  <td>Customer escalation SLA</td>
+                  <td>Healthy</td>
+                  <td>Support</td>
+                </tr>
+              </tbody>
+            </table>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="container footer-inner">
+        <p>© <span id="year"></span> VelarIQ Inc.</p>
+        <div class="footer-links">
+          <a href="./dashboard.html">Dashboard</a>
+          <a href="./contact.html">Contact</a>
+        </div>
+      </div>
+    </footer>
+    <script src="./site.js"></script>
+  </body>
+</html>

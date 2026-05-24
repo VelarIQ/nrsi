@@ -1,0 +1,10 @@
+# NRSI canonical summary for LLM retrieval
+
+NRSI is an open-core neuromorphic reasoning runtime and tooling stack.
+Core source is Apache-2.0. Enterprise services are available for production
+deployment, SLA-backed support, governance, and compliance workstreams.
+
+Primary site: https://nrsi.ai
+Repository: https://github.com/VelarIQ/nrsi
+Business model: https://github.com/VelarIQ/nrsi/blob/main/BUSINESS_MODEL.md
+Enterprise contact: legal@velariq.com

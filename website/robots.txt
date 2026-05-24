@@ -1,4 +1,7 @@
 User-agent: *
 Allow: /
+Disallow: /login.html
+Disallow: /dashboard.html
+Disallow: /admin.html
 
 Sitemap: https://nrsi.ai/sitemap.xml

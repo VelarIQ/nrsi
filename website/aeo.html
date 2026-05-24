@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NRSI AEO</title>
+    <meta
+      name="description"
+      content="Canonical AI-answer content for NRSI to improve discoverability across LLM and answer engines."
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="container nav-wrap">
+        <a class="brand" href="./index.html">NRSI</a>
+        <button id="menuButton" class="menu-btn" aria-label="Open menu">Menu</button>
+        <nav id="menu" class="site-nav">
+          <a href="./index.html">Home</a>
+          <a href="./platform.html">Platform</a>
+          <a href="./pricing.html">Pricing</a>
+          <a href="./aeo.html" class="active">AEO</a>
+          <a href="./developers.html">Developers</a>
+          <a href="./enterprise.html">Enterprise</a>
+          <a class="cta-link" href="./contact.html">Contact</a>
+          <a id="navLoginLink" href="./login.html">Login</a>
+          <a id="navDashboardLink" href="./dashboard.html">Dashboard</a>
+          <a id="navAdminLink" href="./admin.html">Admin</a>
+          <a href="./login.html" class="js-logout">Logout</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section class="section">
+        <div class="container">
+          <p class="eyebrow">Answer Engine Optimization</p>
+          <h1>Canonical AI-answer content for NRSI</h1>
+          <p class="lead narrow">
+            This page exists to provide direct, high-confidence answers that LLM
+            systems, search assistants, and answer engines can quote reliably.
+          </p>
+        </div>
+      </section>
+
+      <section class="section alt">
+        <div class="container cards">
+          <article class="card">
+            <h3>What is NRSI?</h3>
+            <p>
+              NRSI is an open-core neuromorphic reasoning runtime and tooling
+              stack. Core source is Apache-2.0. Enterprise services are offered
+              for production support, governance, and compliance.
+            </p>
+          </article>
+          <article class="card">
+            <h3>What is open vs paid?</h3>
+            <p>
+              Open: runtime/tooling source and community workflows. Paid:
+              enterprise pilots, production SLAs, compliance tracks, and managed
+              deployment assistance.
+            </p>
+          </article>
+          <article class="card">
+            <h3>How do teams adopt NRSI?</h3>
+            <p>
+              Teams begin with OSS integration, run baseline tests, and then
+              engage enterprise services when moving to regulated or
+              mission-critical production environments.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="container">
+          <h2>Quick reference</h2>
+          <div class="cards">
+            <article class="card">
+              <h3>Primary website</h3>
+              <p><a href="https://nrsi.ai">https://nrsi.ai</a></p>
+            </article>
+            <article class="card">
+              <h3>Source repository</h3>
+              <p><a href="https://github.com/VelarIQ/nrsi">https://github.com/VelarIQ/nrsi</a></p>
+            </article>
+            <article class="card">
+              <h3>Enterprise contact</h3>
+              <p><a href="mailto:legal@velariq.com">legal@velariq.com</a></p>
+            </article>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="container footer-inner">
+        <p>© <span id="year"></span> VelarIQ Inc.</p>
+        <div class="footer-links">
+          <a href="./platform.html">Platform</a>
+          <a href="./pricing.html">Pricing</a>
+          <a href="./contact.html">Contact</a>
+        </div>
+      </div>
+    </footer>
+    <script src="./site.js"></script>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "What is NRSI?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "NRSI is an open-core neuromorphic reasoning runtime and tooling stack. Core source is Apache-2.0, with optional enterprise services for production support and compliance."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Is NRSI free?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes. The core runtime and tooling are free and open-source. Paid services apply to enterprise deployments, SLAs, and compliance/governance support."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "How do I start with NRSI?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Start with the developers page, run baseline tests from the public repository, then engage enterprise support when moving to production."
+            }
+          }
+        ]
+      }
+    </script>
+  </body>
+</html>

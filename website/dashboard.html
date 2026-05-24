@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NRSI Dashboard</title>
+    <meta name="description" content="Comprehensive user dashboard for NRSI program execution." />
+    <meta name="robots" content="noindex,nofollow" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body data-require-auth="true">
+    <header class="site-header">
+      <div class="container nav-wrap">
+        <a class="brand" href="./index.html">NRSI</a>
+        <button id="menuButton" class="menu-btn" aria-label="Open menu">Menu</button>
+        <nav id="menu" class="site-nav">
+          <a href="./index.html">Home</a>
+          <a href="./platform.html">Platform</a>
+          <a href="./pricing.html">Pricing</a>
+          <a href="./aeo.html">AEO</a>
+          <a href="./developers.html">Developers</a>
+          <a href="./enterprise.html">Enterprise</a>
+          <a class="cta-link" href="./contact.html">Contact</a>
+          <a href="./dashboard.html" class="active">Dashboard</a>
+          <a id="navAdminLink" href="./admin.html">Admin</a>
+          <a href="./login.html" class="js-logout">Logout</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="dashboard-main">
+      <section class="section">
+        <div class="container">
+          <div class="dash-head">
+            <div>
+              <p class="eyebrow">Workspace</p>
+              <h1>Welcome back, <span data-auth-email>operator@nrsi.ai</span></h1>
+              <p class="muted">
+                Role: <strong data-auth-role>user</strong> · Last login: <span data-auth-time>now</span>
+              </p>
+            </div>
+            <div class="dash-actions">
+              <a class="btn" href="./developers.html">Developer docs</a>
+              <a class="btn primary" href="./contact.html">Request support</a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section alt">
+        <div class="container kpi-grid">
+          <article class="kpi-card">
+            <h3>Active deployments</h3>
+            <p class="kpi-value">12</p>
+            <p class="kpi-note">Across pilot + production environments</p>
+          </article>
+          <article class="kpi-card">
+            <h3>Pilot conversion rate</h3>
+            <p class="kpi-value">58%</p>
+            <p class="kpi-note">Quarter-to-date conversion signal</p>
+          </article>
+          <article class="kpi-card">
+            <h3>Incident SLA compliance</h3>
+            <p class="kpi-value">99.2%</p>
+            <p class="kpi-note">30-day rolling window</p>
+          </article>
+          <article class="kpi-card">
+            <h3>ARR progress</h3>
+            <p class="kpi-value">$0.82M</p>
+            <p class="kpi-note">Toward $1M+ Dec 2026 target</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="container dashboard-grid">
+          <article class="panel">
+            <h3>Delivery timeline</h3>
+            <ul class="timeline">
+              <li><strong>Week 1:</strong> Architecture readiness review complete</li>
+              <li><strong>Week 2:</strong> Security control mapping in progress</li>
+              <li><strong>Week 3:</strong> Performance and load validation scheduled</li>
+              <li><strong>Week 4:</strong> Production go-live decision gate</li>
+            </ul>
+          </article>
+          <article class="panel">
+            <h3>Workspace modules</h3>
+            <div class="mini-cards">
+              <div class="mini-card"><h4>Deployments</h4><p>Runtime versions, rollout status, rollback checkpoints.</p></div>
+              <div class="mini-card"><h4>Reliability</h4><p>Latency, throughput, and incident trend visibility.</p></div>
+              <div class="mini-card"><h4>Commercial</h4><p>Pilot milestones and contract conversion readiness.</p></div>
+            </div>
+          </article>
+          <article class="panel">
+            <h3>Action queue</h3>
+            <ul>
+              <li>Finalize SOC2 evidence packet for pilot #3</li>
+              <li>Approve production runbook for regulated environment</li>
+              <li>Review API latency regression from last deploy</li>
+              <li>Submit expansion scope for enterprise account ACV uplift</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="container footer-inner">
+        <p>© <span id="year"></span> VelarIQ Inc.</p>
+        <div class="footer-links">
+          <a href="./admin.html">Admin</a>
+          <a href="./contact.html">Contact</a>
+        </div>
+      </div>
+    </footer>
+    <script src="./site.js"></script>
+  </body>
+</html>

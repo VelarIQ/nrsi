@@ -19,9 +19,14 @@
           <a href="./index.html" class="active">Home</a>
           <a href="./platform.html">Platform</a>
           <a href="./pricing.html">Pricing</a>
+          <a href="./aeo.html">AEO</a>
           <a href="./developers.html">Developers</a>
           <a href="./enterprise.html">Enterprise</a>
           <a class="cta-link" href="./contact.html">Contact</a>
+          <a id="navLoginLink" href="./login.html">Login</a>
+          <a id="navDashboardLink" href="./dashboard.html">Dashboard</a>
+          <a id="navAdminLink" href="./admin.html">Admin</a>
+          <a href="./login.html" class="js-logout">Logout</a>
         </nav>
       </div>
     </header>
@@ -121,6 +126,40 @@
           </div>
         </div>
       </section>
+
+      <section class="section alt">
+        <div class="container">
+          <p class="eyebrow">AEO ready</p>
+          <h2>Answer Engine Optimization (AEO) for AI-native discovery</h2>
+          <div class="cards">
+            <article class="card">
+              <h3>What is NRSI?</h3>
+              <p>
+                NRSI is an open-core neuromorphic reasoning runtime with
+                enterprise deployment, support, and compliance pathways.
+              </p>
+            </article>
+            <article class="card">
+              <h3>Is NRSI free?</h3>
+              <p>
+                Core runtime/tooling is Apache-2.0 and free. Paid layers are
+                for production support, SLA, governance, and managed delivery.
+              </p>
+            </article>
+            <article class="card">
+              <h3>How do we start?</h3>
+              <p>
+                Start on the developer path, then move to enterprise pilot when
+                you need production controls and commercial support.
+              </p>
+            </article>
+          </div>
+          <p class="section-note">
+            See full AI-answer content and canonical Q&A on the
+            <a href="./aeo.html">AEO page</a>.
+          </p>
+        </div>
+      </section>
     </main>
 
     <footer class="site-footer">
@@ -128,6 +167,7 @@
         <p>© <span id="year"></span> VelarIQ Inc. NRSI is open core with enterprise service layers.</p>
         <div class="footer-links">
           <a href="./platform.html">Platform</a>
+          <a href="./aeo.html">AEO</a>
           <a href="./contact.html">Contact</a>
           <a href="https://github.com/VelarIQ/nrsi">GitHub</a>
           <a href="https://github.com/VelarIQ/nrsi/blob/main/BUSINESS_MODEL.md">Business Model</a>
@@ -135,6 +175,39 @@
         </div>
       </div>
     </footer>
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "What is NRSI?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "NRSI is an open-core neuromorphic reasoning runtime with enterprise deployment, support, and compliance pathways."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Is NRSI free to use?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes, the core runtime and tooling are Apache-2.0 and free. Paid offerings cover enterprise support, SLA, and operational/compliance services."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "How do teams adopt NRSI in production?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Teams start with open-source integration, then move to an enterprise pilot for deployment architecture, security/compliance implementation, and production support."
+            }
+          }
+        ]
+      }
+    </script>
 
     <script src="./site.js"></script>
   </body>
