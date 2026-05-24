@@ -77,3 +77,19 @@ here.
 - Website deployment guidance now prioritizes GCP Cloud Run with `nrsi.ai`.
 - Removed Pages `CNAME` file to avoid domain ownership conflicts during Cloud
   Run cutover.
+
+## [0.1.5] - 2026-05-24
+
+### Changed
+
+- Expanded website UX/UI to a fuller information architecture with platform and
+  contact flows integrated across navigation.
+
+### Added
+
+- New website pages:
+  - `website/platform.html`
+  - `website/contact.html`
+- Search/discovery assets:
+  - `website/sitemap.xml`
+  - `website/robots.txt`

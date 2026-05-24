@@ -39,3 +39,10 @@ NRS ecosystem.
 - Primary deployment target: GCP Cloud Run via `scripts/deploy_gcp.sh`
 - Domain target: `https://nrsi.ai` (see `website/DEPLOYMENT.md`)
 - GitHub Pages workflow: `.github/workflows/pages.yml` (fallback path)
+- Site map:
+  - `index.html`
+  - `platform.html`
+  - `pricing.html`
+  - `developers.html`
+  - `enterprise.html`
+  - `contact.html`
