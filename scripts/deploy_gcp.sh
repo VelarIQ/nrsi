@@ -24,6 +24,7 @@ echo "Deploying ${SERVICE_NAME} to project=${PROJECT_ID}, region=${REGION}"
 gcloud builds submit \
   --project "${PROJECT_ID}" \
   --tag "${IMAGE}" \
+  --suppress-logs \
   web-next
 
 ENV_VARS=()
