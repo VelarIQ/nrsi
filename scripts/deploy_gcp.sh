@@ -18,11 +18,8 @@ DEPLOY_FLAGS=()
 
 echo "Deploying ${SERVICE_NAME} to project=${PROJECT_ID}, region=${REGION}"
 
-gcloud services enable \
-  run.googleapis.com \
-  cloudbuild.googleapis.com \
-  artifactregistry.googleapis.com \
-  --project "${PROJECT_ID}"
+# Core APIs should be pre-enabled during project bootstrap.
+# This keeps the deploy identity least-privilege (no serviceusage.admin needed).
 
 gcloud builds submit \
   --project "${PROJECT_ID}" \
