@@ -21,6 +21,7 @@ env:
   GCP_PROJECT_ID: nrsi-web-prod-20260524
   GCP_REGION: us-central1
   SERVICE_NAME: nrsi-site
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   deploy:
@@ -43,13 +44,13 @@ jobs:
           npm run build:guard
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: projects/924270273440/locations/global/workloadIdentityPools/github-actions-pool/providers/nrsi-repo-provider
           service_account: nrsi-github-deployer@nrsi-web-prod-20260524.iam.gserviceaccount.com
 
       - name: Setup gcloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Deploy website to Cloud Run
         run: |
