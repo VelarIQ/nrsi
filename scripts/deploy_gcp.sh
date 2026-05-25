@@ -21,11 +21,37 @@ echo "Deploying ${SERVICE_NAME} to project=${PROJECT_ID}, region=${REGION}"
 # Core APIs should be pre-enabled during project bootstrap.
 # This keeps the deploy identity least-privilege (no serviceusage.admin needed).
 
-gcloud builds submit \
-  --project "${PROJECT_ID}" \
-  --tag "${IMAGE}" \
-  --suppress-logs \
-  web-next
+BUILD_ID="$(
+  gcloud builds submit \
+    --project "${PROJECT_ID}" \
+    --tag "${IMAGE}" \
+    --async \
+    --format='value(id)' \
+    web-next
+)"
+
+if [[ -z "${BUILD_ID}" ]]; then
+  echo "Failed to create Cloud Build job." >&2
+  exit 1
+fi
+
+echo "Cloud Build started: ${BUILD_ID}"
+while true; do
+  BUILD_STATUS="$(gcloud builds describe "${BUILD_ID}" --project "${PROJECT_ID}" --format='value(status)')"
+  case "${BUILD_STATUS}" in
+    SUCCESS)
+      break
+      ;;
+    QUEUED|WORKING|PENDING)
+      sleep 5
+      ;;
+    *)
+      echo "Cloud Build failed: ${BUILD_STATUS}" >&2
+      gcloud builds describe "${BUILD_ID}" --project "${PROJECT_ID}" --format='value(logUrl)' >&2 || true
+      exit 1
+      ;;
+  esac
+done
 
 ENV_VARS=()
 if [[ -n "${NEXT_PUBLIC_TURNSTILE_SITE_KEY:-}" ]]; then
