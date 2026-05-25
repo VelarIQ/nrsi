@@ -314,6 +314,29 @@ code {
   margin-top: 10px;
 }
 
+.sso-block {
+  margin-top: 10px;
+}
+
+.sso-label {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.auth-divider {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 12px 0;
+}
+
+.auth-error {
+  color: #ff9aa2;
+  min-height: 1.1rem;
+  margin: 8px 0 0;
+  font-size: 0.88rem;
+}
+
 .auth-form label {
   display: grid;
   gap: 6px;

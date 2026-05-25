@@ -446,6 +446,53 @@
         "qdrant",
         "architecture"
       ]
+    },
+    {
+      "id": "arch-event-relay-signed-idempotent-contract-20260525",
+      "text": "The product event relay contract is fail-closed and replay-aware: producers sign event envelopes with HMAC SHA-256 over `eventId|signedAt|type|source`, relay enforces signature verification plus timestamp skew bounds (`EVENT_SIGNATURE_MAX_SKEW_SECONDS`), and ingest applies idempotency through a 24-hour in-memory seen-event cache plus BigQuery row insert IDs keyed by event_id. This pattern enables authenticated retries without duplicate durable writes.",
+      "confidence": 0.96,
+      "tags": [
+        "event-relay",
+        "hmac",
+        "signature-verification",
+        "timestamp-skew",
+        "idempotency",
+        "bigquery",
+        "ingestion",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-event-relay-dual-sink-canary-retention-ops-20260525",
+      "text": "Web API providers route product telemetry to a durable BigQuery-backed relay pipeline with optional canary mirroring: primary prod webhook receives signed envelopes while deterministic hash-based routing mirrors a configurable percent to staging webhook targets (`WEBHOOK_CANARY_PERCENT`). Data governance is operationalized with an hourly GitHub Actions retention job that processes `product_event_delete_requested` logs and issues BigQuery deletes in both production and staging tables via `scripts/process_event_deletion_requests.sh`.",
+      "confidence": 0.95,
+      "tags": [
+        "event-relay",
+        "bigquery",
+        "canary",
+        "staging",
+        "retention",
+        "deletion",
+        "github-actions",
+        "governance",
+        "architecture"
+      ]
+    },
+    {
+      "id": "arch-event-relay-observability-and-postdeploy-gates-20260525",
+      "text": "Event relay reliability is guarded by deployment-time and runtime checks: deploy-cloud-run workflow includes post-deploy smoke tests against deployed website analytics/launch-interest APIs plus relay health, while monitoring setup provisions relay-specific log metrics (`nrsi_event_relay_auth_fail_count`, `nrsi_event_relay_ingest_count`) and alert policies for auth-failure spikes, ingestion throughput drops, and relay 5xx responses. This keeps auth regressions and ingest stalls visible quickly after rollout.",
+      "confidence": 0.95,
+      "tags": [
+        "event-relay",
+        "observability",
+        "smoke-test",
+        "post-deploy",
+        "github-actions",
+        "monitoring",
+        "alerts",
+        "ingestion",
+        "architecture"
+      ]
     }
   ]
 }

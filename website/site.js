@@ -1,6 +1,7 @@
 const menuButton = document.getElementById("menuButton");
 const menu = document.getElementById("menu");
 const SESSION_KEY = "nrsi_site_session_v1";
+const DEFAULT_NEXT_PATH = "dashboard.html";
 
 if (menuButton && menu) {
   menuButton.addEventListener("click", () => {
@@ -29,6 +30,9 @@ function setSession(session) {
 
 function clearSession() {
   localStorage.removeItem(SESSION_KEY);
+  if (window.google?.accounts?.id?.disableAutoSelect) {
+    window.google.accounts.id.disableAutoSelect();
+  }
 }
 
 function redirectToLogin(nextPage) {
@@ -87,6 +91,8 @@ function enforceAuth(session) {
 function bindLoginForm() {
   const form = document.getElementById("loginForm");
   if (!form) return;
+  // SSO-only mode: keep form node only for next-path plumbing.
+  if (!document.getElementById("loginEmail")) return;
 
   const emailInput = document.getElementById("loginEmail");
   const passInput = document.getElementById("loginPassword");
@@ -129,7 +135,101 @@ function bindLoginForm() {
   });
 }
 
+function showAuthError(message) {
+  const node = document.getElementById("ssoError");
+  if (node) {
+    node.textContent = message || "";
+  }
+}
+
+function getAuthConfig() {
+  return window.NRSI_AUTH_CONFIG || {};
+}
+
+function parseJwt(token) {
+  try {
+    const payload = token.split(".")[1];
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const decoded = atob(normalized);
+    return JSON.parse(decoded);
+  } catch {
+    return null;
+  }
+}
+
+function resolveNextPath(nextInput) {
+  return (nextInput?.value || DEFAULT_NEXT_PATH).replace("./", "");
+}
+
+function buildRoleFromEmail(email) {
+  if (email.startsWith("admin@") || email.includes("+admin")) {
+    return "admin";
+  }
+  return "user";
+}
+
+function bindGoogleSignIn() {
+  const form = document.getElementById("loginForm");
+  if (!form) return;
+
+  const nextInput = document.getElementById("loginNext");
+  const buttonContainer = document.getElementById("googleLoginButton");
+  const config = getAuthConfig();
+  const clientId = (config.googleClientId || "").trim();
+  const allowedDomain = (config.allowedWorkspaceDomain || "").trim().toLowerCase();
+
+  if (!buttonContainer) return;
+  if (!window.google?.accounts?.id) {
+    showAuthError("Google SSO is unavailable in this browser session.");
+    return;
+  }
+  if (!clientId || clientId.startsWith("REPLACE_WITH")) {
+    showAuthError("Google SSO is not configured yet. Use the manual demo login below.");
+    return;
+  }
+
+  window.google.accounts.id.initialize({
+    client_id: clientId,
+    callback: (response) => {
+      const claims = parseJwt(response.credential || "");
+      if (!claims?.email || !claims?.email_verified) {
+        showAuthError("Google login failed email verification.");
+        return;
+      }
+
+      if (allowedDomain && claims.hd !== allowedDomain) {
+        showAuthError(`Use your ${allowedDomain} workspace account.`);
+        return;
+      }
+
+      const role = buildRoleFromEmail(claims.email.toLowerCase());
+      const session = {
+        email: claims.email.toLowerCase(),
+        role,
+        authMethod: "google",
+        loginAt: new Date().toISOString()
+      };
+      setSession(session);
+
+      const nextPath = resolveNextPath(nextInput);
+      if (nextPath === "admin.html" && role !== "admin") {
+        window.location.href = "./dashboard.html";
+        return;
+      }
+      window.location.href = `./${nextPath}`;
+    }
+  });
+
+  window.google.accounts.id.renderButton(buttonContainer, {
+    theme: "outline",
+    size: "large",
+    width: 320,
+    text: "continue_with"
+  });
+}
+
 const session = getSession();
 hydrateAuthUi(session);
 enforceAuth(session);
 bindLoginForm();
+bindGoogleSignIn();

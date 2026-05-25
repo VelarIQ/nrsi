@@ -36,34 +36,17 @@
               Sign in to access your dashboard. Admin users can access governance
               and operations controls.
             </p>
+            <div class="sso-block">
+              <p class="sso-label">Sign in with your Google Workspace account</p>
+              <div id="googleLoginButton"></div>
+              <p id="ssoError" class="auth-error" role="alert" aria-live="polite"></p>
+            </div>
+            <hr class="auth-divider" />
             <form id="loginForm" class="auth-form">
-              <label>
-                Work email
-                <input type="email" id="loginEmail" required placeholder="you@company.com" />
-              </label>
-              <label>
-                Password
-                <input type="password" id="loginPassword" required minlength="6" placeholder="••••••••" />
-              </label>
-              <label>
-                Workspace role
-                <select id="loginRole">
-                  <option value="user">User</option>
-                  <option value="admin">Admin</option>
-                </select>
-              </label>
-              <label>
-                Redirect after login
-                <select id="loginNext">
-                  <option value="dashboard.html">Dashboard</option>
-                  <option value="admin.html">Admin Dashboard</option>
-                </select>
-              </label>
-              <button class="btn primary" type="submit">Sign in</button>
+              <input type="hidden" id="loginNext" value="dashboard.html" />
             </form>
             <p class="auth-note">
-              Demo login for UX/UI flow. Replace with production identity provider
-              integration before exposing real protected data.
+              SSO-only mode is enabled. Manual username/password sign-in is disabled.
             </p>
           </div>
           <aside class="auth-info">
@@ -88,6 +71,8 @@
         </div>
       </div>
     </footer>
+    <script src="./auth-config.js"></script>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
     <script src="./site.js"></script>
   </body>
 </html>

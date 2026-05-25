@@ -1,24 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Deploy the static NRSI website to Cloud Run.
+# Deploy the Next.js NRSI website to Cloud Run.
 # Usage:
 #   ./scripts/deploy_gcp.sh [PROJECT_ID] [REGION] [SERVICE_NAME]
 #
 # Defaults:
-#   PROJECT_ID from current gcloud config
+#   PROJECT_ID=nrsi-web-prod-20260524
 #   REGION=us-central1
 #   SERVICE_NAME=nrsi-site
 
-PROJECT_ID="${1:-$(gcloud config get-value project 2>/dev/null)}"
+PROJECT_ID="${1:-nrsi-web-prod-20260524}"
 REGION="${2:-us-central1}"
 SERVICE_NAME="${3:-nrsi-site}"
 IMAGE="gcr.io/${PROJECT_ID}/${SERVICE_NAME}:$(date +%Y%m%d-%H%M%S)"
-
-if [ -z "${PROJECT_ID}" ] || [ "${PROJECT_ID}" = "(unset)" ]; then
-  echo "No PROJECT_ID set. Pass one as arg1 or run: gcloud config set project <id>"
-  exit 1
-fi
+DEPLOY_FLAGS=()
 
 echo "Deploying ${SERVICE_NAME} to project=${PROJECT_ID}, region=${REGION}"
 
@@ -31,14 +27,62 @@ gcloud services enable \
 gcloud builds submit \
   --project "${PROJECT_ID}" \
   --tag "${IMAGE}" \
-  website
+  web-next
 
-gcloud run deploy "${SERVICE_NAME}" \
-  --project "${PROJECT_ID}" \
-  --region "${REGION}" \
-  --image "${IMAGE}" \
-  --port 8080 \
-  --allow-unauthenticated
+ENV_VARS=()
+if [[ -n "${NEXT_PUBLIC_TURNSTILE_SITE_KEY:-}" ]]; then
+  ENV_VARS+=("NEXT_PUBLIC_TURNSTILE_SITE_KEY=${NEXT_PUBLIC_TURNSTILE_SITE_KEY}")
+fi
+if [[ -n "${TURNSTILE_SECRET_KEY:-}" ]]; then
+  ENV_VARS+=("TURNSTILE_SECRET_KEY=${TURNSTILE_SECRET_KEY}")
+fi
+if [[ -n "${LAUNCH_INTEREST_WEBHOOK_URL:-}" ]]; then
+  ENV_VARS+=("LAUNCH_INTEREST_WEBHOOK_URL=${LAUNCH_INTEREST_WEBHOOK_URL}")
+fi
+if [[ -n "${LAUNCH_INTEREST_WEBHOOK_TOKEN:-}" ]]; then
+  ENV_VARS+=("LAUNCH_INTEREST_WEBHOOK_TOKEN=${LAUNCH_INTEREST_WEBHOOK_TOKEN}")
+fi
+if [[ -n "${LAUNCH_INTEREST_WEBHOOK_TIMEOUT_MS:-}" ]]; then
+  ENV_VARS+=("LAUNCH_INTEREST_WEBHOOK_TIMEOUT_MS=${LAUNCH_INTEREST_WEBHOOK_TIMEOUT_MS}")
+fi
+if [[ -n "${ANALYTICS_WEBHOOK_URL:-}" ]]; then
+  ENV_VARS+=("ANALYTICS_WEBHOOK_URL=${ANALYTICS_WEBHOOK_URL}")
+fi
+if [[ -n "${ANALYTICS_WEBHOOK_TOKEN:-}" ]]; then
+  ENV_VARS+=("ANALYTICS_WEBHOOK_TOKEN=${ANALYTICS_WEBHOOK_TOKEN}")
+fi
+if [[ -n "${ANALYTICS_WEBHOOK_TIMEOUT_MS:-}" ]]; then
+  ENV_VARS+=("ANALYTICS_WEBHOOK_TIMEOUT_MS=${ANALYTICS_WEBHOOK_TIMEOUT_MS}")
+fi
+if [[ -n "${LAUNCH_INTEREST_STAGING_WEBHOOK_URL:-}" ]]; then
+  ENV_VARS+=("LAUNCH_INTEREST_STAGING_WEBHOOK_URL=${LAUNCH_INTEREST_STAGING_WEBHOOK_URL}")
+fi
+if [[ -n "${ANALYTICS_STAGING_WEBHOOK_URL:-}" ]]; then
+  ENV_VARS+=("ANALYTICS_STAGING_WEBHOOK_URL=${ANALYTICS_STAGING_WEBHOOK_URL}")
+fi
+if [[ -n "${WEBHOOK_CANARY_PERCENT:-}" ]]; then
+  ENV_VARS+=("WEBHOOK_CANARY_PERCENT=${WEBHOOK_CANARY_PERCENT}")
+fi
+if [[ -n "${EVENT_WEBHOOK_SIGNING_SECRET:-}" ]]; then
+  ENV_VARS+=("EVENT_WEBHOOK_SIGNING_SECRET=${EVENT_WEBHOOK_SIGNING_SECRET}")
+fi
+if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
+  echo "Applying runtime env vars."
+  gcloud run deploy "${SERVICE_NAME}" \
+    --project "${PROJECT_ID}" \
+    --region "${REGION}" \
+    --image "${IMAGE}" \
+    --port 8080 \
+    --allow-unauthenticated \
+    --update-env-vars "$(IFS=,; echo "${ENV_VARS[*]}")"
+else
+  gcloud run deploy "${SERVICE_NAME}" \
+    --project "${PROJECT_ID}" \
+    --region "${REGION}" \
+    --image "${IMAGE}" \
+    --port 8080 \
+    --allow-unauthenticated
+fi
 
 SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
   --project "${PROJECT_ID}" \
@@ -49,6 +93,6 @@ echo "Deployment complete:"
 echo "  Cloud Run URL: ${SERVICE_URL}"
 echo ""
 echo "Next:"
-echo "  1) Keep GitHub Pages as fallback or disable it after cutover."
+echo "  1) Cloud Run deploy workflow: .github/workflows/deploy-cloud-run.yml"
 echo "  2) Map custom domain with:"
 echo "     gcloud beta run domain-mappings create --project ${PROJECT_ID} --service ${SERVICE_NAME} --domain nrsi.ai --region ${REGION}"

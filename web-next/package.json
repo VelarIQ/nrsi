@@ -1,0 +1,19 @@
+{
+  "name": "nrsi-web-next",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "check:bundle": "node ./scripts/check-bundle-budget.mjs",
+    "build:guard": "npm run build && npm run check:bundle"
+  },
+  "dependencies": {
+    "next": "^15.3.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "three": "^0.176.0"
+  }
+}

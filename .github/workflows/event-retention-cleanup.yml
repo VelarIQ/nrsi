@@ -1,0 +1,37 @@
+name: Event Retention Cleanup
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT_ID: nrsi-web-prod-20260524
+  DATASET: nrsi_events
+  PROD_TABLE: product_events
+  STAGING_TABLE: product_events_staging
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/924270273440/locations/global/workloadIdentityPools/github-actions-pool/providers/nrsi-repo-provider
+          service_account: nrsi-github-deployer@nrsi-web-prod-20260524.iam.gserviceaccount.com
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Process event deletion requests
+        run: |
+          chmod +x ./scripts/process_event_deletion_requests.sh
+          ./scripts/process_event_deletion_requests.sh "${GCP_PROJECT_ID}" "${DATASET}" "${PROD_TABLE}" "${STAGING_TABLE}"

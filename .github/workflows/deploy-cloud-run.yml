@@ -1,0 +1,68 @@
+name: Deploy NRSI Website (Cloud Run)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web-next/**"
+      - "scripts/deploy_gcp.sh"
+      - ".github/workflows/deploy-cloud-run.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: "cloud-run-deploy"
+  cancel-in-progress: true
+
+env:
+  GCP_PROJECT_ID: nrsi-web-prod-20260524
+  GCP_REGION: us-central1
+  SERVICE_NAME: nrsi-site
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web-next/package-lock.json
+
+      - name: Build guardrails (bundle budget)
+        working-directory: web-next
+        run: |
+          npm ci
+          npm run build:guard
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/924270273440/locations/global/workloadIdentityPools/github-actions-pool/providers/nrsi-repo-provider
+          service_account: nrsi-github-deployer@nrsi-web-prod-20260524.iam.gserviceaccount.com
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy website to Cloud Run
+        run: |
+          chmod +x ./scripts/deploy_gcp.sh
+          ./scripts/deploy_gcp.sh "${GCP_PROJECT_ID}" "${GCP_REGION}" "${SERVICE_NAME}"
+
+      - name: Integration smoke tests (deployed APIs + relay)
+        run: |
+          SITE_URL="$(gcloud run services describe "${SERVICE_NAME}" --project "${GCP_PROJECT_ID}" --region "${GCP_REGION}" --format='value(status.url)')"
+          RELAY_URL="$(gcloud run services describe nrsi-event-relay --project "${GCP_PROJECT_ID}" --region "${GCP_REGION}" --format='value(status.url)')"
+          NOW_MS="$(python3 -c 'import time; print(int(time.time()*1000)-3000)')"
+
+          test "$(curl -s -o /dev/null -w "%{http_code}" "${RELAY_URL}/health")" = "200"
+          test "$(curl -s -o /dev/null -w "%{http_code}" -X POST "${SITE_URL}/api/analytics" -H "Content-Type: application/json" -d '{}')" = "400"
+          test "$(curl -s -o /dev/null -w "%{http_code}" -X POST "${SITE_URL}/api/analytics" -H "Content-Type: application/json" -d '{"eventName":"ci_smoke","path":"/","ts":1779713000000}')" = "200"
+          test "$(curl -s -o /dev/null -w "%{http_code}" -X POST "${SITE_URL}/api/launch-interest" -H "Content-Type: application/json" -H "User-Agent: Mozilla/5.0" -d "{\"name\":\"CI Smoke\",\"email\":\"ci-smoke@example.com\",\"company\":\"Atherion\",\"intent\":\"builder\",\"startedAt\":${NOW_MS}}")" = "200"

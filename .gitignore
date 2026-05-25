@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 *.reasoning_graph_cache.json
+web-next/.next/
+web-next/node_modules/
+web-next/.vercel/
+web-next/.env.local
