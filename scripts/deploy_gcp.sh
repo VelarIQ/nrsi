@@ -90,6 +90,27 @@ fi
 if [[ -n "${EVENT_WEBHOOK_SIGNING_SECRET:-}" ]]; then
   ENV_VARS+=("EVENT_WEBHOOK_SIGNING_SECRET=${EVENT_WEBHOOK_SIGNING_SECRET}")
 fi
+if [[ -n "${GOOGLE_OAUTH_CLIENT_ID:-}" ]]; then
+  ENV_VARS+=("GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}")
+fi
+if [[ -n "${NEXT_PUBLIC_GOOGLE_OAUTH_CLIENT_ID:-}" ]]; then
+  ENV_VARS+=("NEXT_PUBLIC_GOOGLE_OAUTH_CLIENT_ID=${NEXT_PUBLIC_GOOGLE_OAUTH_CLIENT_ID}")
+fi
+if [[ -n "${AUTH_ALLOWED_DOMAINS:-}" ]]; then
+  ENV_VARS+=("AUTH_ALLOWED_DOMAINS=${AUTH_ALLOWED_DOMAINS}")
+fi
+if [[ -n "${AUTH_SUPER_ADMIN_EMAILS:-}" ]]; then
+  ENV_VARS+=("AUTH_SUPER_ADMIN_EMAILS=${AUTH_SUPER_ADMIN_EMAILS}")
+fi
+if [[ -n "${AUTH_ADMIN_EMAILS:-}" ]]; then
+  ENV_VARS+=("AUTH_ADMIN_EMAILS=${AUTH_ADMIN_EMAILS}")
+fi
+if [[ -n "${AUTH_SESSION_SECRET:-}" ]]; then
+  ENV_VARS+=("AUTH_SESSION_SECRET=${AUTH_SESSION_SECRET}")
+fi
+if [[ -n "${AUTH_SESSION_TTL_SECONDS:-}" ]]; then
+  ENV_VARS+=("AUTH_SESSION_TTL_SECONDS=${AUTH_SESSION_TTL_SECONDS}")
+fi
 if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
   echo "Applying runtime env vars."
   gcloud run deploy "${SERVICE_NAME}" \
@@ -98,7 +119,7 @@ if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
     --image "${IMAGE}" \
     --port 8080 \
     --allow-unauthenticated \
-    --update-env-vars "$(IFS=,; echo "${ENV_VARS[*]}")"
+    --update-env-vars "^|^$(IFS='|'; echo "${ENV_VARS[*]}")"
 else
   gcloud run deploy "${SERVICE_NAME}" \
     --project "${PROJECT_ID}" \
